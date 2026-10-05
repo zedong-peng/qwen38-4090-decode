@@ -206,7 +206,7 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0 0; width: 10
     <li><strong>Side work on a second stream.</strong> GDN and attention kernels share DRAM and stretch each other one-for-one.</li>
     <li><strong>Grid and placement tricks.</strong> SM-balanced GEMM grids, <code>prefetch.global.L2</code> on Ada, NUMA pinning and splitting the CUDA graph all measured null.</li>
     <li><strong>A 2-bit head screen.</strong> Its top-1 recall is 0.987.</li>
-    <li><strong>RMSNorms folded into GEMM epilogues</strong> through a cross-CTA reduction. The atomics landing on a single L2 line cost more than the 80 norm launches they removed.</li>
+    <li><strong>RMSNorms folded into GEMM epilogues</strong> through a cross-CTA reduction. The producer GEMM grew 5.5 µs per call, more than the 80 removed norm launches saved; the likely cause is atomics landing on a single L2 line.</li>
   </ul>
 
   <hr>
