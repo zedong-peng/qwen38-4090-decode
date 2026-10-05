@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Qwen3.8-27B at 313 tok/s</title>
+<title>Qwen3.8-27B at 319 tok/s</title>
 <style>
 /* Layout: one reading column (~66ch) with full-column data figures: a to-scale ledger and a stacked round budget. */
 :root {
@@ -89,14 +89,14 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0 0; width: 10
 <body>
 <article class="wrap">
   <div class="eyebrow">Draft · 2026-10-05 · single RTX 4090</div>
-  <h1><span class="num">237 → 313</span> tok/s: speculative decoding of a 27B model on one RTX 4090</h1>
+  <h1><span class="num">237 → 319</span> tok/s: speculative decoding of a 27B model on one RTX 4090</h1>
   <p class="note">Every number here comes from one box: 4× RTX 4090, one card per run, 450 W, PCIe Gen3. Benchmark:
     Spec-Bench, all 480 prompts, concurrency 1, greedy, 256 new tokens.</p>
 
   <div class="tldr">
     <ul>
-      <li>Qwen3.8-27B with a DFlash2 block drafter now decodes Spec-Bench-480 at <strong>≈313 tok/s</strong>. The release container runs at 237.6 tok/s on our engine branch, and at 179.0 tok/s on stock Cinference with its default 7-token chain.</li>
-      <li>The quantized target is <strong>closer to the FP32 reference than the release</strong> on every fidelity metric: KL64 0.0618 vs 0.0668, top-1 0.9256 vs 0.9250, PPL 3.21 vs 3.29. Speculative decoding is lossless with respect to that target.</li>
+      <li>Qwen3.8-27B with a DFlash2 block drafter now decodes Spec-Bench-480 at <strong>319.4 tok/s</strong>. The release container runs at 237.6 tok/s on our engine branch, and at 179.0 tok/s on stock Cinference with its default 7-token chain.</li>
+      <li>The quantized target is <strong>closer to the FP32 reference than the release</strong> on KL and perplexity: KL64 0.0619 vs 0.0668, PPL 3.21 vs 3.29, with top-1 at the release's level (0.9250). Speculative decoding is lossless with respect to that target.</li>
       <li>Two levers did it: fewer weight bytes per round, through better quantization, and kernels that stream those bytes at 850–950 GB/s. Most of the late gains were only visible because 0.3% differences could be measured reliably.</li>
     </ul>
   </div>
@@ -133,6 +133,7 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0 0; width: 10
 <li><span class="lab">Drafter MLP at Q3</span><span class="track"><span class="bar" style="width:96.84%"></span></span><span class="val">309.9</span></li>
 <li><span class="lab">E2E v5 (16 more Q3 down layers) + INT8 V cache</span><span class="track"><span class="bar" style="width:97.50%"></span></span><span class="val">≈312</span></li>
 <li><span class="lab">GDN conv fused into the input-projection epilogue (+0.4%)</span><span class="track"><span class="bar" style="width:97.81%"></span></span><span class="val">≈313</span></li>
+<li><span class="lab">FP16 GDN state + L2 fills of the next GEMM's weights</span><span class="track"><span class="bar" style="width:99.81%"></span></span><span class="val">319.4</span></li>
     </ul>
     <div class="axis"><span class="ticks"><span>0</span><span>80</span><span>160</span><span>240</span><span>320</span></span><span></span></div>
     <figcaption>Spec-Bench-480 tok/s, bars to scale. The grey bars are the baselines. ≈ marks steps measured as a paired
@@ -176,13 +177,13 @@ hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0 0; width: 10
       <thead><tr><th>Target</th><th>Prose KL64</th><th>Code KL64</th><th>KL64</th><th>Top-1</th><th>PPL</th></tr></thead>
       <tbody>
         <tr><td>Release container</td><td>0.0290</td><td>0.1095</td><td>0.0668</td><td>0.9250</td><td>3.294</td></tr>
-        <tr class="now"><td>Current (E2E v5, Q3 mix, INT8 V)</td><td>0.0265</td><td>0.1016</td><td>0.0618</td><td>0.9256</td><td>3.213</td></tr>
+        <tr class="now"><td>Current (E2E v5, Q3 mix, INT8 V, FP16 GDN state)</td><td>0.0265</td><td>0.1018</td><td>0.0619</td><td>0.9250</td><td>3.213</td></tr>
         <tr><td>FP32 reference</td><td>—</td><td>—</td><td>—</td><td>—</td><td>3.146</td></tr>
       </tbody>
     </table>
   </div>
-  <p>The bar for adoption is "better than the release on every split and metric". Top-1 has the least headroom: the
-    current target clears it by about 25 of 46,059 predictions.</p>
+  <p>The bar for adoption is "better than the release on every split and metric". Top-1 has the least headroom. Before
+    FP16 GDN state the target cleared it by about 25 of 46,059 predictions; FP16 state spent that, and it now clears it by 1.</p>
   <p>A non-bit-exact kernel change, such as FP16 GDN state or a fused norm, flips about 200 near-tie predictions in each
     direction, which moves top-1 by about ±20. Rounding the carried GDN state to 5, 7, 8, 10 or 16 mantissa bits costs
     10–25 agreements regardless of the precision. That looks like noise around a lucky baseline, not damage. The next
