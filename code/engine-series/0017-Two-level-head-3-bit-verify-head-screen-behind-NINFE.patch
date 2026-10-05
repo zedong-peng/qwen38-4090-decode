@@ -1,0 +1,560 @@
+From 6e10f37c4bbbef87801980bd36ef2d3f348ccb38 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 19:50:16 +0800
+Subject: [PATCH 17/49] Two-level head: 3-bit verify-head screen behind
+ NINFER_HEAD_SCREEN=3
+
+Half-offset 3-bit G64 copy of the Q8 head (0.48 GiB instead of the 0.64 GiB Q4 copy), per-CTA top-8,
+merge to the top-32 per column, exact Q8 rescoring. The exact argmax stays within the screen top-12 on
+16k real verify states. Spec-Bench-480: 480/480 outputs identical; same-binary A/B +0.8..1.4% decode.
+---
+ include/ninfer/ops/linear_topk.h      |  16 ++
+ src/models/qwen3_5/execution/text.cpp |  25 ++
+ src/ops/linear_topk/screen_head.cu    |  84 ++++++
+ src/ops/linear_topk/screen_lowbit.cuh | 363 ++++++++++++++++++++++++++
+ src/ops/linear_topk/sources.cmake     |   1 +
+ 5 files changed, 489 insertions(+)
+ create mode 100644 src/ops/linear_topk/screen_head.cu
+ create mode 100644 src/ops/linear_topk/screen_lowbit.cuh
+
+diff --git a/include/ninfer/ops/linear_topk.h b/include/ninfer/ops/linear_topk.h
+index a70b2ba..01a1fc2 100644
+--- a/include/ninfer/ops/linear_topk.h
++++ b/include/ninfer/ops/linear_topk.h
+@@ -77,4 +77,20 @@ void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_s
+ void two_level_head_rescore(const Tensor& hidden, const Weight& q8_head,
+                             const Tensor& candidate_ids, Tensor& tokens, cudaStream_t stream);
+ 
++// Research: low-bit (3-bit G64) screen for the two-level head (NINFER_HEAD_SCREEN=3).
++struct LowBitScreen {
++    void* codes  = nullptr;  // 2-bit plane [248320, 1280]
++    void* high   = nullptr;  // high-bit plane [248320, 640]
++    void* scales = nullptr;  // FP16 [248320, 80]
++    void* keys   = nullptr;  // per-CTA top-8 keys, 16 columns
++    void* mid    = nullptr;  // per-chunk top-32 keys, 16 columns
++};
++struct LowBitScreenSizes {
++    std::size_t codes = 0, high = 0, scales = 0, keys = 0, mid = 0;
++};
++LowBitScreenSizes lowbit_screen_sizes();
++void lowbit_screen_build(const Weight& q8_head, const LowBitScreen& screen, cudaStream_t stream);
++void lowbit_screen_verify(const Tensor& hidden, const Weight& q8_head, const LowBitScreen& screen,
++                          Tensor& tokens, cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 6780d8c..c77f706 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -310,7 +310,16 @@ struct TwoLevelHead {
+     Weight q4;
+     std::unique_ptr<DeviceArena> work;
+ 
++    // NINFER_HEAD_SCREEN=3: 3-bit screen + top-32 exact rescoring instead of the Q4 copy.
++    int screen_bits = 0;
++    DeviceBuffer screen_codes, screen_high, screen_scales, screen_keys, screen_mid;
++    ops::LowBitScreen screen;
++
+     void verify(const Tensor& hidden, const Weight& q8, Tensor& tokens, cudaStream_t stream) {
++        if (screen_bits == 3) {
++            ops::lowbit_screen_verify(hidden, q8, screen, tokens, stream);
++            return;
++        }
+         work->reset();
+         const std::int32_t columns = hidden.ne[1];
+         Tensor ids    = work->alloc(DType::I32, {16, columns});
+@@ -330,6 +339,22 @@ TwoLevelHead* two_level_head(const Weight& q8) {
+     }
+     static std::unique_ptr<TwoLevelHead> head = [&] {
+         auto h    = std::make_unique<TwoLevelHead>();
++        if (const char* bits = std::getenv("NINFER_HEAD_SCREEN"); bits != nullptr && bits[0] == '3') {
++            const auto sizes = ops::lowbit_screen_sizes();
++            h->screen_bits   = 3;
++            h->screen_codes  = DeviceBuffer(sizes.codes);
++            h->screen_high   = DeviceBuffer(sizes.high);
++            h->screen_scales = DeviceBuffer(sizes.scales);
++            h->screen_keys   = DeviceBuffer(sizes.keys);
++            h->screen_mid    = DeviceBuffer(sizes.mid);
++            h->screen        = {h->screen_codes.p, h->screen_high.p, h->screen_scales.p,
++                                h->screen_keys.p, h->screen_mid.p};
++            ops::lowbit_screen_build(q8, h->screen, nullptr);
++            CUDA_CHECK(cudaDeviceSynchronize());
++            std::fprintf(stderr, "two-level verify head: 3-bit screen %.2f GiB\n",
++                         static_cast<double>(sizes.codes + sizes.high + sizes.scales) / (1u << 30));
++            return h;
++        }
+         h->codes  = DeviceBuffer(static_cast<std::size_t>(q8.n) * q8.k / 2);
+         h->scales = DeviceBuffer(static_cast<std::size_t>(q8.n) * (q8.k / 64) * 2);
+         ops::two_level_head_requantize(q8, h->codes.p, h->scales.p, nullptr);
+diff --git a/src/ops/linear_topk/screen_head.cu b/src/ops/linear_topk/screen_head.cu
+new file mode 100644
+index 0000000..51670dc
+--- /dev/null
++++ b/src/ops/linear_topk/screen_head.cu
+@@ -0,0 +1,84 @@
++// Research: low-bit verify-head screen for the two-level head (NINFER_HEAD_SCREEN=3); see screen_lowbit.cuh.
++
++#include "core/weight.h"
++#include "ninfer/ops/linear_topk.h"
++
++#include "core/device.h"
++#include "ops/linear_topk/screen_lowbit.cuh"
++
++#include <algorithm>
++#include <stdexcept>
++
++namespace ninfer::ops {
++namespace {
++
++namespace sq = detail::screen_q2;
++using S3                 = sq::Schedule<3, 8, 8, 8, 3>;
++constexpr int kHeadRows  = 248320;
++constexpr int kValidRows = 248077;
++constexpr int kCtas      = kHeadRows / S3::kRows;
++constexpr int kChunks    = (kCtas + sq::kChunkCtas - 1) / sq::kChunkCtas;
++static_assert(kHeadRows % S3::kRows == 0 && kChunks * sq::kCandidates <= 1024);
++
++void require_head(const Weight& q8) {
++    if (q8.qtype != QType::Q8_G32_FP16 || q8.layout != QuantLayout::RowSplit || q8.n != kHeadRows ||
++        q8.k != sq::kHidden || q8.qdata == nullptr || q8.scales == nullptr) {
++        throw std::invalid_argument("low-bit screen: requires the Q8 [248320,5120] row-split head");
++    }
++}
++
++} // namespace
++
++LowBitScreenSizes lowbit_screen_sizes() {
++    LowBitScreenSizes s;
++    s.codes  = static_cast<std::size_t>(kHeadRows) * sq::kRowBytes;
++    s.high   = static_cast<std::size_t>(kHeadRows) * (sq::kHidden / 8);
++    s.scales = static_cast<std::size_t>(kHeadRows) * sq::kGroups * 2;
++    s.keys   = static_cast<std::size_t>(sq::kMaxColumns) * kCtas * sq::kPerCta * 8;
++    s.mid    = static_cast<std::size_t>(sq::kMaxColumns) * kChunks * sq::kCandidates * 8;
++    return s;
++}
++
++void lowbit_screen_build(const Weight& q8, const LowBitScreen& screen, cudaStream_t stream) {
++    require_head(q8);
++    const std::int64_t threads = static_cast<std::int64_t>(kHeadRows) * sq::kGroups;
++    sq::requant_kernel<3><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
++        static_cast<const std::int8_t*>(q8.qdata), static_cast<const __half*>(q8.scales),
++        static_cast<std::uint8_t*>(screen.codes), static_cast<std::uint8_t*>(screen.high),
++        static_cast<__half*>(screen.scales), kHeadRows);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void lowbit_screen_verify(const Tensor& hidden, const Weight& q8, const LowBitScreen& screen,
++                          Tensor& tokens, cudaStream_t stream) {
++    require_head(q8);
++    const std::int32_t columns = hidden.ne[1];
++    if (hidden.dtype != DType::BF16 || hidden.ne[0] != sq::kHidden || hidden.nb[1] % 16 != 0 ||
++        tokens.dtype != DType::I32 || tokens.ne[0] < columns) {
++        throw std::invalid_argument("low-bit screen verify: invalid tensors");
++    }
++    static const bool configured = [] {
++        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S3>,
++                                        cudaFuncAttributeMaxDynamicSharedMemorySize, S3::kSmemBytes));
++        return true;
++    }();
++    (void)configured;
++    const int ld = static_cast<int>(hidden.nb[1] / sizeof(__nv_bfloat16));
++    auto* keys   = static_cast<std::uint64_t*>(screen.keys);
++    auto* mid    = static_cast<std::uint64_t*>(screen.mid);
++    for (int c0 = 0; c0 < columns; c0 += sq::kMaxColumns) {
++        const int n = std::min(sq::kMaxColumns, columns - c0);
++        const auto* x = static_cast<const __nv_bfloat16*>(hidden.data) + static_cast<std::int64_t>(c0) * ld;
++        sq::screen_kernel<S3><<<kCtas, S3::kThreads, S3::kSmemBytes, stream>>>(
++            x, ld, static_cast<const std::uint8_t*>(screen.codes),
++            static_cast<const std::uint8_t*>(screen.high), static_cast<const __half*>(screen.scales), n,
++            kValidRows, keys);
++        sq::merge_chunk_kernel<<<dim3(kChunks, n), 512, 0, stream>>>(keys, kCtas, mid);
++        sq::final_kernel<<<n, 1024, 0, stream>>>(
++            mid, kChunks, x, ld, static_cast<const std::int8_t*>(q8.qdata),
++            static_cast<const __half*>(q8.scales), static_cast<std::int32_t*>(tokens.data) + c0, nullptr);
++        CUDA_CHECK(cudaGetLastError());
++    }
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/linear_topk/screen_lowbit.cuh b/src/ops/linear_topk/screen_lowbit.cuh
+new file mode 100644
+index 0000000..eb7119d
+--- /dev/null
++++ b/src/ops/linear_topk/screen_lowbit.cuh
+@@ -0,0 +1,363 @@
++#pragma once
++// Two-level verify head with a low-bit screen. The screen is a half-offset G64 copy of the Q8 G32 head:
++// value = (2c - (2^Bits - 1)) * scale for codes c in [0, 2^Bits) (levels (c' + 1/2) * absmax / (2^(Bits-1) - 1/2)),
++// stored as a 2-bit plane (four codes per byte, low bits first) plus, for Bits = 3, a high-bit plane (bit i of
++// a group's 64-bit word = weight i), and one FP16 scale per 64 weights: 2.25 / 3.25 bits per weight
++// (0.35 / 0.52 GB for the 248320-row head). Bits = 3 keeps the exact Q8 argmax within the top 12 on 16k real
++// verify states (tools/screen_bits.py); Bits = 2 does not (rank 1945).
++// Stage 1 streams the screen with the Ada small-T mainloop (a lane owns 16 consecutive weights = 4 code
++// bytes per group; same K permutation and x fragments as ada_small_t_mma.cuh) and keeps each CTA's top-8
++// rows per column. Stage 2 merges chunks of 128 CTAs to their top-32. Stage 3 merges to the column's
++// top-32 and rescores those rows exactly on the Q8 head (BF16-rounded scores, lowest id on ties).
++#include "ops/common/memory.cuh"
++#include "ops/common/mma.cuh"
++#include "ops/common/score_id_order.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <climits>
++#include <cstdint>
++
++namespace ninfer::ops::detail::screen_q2 {
++
++constexpr int kHidden     = 5120;
++constexpr int kGroups     = kHidden / 64;
++constexpr int kQ8Groups   = kHidden / 32;
++constexpr int kRowBytes   = kHidden / 4;
++constexpr int kPerCta     = 8;    // rows kept per CTA and column
++constexpr int kChunkCtas  = 128;  // CTAs per stage-2 chunk (1024 keys)
++constexpr int kCandidates = 32;
++constexpr int kMaxColumns = 16;
++
++template <int Bits, int RowTiles, int Warps, int GroupsPerStage, int Stages>
++struct Schedule {
++    static constexpr int kBits        = Bits;
++    static constexpr int kRowTiles    = RowTiles;
++    static constexpr int kWarps       = Warps;
++    static constexpr int kG           = GroupsPerStage;
++    static constexpr int kStages      = Stages;
++    static constexpr int kRows        = 8 * RowTiles;
++    static constexpr int kThreads     = 32 * Warps;
++    static constexpr int kCodeStride  = 16 * kG + 16;  // stride/4 = 4 mod 32: conflict-free fragment reads
++    static constexpr int kScaleStride = 2 * kG < 16 ? 16 : 2 * kG;
++    static constexpr int kHighStride  = Bits == 3 ? 8 * kG + 16 : 0;  // 16-byte rows; 8 rows hit distinct bank pairs
++    static constexpr int kStageBytes  = kRows * (kCodeStride + kHighStride + kScaleStride);
++    static constexpr int kReduceBytes = kWarps * kRows * kMaxColumns * 4;
++    static constexpr int kSmemBytes   = kStages * kStageBytes > kReduceBytes ? kStages * kStageBytes : kReduceBytes;
++    static_assert(kG % kWarps == 0 && kGroups % kG == 0 && kRows <= 64 && kRows % 32 == 0);
++};
++
++// Two codes -> exact bf16x2 integers 2c - (2^Bits - 1): bf16 0x4300 + 2c is 128 + 2c, minus 131 / 135.
++template <int Bits>
++__device__ __forceinline__ unsigned decode_pair(unsigned bits) {
++    const unsigned bias = Bits == 3 ? 0x43074307u : 0x43034303u;
++    const __nv_bfloat162 v = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&bits),
++                                     *reinterpret_cast<const __nv_bfloat162*>(&bias));
++    return *reinterpret_cast<const unsigned*>(&v);
++}
++
++template <class S>
++__global__ void __launch_bounds__(S::kThreads) screen_kernel(const __nv_bfloat16* __restrict__ x, int x_ld,
++                                                             const std::uint8_t* __restrict__ codes,
++                                                             const std::uint8_t* __restrict__ high,
++                                                             const __half* __restrict__ scales, int columns,
++                                                             int valid_rows, std::uint64_t* __restrict__ keys) {
++    constexpr int R = S::kRowTiles, kRows = S::kRows, J = S::kG / S::kWarps;
++    constexpr int kPipe = kGroups / S::kG;
++    extern __shared__ __align__(16) std::uint8_t smem[];
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, q = lane & 3, gid = lane >> 2;
++    const int block = blockIdx.x;
++    const std::int64_t row0 = static_cast<std::int64_t>(block) * kRows;
++
++    unsigned long long policy;
++    asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
++    const auto fill16 = [&](void* dst, const void* src) {
++        asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
++                     :: "r"(static_cast<unsigned>(__cvta_generic_to_shared(dst))), "l"(src), "l"(policy));
++    };
++    const auto issue = [&](int stage) {
++        std::uint8_t* cdst = smem + (stage % S::kStages) * S::kStageBytes;
++        std::uint8_t* hdst = cdst + kRows * S::kCodeStride;
++        std::uint8_t* sdst = hdst + kRows * S::kHighStride;
++        const int g0 = stage * S::kG;
++        for (int i = tid; i < kRows * S::kG; i += S::kThreads) {
++            const int row = i / S::kG, c = i % S::kG;
++            fill16(cdst + row * S::kCodeStride + 16 * c, codes + (row0 + row) * kRowBytes + (g0 + c) * 16);
++        }
++        if constexpr (S::kBits == 3) {
++            constexpr int kChunks = S::kG / 2;  // 8 high bytes per group
++            for (int i = tid; i < kRows * kChunks; i += S::kThreads) {
++                const int row = i / kChunks, c = i % kChunks;
++                fill16(hdst + row * S::kHighStride + 16 * c, high + (row0 + row) * (kHidden / 8) + g0 * 8 + 16 * c);
++            }
++        }
++        if constexpr (2 * S::kG >= 16) {
++            constexpr int kChunks = 2 * S::kG / 16;
++            for (int i = tid; i < kRows * kChunks; i += S::kThreads) {
++                const int row = i / kChunks, c = i % kChunks;
++                fill16(sdst + row * S::kScaleStride + 16 * c,
++                       reinterpret_cast<const std::uint8_t*>(scales + (row0 + row) * kGroups + g0) + 16 * c);
++            }
++        } else {
++            for (int row = tid; row < kRows; row += S::kThreads) {
++                cp_async<2 * S::kG>(sdst + row * S::kScaleStride, scales + (row0 + row) * kGroups + g0);
++            }
++        }
++    };
++
++    const bool lo_valid = gid < columns, hi_valid = gid + 8 < columns;
++    const __nv_bfloat16* xlo = x + static_cast<std::int64_t>(gid) * x_ld + 16 * q;
++    const __nv_bfloat16* xhi = xlo + static_cast<std::int64_t>(8) * x_ld;
++    struct XF { uint4 lo[2], hi[2]; };
++    const auto load_x = [&](int stage, XF (&dst)[J]) {
++        const uint4 zero{0u, 0u, 0u, 0u};
++#pragma unroll
++        for (int j = 0; j < J; ++j) {
++            const int k0 = (stage * S::kG + warp + j * S::kWarps) * 64;
++            const auto* lo = reinterpret_cast<const uint4*>(xlo + k0);
++            const auto* hi = reinterpret_cast<const uint4*>(xhi + k0);
++            dst[j].lo[0] = lo_valid ? __ldg(lo) : zero;
++            dst[j].lo[1] = lo_valid ? __ldg(lo + 1) : zero;
++            dst[j].hi[0] = hi_valid ? __ldg(hi) : zero;
++            dst[j].hi[1] = hi_valid ? __ldg(hi + 1) : zero;
++        }
++    };
++    float acc[R][4];
++#pragma unroll
++    for (int r = 0; r < R; ++r) { acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = 0.0f; }
++
++    const auto compute = [&](int stage, const XF (&xf)[J]) {
++        const std::uint8_t* cs = smem + (stage % S::kStages) * S::kStageBytes;
++        const std::uint8_t* hs = cs + kRows * S::kCodeStride;
++        const std::uint8_t* ss = hs + kRows * S::kHighStride;
++#pragma unroll
++        for (int j = 0; j < J; ++j) {
++            const int gi = warp + j * S::kWarps;
++            const unsigned a_lo[8] = {xf[j].lo[0].x, xf[j].lo[0].y, xf[j].lo[0].z, xf[j].lo[0].w,
++                                      xf[j].lo[1].x, xf[j].lo[1].y, xf[j].lo[1].z, xf[j].lo[1].w};
++            const unsigned a_hi[8] = {xf[j].hi[0].x, xf[j].hi[0].y, xf[j].hi[0].z, xf[j].hi[0].w,
++                                      xf[j].hi[1].x, xf[j].hi[1].y, xf[j].hi[1].z, xf[j].hi[1].w};
++#pragma unroll
++            for (int r = 0; r < R; ++r) {
++                const int row = 8 * r + gid;
++                const unsigned w = *reinterpret_cast<const unsigned*>(cs + row * S::kCodeStride + gi * 16 + 4 * q);
++                unsigned hw = 0;
++                if constexpr (S::kBits == 3) {
++                    hw = *reinterpret_cast<const unsigned short*>(hs + row * S::kHighStride + gi * 8 + 2 * q);
++                }
++                float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
++#pragma unroll
++                for (int s = 0; s < 4; ++s) {
++                    const unsigned b = (w >> (8 * s)) & 0xffu;
++                    unsigned p0 = 0x43004300u | ((b & 3u) << 1) | ((b & 0xcu) << 15);
++                    unsigned p1 = 0x43004300u | ((b >> 3) & 6u) | ((b & 0xc0u) << 11);
++                    if constexpr (S::kBits == 3) {
++                        const unsigned h = (hw >> (4 * s)) & 0xfu;
++                        p0 |= ((h & 1u) << 3) | ((h & 2u) << 18);
++                        p1 |= ((h & 4u) << 1) | ((h & 8u) << 16);
++                    }
++                    const unsigned b0 = decode_pair<S::kBits>(p0);
++                    const unsigned b1 = decode_pair<S::kBits>(p1);
++                    mma_bf16(d0, d1, d2, d3, a_lo[2 * s], a_hi[2 * s], a_lo[2 * s + 1], a_hi[2 * s + 1], b0, b1);
++                }
++                const int srow = 8 * r + 2 * q;
++                const float s0 = __half2float(*reinterpret_cast<const __half*>(ss + srow * S::kScaleStride + 2 * gi));
++                const float s1 = __half2float(*reinterpret_cast<const __half*>(ss + (srow + 1) * S::kScaleStride + 2 * gi));
++                acc[r][0] = fmaf(s0, d0, acc[r][0]);
++                acc[r][1] = fmaf(s1, d1, acc[r][1]);
++                acc[r][2] = fmaf(s0, d2, acc[r][2]);
++                acc[r][3] = fmaf(s1, d3, acc[r][3]);
++            }
++        }
++    };
++
++#pragma unroll
++    for (int s = 0; s < S::kStages - 1; ++s) {
++        if (s < kPipe) issue(s);
++        cp_commit();
++    }
++    XF cur[J];
++    load_x(0, cur);
++    for (int s = 0; s < kPipe; ++s) {
++        cp_wait<S::kStages - 2>();
++        __syncthreads();
++        if (s + S::kStages - 1 < kPipe) issue(s + S::kStages - 1);
++        cp_commit();
++        XF nxt[J];
++        if (s + 1 < kPipe) load_x(s + 1, nxt);
++        compute(s, cur);
++#pragma unroll
++        for (int j = 0; j < J; ++j) cur[j] = nxt[j];
++    }
++    cp_wait<0>();
++    __syncthreads();
++
++    float* red = reinterpret_cast<float*>(smem);
++    const auto slot = [](int w, int row, int t) { return (w * kRows + row) * kMaxColumns + t; };
++#pragma unroll
++    for (int r = 0; r < R; ++r) {
++        const int row = 8 * r + 2 * q;
++        red[slot(warp, row, gid)]         = acc[r][0];
++        red[slot(warp, row + 1, gid)]     = acc[r][1];
++        red[slot(warp, row, gid + 8)]     = acc[r][2];
++        red[slot(warp, row + 1, gid + 8)] = acc[r][3];
++    }
++    __syncthreads();
++    // Top-8 of the CTA's rows per column: one warp per column, kRows / 32 rows per lane.
++    for (int t = warp; t < columns; t += S::kWarps) {
++        std::uint64_t k[kRows / 32];
++#pragma unroll
++        for (int i = 0; i < kRows / 32; ++i) {
++            const int row = lane + 32 * i;
++            float v = 0.0f;
++#pragma unroll
++            for (int w = 0; w < S::kWarps; ++w) v += red[slot(w, row, t)];
++            const std::int64_t id = row0 + row;
++            k[i] = score_id_order_key(v, id < valid_rows ? static_cast<std::int32_t>(id) : INT_MAX);
++        }
++        std::uint64_t* out = keys + (static_cast<std::int64_t>(t) * gridDim.x + block) * kPerCta;
++#pragma unroll
++        for (int n = 0; n < kPerCta; ++n) {
++            std::uint64_t best = k[0];
++#pragma unroll
++            for (int i = 1; i < kRows / 32; ++i) best = k[i] > best ? k[i] : best;
++#pragma unroll
++            for (int o = 16; o > 0; o >>= 1) {
++                const std::uint64_t other = __shfl_xor_sync(0xffffffffu, best, o);
++                best = other > best ? other : best;
++            }
++#pragma unroll
++            for (int i = 0; i < kRows / 32; ++i) k[i] = k[i] == best ? 0 : k[i];
++            if (lane == 0) out[n] = best;
++        }
++    }
++}
++
++// In-place descending bitonic sort of N keys in shared memory by the whole block.
++template <int N>
++__device__ __forceinline__ void bitonic_desc(std::uint64_t* a) {
++    for (int size = 2; size <= N; size <<= 1) {
++        for (int stride = size >> 1; stride > 0; stride >>= 1) {
++            __syncthreads();
++            for (int i = threadIdx.x; i < N / 2; i += blockDim.x) {
++                const int lo = 2 * i - (i & (stride - 1));
++                const int hi = lo + stride;
++                const bool desc = (lo & size) == 0;
++                const std::uint64_t x = a[lo], y = a[hi];
++                if ((x < y) == desc) { a[lo] = y; a[hi] = x; }
++            }
++        }
++    }
++    __syncthreads();
++}
++
++// Stage 2: grid (chunks, columns); chunk c holds CTAs [128c, 128c + 128).
++__global__ void __launch_bounds__(512) merge_chunk_kernel(const std::uint64_t* __restrict__ keys, int ctas,
++                                                          std::uint64_t* __restrict__ mid) {
++    __shared__ std::uint64_t a[kChunkCtas * kPerCta];
++    const int chunk = blockIdx.x, column = blockIdx.y, chunks = gridDim.x;
++    const int first = chunk * kChunkCtas;
++    const int n     = min(kChunkCtas, ctas - first) * kPerCta;
++    const std::uint64_t* src = keys + (static_cast<std::int64_t>(column) * ctas + first) * kPerCta;
++    for (int i = threadIdx.x; i < kChunkCtas * kPerCta; i += blockDim.x) a[i] = i < n ? src[i] : 0;
++    bitonic_desc<kChunkCtas * kPerCta>(a);
++    if (threadIdx.x < kCandidates) mid[(static_cast<std::int64_t>(column) * chunks + chunk) * kCandidates + threadIdx.x] = a[threadIdx.x];
++}
++
++// Stage 3: one CTA (32 warps) per column: top-32 of the chunks, exact Q8 rescoring, argmax.
++__global__ void __launch_bounds__(1024) final_kernel(const std::uint64_t* __restrict__ mid, int chunks,
++                                                     const __nv_bfloat16* __restrict__ hidden, int hidden_ld,
++                                                     const std::int8_t* __restrict__ q8_codes,
++                                                     const __half* __restrict__ q8_scales,
++                                                     std::int32_t* __restrict__ tokens,
++                                                     std::int32_t* __restrict__ candidates) {
++    __shared__ std::uint64_t a[1024];
++    __shared__ float score[kCandidates];
++    __shared__ int ids[kCandidates];
++    const int column = blockIdx.x;
++    const int n = chunks * kCandidates;
++    for (int i = threadIdx.x; i < 1024; i += blockDim.x) a[i] = i < n ? mid[static_cast<std::int64_t>(column) * n + i] : 0;
++    bitonic_desc<1024>(a);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int id = id_from_order_key(a[warp]);
++    float acc = 0.0f;
++    if (id != INT_MAX) {
++        const std::int8_t* row = q8_codes + static_cast<std::int64_t>(id) * kHidden;
++        const __half* rs = q8_scales + static_cast<std::int64_t>(id) * kQ8Groups;
++        const __nv_bfloat16* xc = hidden + static_cast<std::int64_t>(column) * hidden_ld;
++        for (int g = lane; g < kQ8Groups; g += 32) {
++            const int4* cp = reinterpret_cast<const int4*>(row + g * 32);
++            const int4* ap = reinterpret_cast<const int4*>(xc + g * 32);
++            float part = 0.0f;
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++                const int4 c = cp[h];
++                const std::int8_t* cb = reinterpret_cast<const std::int8_t*>(&c);
++#pragma unroll
++                for (int qq = 0; qq < 2; ++qq) {
++                    const int4 av = ap[2 * h + qq];
++                    const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(&av);
++#pragma unroll
++                    for (int e = 0; e < 8; ++e) part = fmaf(static_cast<float>(cb[8 * qq + e]), __bfloat162float(ab[e]), part);
++                }
++            }
++            acc = fmaf(part, __half2float(rs[g]), acc);
++        }
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
++    }
++    if (lane == 0) {
++        score[warp] = id != INT_MAX ? __bfloat162float(__float2bfloat16(acc)) : -INFINITY;
++        ids[warp]   = id;
++        if (candidates != nullptr) candidates[column * kCandidates + warp] = id;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float best = score[0];
++        int best_id = ids[0];
++        for (int i = 1; i < kCandidates; ++i) {
++            if (score[i] > best || (score[i] == best && ids[i] < best_id)) { best = score[i]; best_id = ids[i]; }
++        }
++        tokens[column] = best_id;
++    }
++}
++
++// Q8 G32 head -> half-offset G64 screen: one thread per (row, 64-group).
++template <int Bits>
++__global__ void requant_kernel(const std::int8_t* __restrict__ q8_codes, const __half* __restrict__ q8_scales,
++                               std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ high,
++                               __half* __restrict__ scales, std::int64_t rows) {
++    constexpr int n = 1 << (Bits - 1);
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= rows * kGroups) return;
++    const std::int64_t row = index / kGroups;
++    const int group = static_cast<int>(index % kGroups);
++    const std::int8_t* src = q8_codes + row * kHidden + group * 64;
++    const float s0 = __half2float(q8_scales[row * kQ8Groups + 2 * group]);
++    const float s1 = __half2float(q8_scales[row * kQ8Groups + 2 * group + 1]);
++    float absmax = 0.0f;
++    for (int i = 0; i < 64; ++i) absmax = fmaxf(absmax, fabsf(static_cast<float>(src[i]) * (i < 32 ? s0 : s1)));
++    __half sh = __float2half_rn(absmax / (n - 0.5f));
++    if (__half2float(sh) == 0.0f && absmax > 0.0f) sh = __ushort_as_half(1);
++    const float s = __half2float(sh), inv = s > 0.0f ? 1.0f / s : 0.0f;
++    std::uint8_t* dst = codes + row * kRowBytes + group * 16;
++    unsigned long long hbits = 0;
++    for (int b = 0; b < 16; ++b) {
++        unsigned byte = 0;
++        for (int e = 0; e < 4; ++e) {
++            const int i = 4 * b + e;
++            const float v = static_cast<float>(src[i]) * (i < 32 ? s0 : s1);
++            const int c = max(-n, min(n - 1, __float2int_rn(v * inv - 0.5f))) + n;
++            byte |= static_cast<unsigned>(c & 3) << (2 * e);
++            hbits |= static_cast<unsigned long long>(c >> 2) << i;
++        }
++        dst[b] = static_cast<std::uint8_t>(byte);
++    }
++    if constexpr (Bits == 3) {
++        for (int b = 0; b < 8; ++b) high[row * (kHidden / 8) + group * 8 + b] = static_cast<std::uint8_t>(hbits >> (8 * b));
++    }
++    scales[row * kGroups + group] = __float2half_rn(s * 0.5f);
++}
++
++} // namespace ninfer::ops::detail::screen_q2
+diff --git a/src/ops/linear_topk/sources.cmake b/src/ops/linear_topk/sources.cmake
+index 989130a..a9c1ad3 100644
+--- a/src/ops/linear_topk/sources.cmake
++++ b/src/ops/linear_topk/sources.cmake
+@@ -8,4 +8,5 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q4_m64.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/merge.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/two_level_head.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/screen_head.cu"
+ )
+-- 
+2.34.1
+

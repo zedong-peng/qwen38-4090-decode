@@ -1,0 +1,50 @@
+From 17f68309cfcbcdf9b4813ad8bedadf142dba3cc4 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 01:11:56 +0800
+Subject: [PATCH 04/49] Research: NINFER_TREE_TEMPERATURE override for the
+ verify-tree temperature
+
+---
+ .../bf16/candidate_selector_path.cu                  | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/src/ops/candidate_selector/bf16/candidate_selector_path.cu b/src/ops/candidate_selector/bf16/candidate_selector_path.cu
+index 380fc08..021e2d5 100644
+--- a/src/ops/candidate_selector/bf16/candidate_selector_path.cu
++++ b/src/ops/candidate_selector/bf16/candidate_selector_path.cu
+@@ -8,6 +8,7 @@
+ #include "ops/common/warp.cuh"
+ #include "ops/kernel/sampling_device.cuh"
+ #include <cuda_bf16.h>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::ops::detail {
+@@ -411,6 +412,15 @@ __global__ __launch_bounds__(32) void lookup_chain_tree_kernel(
+     }
+ }
+ 
++// Research override: NINFER_TREE_TEMPERATURE replaces the tree temperature (default 1.5).
++float tree_inverse_temperature() {
++    static const float value = [] {
++        const char* env = std::getenv("NINFER_TREE_TEMPERATURE");
++        return env != nullptr ? 1.0F / std::strtof(env, nullptr) : kTreeInverseTemperature;
++    }();
++    return value;
++}
++
+ } // namespace
+ 
+ void candidate_selector_tree_launch(
+@@ -437,7 +447,7 @@ void candidate_selector_tree_launch(
+     selector_tree_kernel<<<candidate_ids.ne[2], 32, 0, stream>>>(
+         args, edge_data, static_cast<const std::int32_t*>(current_extents.data),
+         static_cast<std::int32_t*>(tree_parents.data), static_cast<std::int32_t*>(tree_masks.data),
+-        static_cast<std::int32_t*>(rope_positions.data), kTreeInverseTemperature,
++        static_cast<std::int32_t*>(rope_positions.data), tree_inverse_temperature(),
+         static_cast<const std::int32_t*>(lookup_tokens.data),
+         static_cast<const std::int32_t*>(lookup_counts.data),
+         static_cast<const float*>(lookup_log_probability.data));
+-- 
+2.34.1
+

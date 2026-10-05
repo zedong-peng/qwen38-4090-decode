@@ -1,0 +1,135 @@
+From b830dcc72de17f8651187a5d6c5bec85bb169100 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 22:45:37 +0800
+Subject: [PATCH 20/49] Q4 drafter feature projection: Ada small-T route at
+ verify widths; LS8 planes for Q4 drafter fc and attention outputs
+
+---
+ src/models/qwen3_5/execution/parameters.cpp |  2 +
+ src/ops/linear/q4/q4_ada_small_t.cu         | 55 +++++++++++++++++++++
+ src/ops/linear/q4/q4_launch.h               |  3 ++
+ src/ops/linear/q4/shapes/n5120_k25600.cu    |  6 +--
+ src/ops/linear/q4/sources.cmake             |  1 +
+ 5 files changed, 64 insertions(+), 3 deletions(-)
+ create mode 100644 src/ops/linear/q4/q4_ada_small_t.cu
+
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 3146114..6f825d8 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -358,7 +358,9 @@ Parameters::Parameters(const Model& source) : model(source) {
+             }
+         }
+         if (draft) {
++            pass(draft->feature_projection.weight);
+             for (auto& layer : draft->layers) {
++                pass(layer.output.weight);
+                 pass(layer.mlp.gate_up.weight);
+                 pass(layer.mlp.down.weight);
+             }
+diff --git a/src/ops/linear/q4/q4_ada_small_t.cu b/src/ops/linear/q4/q4_ada_small_t.cu
+new file mode 100644
+index 0000000..1d36a54
+--- /dev/null
++++ b/src/ops/linear/q4/q4_ada_small_t.cu
+@@ -0,0 +1,55 @@
++#include "ops/linear/q4/q4_launch.h"
++
++#include "core/device.h"
++#include "ops/linear/ada_small_t_mma.cuh"
++
++#include <cuda_bf16.h>
++
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++
++template <int N>
++struct AdaBf16Store {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* out;
++
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        out[static_cast<std::int64_t>(token) * N + row] = __float2bfloat16_rn(value);
++    }
++};
++
++} // namespace
++
++// Q4 G64 row-split GEMM for T <= 16 into a contiguous BF16 [N, T] output on the Ada small-T kernel:
++// 40-row CTAs read every weight byte once (LS8 scales when the weight has them).
++template <int N, int K>
++void launch_q4_ada_small_t(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
++    const int tokens = x.ne[1];
++    if (tokens < 1 || tokens > 16 || x.ne[0] != K || x.dtype != DType::BF16 ||
++        out.dtype != DType::BF16 || out.ne[0] != N || w.layout != QuantLayout::RowSplit ||
++        w.padded_shape[1] != K) {
++        throw std::invalid_argument("q4 Ada small-T: unsupported operands");
++    }
++    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
++    const auto* code = static_cast<const std::uint8_t*>(w.qdata);
++    const AdaBf16Store<N> epilogue{static_cast<__nv_bfloat16*>(out.data)};
++    if (tokens <= 8) {
++        using S = Q4AdaSmallTSchedule<5, 8, 1, 8, 2>;
++        static_assert(N % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, K>(xp, K, code, nullptr, ada_scales(w), N, tokens, epilogue,
++                                     stream, ada_super(w));
++    } else {
++        using S = Q4AdaSmallTSchedule<5, 8, 2, 8, 2>;
++        ada_small_t_mma_launch<S, K>(xp, K, code, nullptr, ada_scales(w), N, tokens, epilogue,
++                                     stream, ada_super(w));
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++template void launch_q4_ada_small_t<5120, 25600>(const Tensor&, const Weight&, Tensor&,
++                                                 cudaStream_t);
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/q4/q4_launch.h b/src/ops/linear/q4/q4_launch.h
+index 3dff030..0406a67 100644
+--- a/src/ops/linear/q4/q4_launch.h
++++ b/src/ops/linear/q4/q4_launch.h
+@@ -25,5 +25,8 @@ void launch_q4_mma_r64_c96(const Tensor& x, const Weight& w, Tensor& out, cudaSt
+ void launch_q4_mma_r64_c112(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+ void launch_q4_mma_r64_c120(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+ void launch_q4_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
++// Ada small-T Q4 route (T <= 16, BF16 output); instantiated in q4_ada_small_t.cu.
++template <int N, int K>
++void launch_q4_ada_small_t(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+ 
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/q4/shapes/n5120_k25600.cu b/src/ops/linear/q4/shapes/n5120_k25600.cu
+index 99a3a1b..7373463 100644
+--- a/src/ops/linear/q4/shapes/n5120_k25600.cu
++++ b/src/ops/linear/q4/shapes/n5120_k25600.cu
+@@ -17,9 +17,9 @@ using MmaR32C64 = Q4RowSplitMmaGemmSchedule<32, 64, 64, 16, 32, 3, 2, Q4Fragment
+ // uses the dynamic 4-rows-per-CTA GEMV. Two staging buffers fit the static limit through 16 columns.
+ Q4Launch select_q4_n5120_k25600(std::int32_t tokens) {
+     if (tokens == 1) return launch_q4_gemv_r4_w1_direct;
+-    if (tokens <= 4) return launch_q4_ksplit<5120, 25600, 4, 2>;
+-    if (tokens <= 8) return launch_q4_ksplit<5120, 25600, 8, 2>;
+-    if (tokens <= 16) return launch_q4_ksplit<5120, 25600, 16, 2>;
++    // Verify widths: the Ada small-T route streams the 69.6 MB at DRAM speed (the K-split route
++    // ran 219 us at 16 columns, no faster than Q8).
++    if (tokens <= 16) return launch_q4_ada_small_t<5120, 25600>;
+     if (tokens <= 24) return launch_q4_ksplit<5120, 25600, 24>;
+     if (tokens <= 32) return launch_q4_ksplit<5120, 25600, 32>;
+     if (tokens <= 96) return launch_q4_mma<MmaR32C32>;
+diff --git a/src/ops/linear/q4/sources.cmake b/src/ops/linear/q4/sources.cmake
+index 04a5e67..fbf9960 100644
+--- a/src/ops/linear/q4/sources.cmake
++++ b/src/ops/linear/q4/sources.cmake
+@@ -6,6 +6,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q4_rowsplit_gemm_simt.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_rowsplit_gemv.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_dispatch.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/q4_ada_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k5120.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k5120.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
+-- 
+2.34.1
+

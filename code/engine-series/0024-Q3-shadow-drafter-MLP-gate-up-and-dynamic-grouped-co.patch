@@ -1,0 +1,79 @@
+From 17d4102bbc8ec3dc37129e13a15504ceda0d2687 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 00:59:34 +0800
+Subject: [PATCH 24/49] Q3 shadow: drafter MLP gate/up and dynamic-grouped-conv
+ down (Ada Q3 routes)
+
+---
+ src/models/qwen3_5/execution/parameters.cpp   |  6 ++++
+ .../q4/q4_dynamic_grouped_conv_add.cu         | 31 +++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 5688065..de41221 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -409,6 +409,12 @@ Parameters::Parameters(const Model& source) : model(source) {
+                 pass(dense->down.weight);
+             }
+         }
++        if (draft) {
++            for (auto& layer : draft->layers) {
++                pass(layer.mlp.gate_up.weight);
++                pass(layer.mlp.down.weight);
++            }
++        }
+         CUDA_CHECK(cudaDeviceSynchronize());
+         std::fprintf(stderr, "Q3 shadow: %d of %d MLP weights (%d half grid), %.1f MiB of Q3 planes\n",
+                      pass.weights, pass.checked, pass.odd, static_cast<double>(pass.bytes) / (1 << 20));
+diff --git a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
+index 5cccb54..8e86c8e 100644
+--- a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
++++ b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
+@@ -107,12 +107,43 @@ struct AdaStoreEpilogue {
+     }
+ };
+ 
++// Q3 shadow planes (NINFER_Q3_SHADOW) of the drafter's MLP down: the target down's 16 groups per stage.
++template <class Narrow, class Wide, int K>
++void ada_projection_q3(const __nv_bfloat16* xp, const Weight& w, const AdaStoreEpilogue& epilogue,
++                       int columns, cudaStream_t stream) {
++    static_assert(kRows % Narrow::kRowsPerCta == 0 && kRows % Wide::kRowsPerCta == 0);
++    const auto* low  = static_cast<const std::uint8_t*>(w.q3_low);
++    const auto* high = static_cast<const std::uint8_t*>(w.q3_high);
++    if (columns <= 8) {
++        ada_small_t_mma_launch<Narrow, K>(xp, K, low, high, ada_scales(w), kRows, columns, epilogue,
++                                          stream, ada_super(w));
++    } else {
++        ada_small_t_mma_launch<Wide, K>(xp, K, low, high, ada_scales(w), kRows, columns, epilogue,
++                                        stream, ada_super(w));
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ template <int K>
+ void ada_projection(const Tensor& x, const Weight& w, __nv_bfloat16* projected, int columns,
+                     cudaStream_t stream) {
+     const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+     const auto* code = static_cast<const std::uint8_t*>(w.qdata);
+     const AdaStoreEpilogue epilogue{projected};
++    if constexpr (K == 17408) {
++        if (w.q3_low != nullptr) {
++            if (w.q3_odd) {
++                ada_projection_q3<Q3OddAdaSmallTSchedule<5, 8, 1, 16, 2>,
++                                  Q3OddAdaSmallTSchedule<5, 8, 2, 16, 2>, K>(xp, w, epilogue, columns,
++                                                                            stream);
++            } else {
++                ada_projection_q3<Q3AdaSmallTSchedule<5, 8, 1, 16, 2>,
++                                  Q3AdaSmallTSchedule<5, 8, 2, 16, 2>, K>(xp, w, epilogue, columns,
++                                                                         stream);
++            }
++            return;
++        }
++    }
+     if (columns <= 8) {
+         using S = Q4AdaSmallTSchedule<5, 8, 1, 8, 2>;
+         static_assert(kRows % S::kRowsPerCta == 0);
+-- 
+2.34.1
+

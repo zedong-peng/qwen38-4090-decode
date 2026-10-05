@@ -1,0 +1,356 @@
+From c06ec5ef6de21177f05df5446fafee59b292edb2 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 45/49] research33: GDN conv in the input-projection epilogue
+ (NINFER_CONV_EPILOGUE=1, bit-exact, -0.4% ms/round, adopted)
+
+---
+ .../q4_q5/q4_q5_gdn_input_independent.cu      | 226 ++++++++++++++++++
+ .../q4_q5/q4_q5_gdn_input_kernels.h           |  11 +
+ src/ops/linear/ada_small_t_mma.cuh            |  19 ++
+ src/ops/wrapper/gdn_input_proj.cpp            |  11 +
+ 4 files changed, 267 insertions(+)
+
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+index 99ddc0d..d6d363d 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+@@ -7,12 +7,15 @@
+ #include "ops/linear/q4/q4_ksplit_strided_store.cuh"
+ #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+ #include "ops/linear/ada_small_t_mma.cuh"
++#include "ops/gdn_input_proj/gdn_conv.cuh"
++#include "ops/common/math.cuh"
+ #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
+ #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+ 
+ #include <cuda_bf16.h>
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <utility>
+ #include <type_traits>
+@@ -365,8 +368,231 @@ void launch_dual_ada_shadow(const Tensor& x, const Weight& qk_weight, const Weig
+     }
+ }
+ 
++// research33 (NINFER_CONV_EPILOGUE=1): one operand of the record's dual grid. Rows below conv_rows are channels
++// channel0 + row of the conv record: written there as GdnQkEpilogue / GdnValueZEpilogue write them, then convolved
++// by the owning CTA exactly as gdn_projected_conv_kernel convolves the record (NoHistoryPublish). Rows from
++// conv_rows on are z rows. Batch 1: x holds the record's columns.
++struct GdnConvRecordEpilogue {
++    static constexpr bool kPairedHalves = false;
++    static constexpr bool kConvRows     = true;
++    static constexpr int kRows          = 16;
++    static constexpr int kChannels      = kQkRows + kValueRows;
++
++    __nv_bfloat16* record;
++    std::int32_t record_ld;
++    __nv_bfloat16* z;
++    std::int32_t z_ld;
++    std::int32_t conv_rows;
++    std::int32_t channel0;
++    const __nv_bfloat16* conv_weight;
++    const __nv_bfloat16* conv_state;
++    const std::int32_t* initial_slots;
++    const std::int32_t* valid_columns;
++    const std::int32_t* tree_parents;
++    std::int32_t width;
++    __nv_bfloat16* query;
++    __nv_bfloat16* key;
++    __nv_bfloat16* value;
++
++    struct Smem {
++        __nv_bfloat16 weight[4][kRows];
++        __nv_bfloat16 history[3][kRows];
++        std::int32_t parents[16];
++        float raw[kRows][17];
++    };
++    __device__ static Smem& smem() {
++        __shared__ __align__(16) Smem s;
++        return s;
++    }
++
++    __device__ __forceinline__ void operator()(int row, int token, float result) const {
++        if (row < conv_rows) {
++            record[static_cast<std::int64_t>(token) * record_ld + row] = __float2bfloat16_rn(result);
++        } else {
++            z[static_cast<std::int64_t>(token) * z_ld + row - conv_rows] = __float2bfloat16_rn(result);
++        }
++    }
++
++    __device__ __forceinline__ void preload(int row0, int tid) const {
++        if (row0 >= conv_rows) { return; }
++        Smem& s           = smem();
++        const int channel = channel0 + row0;
++        if (tid < 8) {
++            const int k = tid >> 1, half = tid & 1;
++            cp_async<16>(&s.weight[k][8 * half], conv_weight + static_cast<std::int64_t>(k) * kChannels + channel + 8 * half);
++        } else if (tid < 14) {
++            const int k = (tid - 8) >> 1, half = tid & 1;
++            const std::int64_t base = static_cast<std::int64_t>(initial_slots[0]) * 3 * kChannels;
++            cp_async<16>(&s.history[k][8 * half], conv_state + base + static_cast<std::int64_t>(k) * kChannels + channel + 8 * half);
++        } else if (tid < 30) {
++            const int c = tid - 14;
++            if (tree_parents != nullptr && c < width) { cp_async<4>(&s.parents[c], tree_parents + c); }
++        }
++    }
++
++    __device__ __forceinline__ void stage(int row, int token, float result) const {
++        smem().raw[row][token] = __bfloat162float(__float2bfloat16_rn(result));
++    }
++
++    __device__ __forceinline__ void rows_done(int row0, int tid, int threads) const {
++        if (row0 >= conv_rows) { return; }
++        Smem& s = smem();
++        // The preload copies joined the pipeline's groups, all drained by its final cp_wait<0>.
++        __syncthreads();
++        std::int32_t valid = valid_columns == nullptr ? width : valid_columns[0];
++        valid              = valid < 0 ? 0 : (valid > width ? width : valid);
++        const bool tree    = tree_parents != nullptr;
++        const std::uint64_t parents = tree ? gdn_pack_tree_parents(s.parents, width) : 0;
++        for (int index = tid; index < kRows * 16; index += threads) {
++            const int row   = index % kRows;
++            const int token = index / kRows;
++            if (token >= width) { continue; }
++            const int channel = channel0 + row0 + row;
++            __nv_bfloat16 out = __float2bfloat16_rn(0.0F);
++            if (token < valid) {
++                const float h0 = __bfloat162float(s.history[0][row]);
++                const float h1 = __bfloat162float(s.history[1][row]);
++                const float h2 = __bfloat162float(s.history[2][row]);
++                float s0, s1, s2;
++                if (tree) {
++                    const auto tap = [&](int column) { return s.raw[row][column]; };
++                    gdn_tree_conv_taps(parents, token, h0, h1, h2, tap, s0, s1, s2);
++                } else {
++                    const auto tap = [&](int column) {
++                        return column >= 0 ? s.raw[row][column] : (column == -1 ? h2 : (column == -2 ? h1 : h0));
++                    };
++                    s0 = tap(token - 3);
++                    s1 = tap(token - 2);
++                    s2 = tap(token - 1);
++                }
++                float conv = fmaf(__bfloat162float(s.weight[0][row]), s0, 0.0F);
++                conv       = fmaf(__bfloat162float(s.weight[1][row]), s1, conv);
++                conv       = fmaf(__bfloat162float(s.weight[2][row]), s2, conv);
++                conv       = fmaf(__bfloat162float(s.weight[3][row]), s.raw[row][token], conv);
++                out        = __float2bfloat16_rn(silu(conv));
++            }
++            if (channel < 2048) {
++                query[static_cast<std::int64_t>(token) * 2048 + channel] = out;
++            } else if (channel < kQkRows) {
++                key[static_cast<std::int64_t>(token) * 2048 + channel - 2048] = out;
++            } else {
++                value[static_cast<std::int64_t>(token) * kValueRows + channel - kQkRows] = out;
++            }
++        }
++    }
++};
++
++template <int TokenTiles, AdaWeightFormat FV, AdaWeightFormat FQ>
++void launch_conv_record_ada(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                            const GdnConvRecordEpilogue& base, cudaStream_t stream) {
++    using SV = AdaSmallTSchedule<FV, 2, 8, TokenTiles, 8, 2>;
++    using SQ = AdaSmallTSchedule<FQ, 2, 8, TokenTiles, 8, 2>;
++    static_assert(SV::kRowsPerCta == GdnConvRecordEpilogue::kRows && SQ::kRowsPerCta == GdnConvRecordEpilogue::kRows);
++    const auto planes = [](const Weight& w, AdaWeightFormat f) {
++        const bool q3 = f != AdaWeightFormat::Q4;
++        return std::pair{static_cast<const std::uint8_t*>(q3 ? w.q3_low : w.qdata),
++                         q3 ? static_cast<const std::uint8_t*>(w.q3_high) : nullptr};
++    };
++    const auto [v_codes, v_high] = planes(value_z_weight, FV);
++    const auto [q_codes, q_high] = planes(qk_weight, FQ);
++    GdnConvRecordEpilogue value_z_epilogue = base;
++    value_z_epilogue.record += kQkRows;
++    value_z_epilogue.conv_rows = kValueRows;
++    value_z_epilogue.channel0  = kQkRows;
++    GdnConvRecordEpilogue qk_epilogue = base;
++    qk_epilogue.z         = nullptr;
++    qk_epilogue.conv_rows = kQkRows;
++    qk_epilogue.channel0  = 0;
++    ada_small_t_mma_dual_launch<SV, kHidden, SQ, kHidden>(
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
++        AdaSmallTOperand<GdnConvRecordEpilogue>{v_codes, v_high, ada_scales(value_z_weight), value_z_epilogue,
++                                                ada_super(value_z_weight)},
++        kValueZRows,
++        AdaSmallTOperand<GdnConvRecordEpilogue>{q_codes, q_high, ada_scales(qk_weight), qk_epilogue,
++                                                ada_super(qk_weight)},
++        kQkRows, stream);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++template <int TokenTiles, AdaWeightFormat FV>
++void launch_conv_record_ada_v(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                              const GdnConvRecordEpilogue& base, cudaStream_t stream) {
++    switch (shadow_format(qk_weight)) {
++    case AdaWeightFormat::Q3:
++        return launch_conv_record_ada<TokenTiles, FV, AdaWeightFormat::Q3>(x, qk_weight, value_z_weight, base, stream);
++    case AdaWeightFormat::Q3Odd:
++        return launch_conv_record_ada<TokenTiles, FV, AdaWeightFormat::Q3Odd>(x, qk_weight, value_z_weight, base,
++                                                                              stream);
++    default:
++        return launch_conv_record_ada<TokenTiles, FV, AdaWeightFormat::Q4>(x, qk_weight, value_z_weight, base, stream);
++    }
++}
++
++template <int TokenTiles>
++void launch_conv_record_ada_shadow(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                                   const GdnConvRecordEpilogue& base, cudaStream_t stream) {
++    switch (shadow_format(value_z_weight)) {
++    case AdaWeightFormat::Q3:
++        return launch_conv_record_ada_v<TokenTiles, AdaWeightFormat::Q3>(x, qk_weight, value_z_weight, base, stream);
++    case AdaWeightFormat::Q3Odd:
++        return launch_conv_record_ada_v<TokenTiles, AdaWeightFormat::Q3Odd>(x, qk_weight, value_z_weight, base,
++                                                                            stream);
++    default:
++        return launch_conv_record_ada_v<TokenTiles, AdaWeightFormat::Q4>(x, qk_weight, value_z_weight, base, stream);
++    }
++}
++
+ } // namespace
+ 
++bool conv_epilogue_enabled() {
++    static const bool enabled = [] {
++        const char* e = std::getenv("NINFER_CONV_EPILOGUE");
++        return e != nullptr && e[0] == '1';
++    }();
++    return enabled;
++}
++
++bool q4_gdn_input_conv_record_admits(const Weight& qk_weight, const Weight& value_z_weight, std::int32_t batch,
++                                     std::int32_t width) {
++    return batch == 1 && width >= 1 && width <= 16 && qk_weight.qtype == QType::Q4_G64_FP16 &&
++           value_z_weight.qtype == QType::Q4_G64_FP16 && qk_weight.padded_shape[1] == kHidden &&
++           value_z_weight.padded_shape[1] == kHidden && qk_weight.n == kQkRows && value_z_weight.n == kValueZRows;
++}
++
++void q4_gdn_input_conv_record_ada_launch(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                                         const Tensor& conv_weight, const Tensor& conv_states,
++                                         const Tensor& valid_columns, const Tensor& initial_state_slots,
++                                         const Tensor& tree_parents, Tensor& conv_record, Tensor& z, Tensor& query,
++                                         Tensor& key, Tensor& value, cudaStream_t stream) {
++    if (!q4_gdn_input_conv_record_admits(qk_weight, value_z_weight, 1, x.ne[1]) || conv_record.ne[0] != kQkRows + kValueRows ||
++        conv_record.ne[1] != x.ne[1] || z.ne[0] != kZRows || query.ne[0] != 2048 || key.ne[0] != 2048 ||
++        value.ne[0] != kValueRows) {
++        throw std::invalid_argument("research33 conv epilogue: problem not admitted");
++    }
++    const GdnConvRecordEpilogue base{
++        static_cast<__nv_bfloat16*>(conv_record.data),
++        static_cast<std::int32_t>(conv_record.nb[1] / sizeof(__nv_bfloat16)),
++        static_cast<__nv_bfloat16*>(z.data),
++        static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16)),
++        0,
++        0,
++        static_cast<const __nv_bfloat16*>(conv_weight.data),
++        static_cast<const __nv_bfloat16*>(conv_states.data),
++        static_cast<const std::int32_t*>(initial_state_slots.data),
++        valid_columns.data == nullptr ? nullptr : static_cast<const std::int32_t*>(valid_columns.data),
++        tree_parents.data == nullptr ? nullptr : static_cast<const std::int32_t*>(tree_parents.data),
++        static_cast<std::int32_t>(x.ne[1]),
++        static_cast<__nv_bfloat16*>(query.data),
++        static_cast<__nv_bfloat16*>(key.data),
++        static_cast<__nv_bfloat16*>(value.data)};
++    if (x.ne[1] <= 8) {
++        launch_conv_record_ada_shadow<1>(x, qk_weight, value_z_weight, base, stream);
++    } else {
++        launch_conv_record_ada_shadow<2>(x, qk_weight, value_z_weight, base, stream);
++    }
++}
++
+ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                         Tensor& z, cudaStream_t stream) {
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h
+index a007b45..3f14e4d 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h
+@@ -33,6 +33,17 @@ void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weig
+ void q4_gdn_input_half_launch(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                               Tensor& qk, Tensor& value, Tensor& z, bool output_gate, cudaStream_t stream);
+ 
++// research33 (NINFER_CONV_EPILOGUE=1): the record projection with gdn_projected_conv_kernel's convolution in the
++// dual Ada grid's epilogue (q4_q5_gdn_input_independent.cu). Bit-identical record, z, query, key and value.
++[[nodiscard]] bool conv_epilogue_enabled();
++[[nodiscard]] bool q4_gdn_input_conv_record_admits(const Weight& qk_weight, const Weight& value_z_weight,
++                                                   std::int32_t batch, std::int32_t width);
++void q4_gdn_input_conv_record_ada_launch(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                                         const Tensor& conv_weight, const Tensor& conv_states,
++                                         const Tensor& valid_columns, const Tensor& initial_state_slots,
++                                         const Tensor& tree_parents, Tensor& conv_record, Tensor& z, Tensor& query,
++                                         Tensor& key, Tensor& value, cudaStream_t stream);
++
+ void q4_q5_gdn_input_conv_record_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, const Tensor& conv_weight,
+                                         const Tensor& conv_states, const Tensor& valid_columns,
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index 65342f7..e9275a8 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -158,6 +158,12 @@ __device__ __forceinline__ unsigned q4_ada_decode_pair(unsigned byte) {
+     return *reinterpret_cast<const unsigned*>(&value);
+ }
+ 
++// research33: an epilogue with kConvRows also gets preload(first_weight_row, tid) right after the pipeline prologue
++// (cp.async copies that join the first in-loop group), stage(local_row, token, dot) beside each element call, and
++// rows_done(first_weight_row, tid, threads) once every element of the CTA is staged.
++template <class E>
++concept AdaConvRowsEpilogue = requires { E::kConvRows; };
++
+ // Epilogue::kPairedHalves == false: epilogue(weight_row, token, dot) for every CTA row and live
+ // token. true: epilogue(output_row, token, gate_dot, up_dot) for the CTA's AdaPairedHalfRows pairs.
+ // One CTA's work; `block` is the CTA index within this problem's grid.
+@@ -390,6 +396,7 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+         if (s < kPipeStages) { issue(s); }
+         cp_commit();
+     }
++    if constexpr (AdaConvRowsEpilogue<Epilogue>) { epilogue.preload(RowMap::weight_row(block, 0, kRows), tid); }
+     XFragment current[J];
+     load_x(0, current);
+     for (int s = 0; s < kPipeStages; ++s) {
+@@ -442,6 +449,18 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+             }
+             epilogue(block * kHalf + row, token, gate, up);
+         }
++    } else if constexpr (AdaConvRowsEpilogue<Epilogue>) {
++        for (int index = tid; index < kRows * S::kMaxTokens; index += S::kThreads) {
++            const int row   = index % kRows;
++            const int token = index / kRows;
++            if (token >= tokens) { continue; }
++            const int weight_row = RowMap::weight_row(block, row, kRows);
++            float value          = reduce(row, token);
++            if (super != nullptr) { value *= super[weight_row]; }
++            epilogue(weight_row, token, value);
++            epilogue.stage(row, token, value);
++        }
++        epilogue.rows_done(RowMap::weight_row(block, 0, kRows), tid, S::kThreads);
+     } else {
+         for (int index = tid; index < kRows * S::kMaxTokens; index += S::kThreads) {
+             const int row   = index % kRows;
+diff --git a/src/ops/wrapper/gdn_input_proj.cpp b/src/ops/wrapper/gdn_input_proj.cpp
+index f156cbd..28a5d2f 100644
+--- a/src/ops/wrapper/gdn_input_proj.cpp
++++ b/src/ops/wrapper/gdn_input_proj.cpp
+@@ -1017,6 +1017,17 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+                  tree_parents.ne[2] != 1 || tree_parents.ne[3] != 1)) {
+         throw std::invalid_argument("gdn_input_proj_conv_record: invalid tree parents");
+     }
++    // research33 (NINFER_CONV_EPILOGUE=1): the convolution in the projection grid's epilogue.
++    if (detail::conv_epilogue_enabled() &&
++        detail::q4_gdn_input_conv_record_admits(qk_weight, value_z_weight, geometry.batch, geometry.width)) {
++        Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
++        Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
++        Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
++        detail::q4_gdn_input_conv_record_ada_launch(x_flat, qk_weight, value_z_weight, conv_weight, conv_states,
++                                                    valid_columns, initial_state_slots, tree_parents, record_flat,
++                                                    z_flat, query, key, value, stream);
++        return;
++    }
+     const detail::Q4Q5GdnInputConvPlan plan =
+         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+     if (!tree && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused &&
+-- 
+2.34.1
+

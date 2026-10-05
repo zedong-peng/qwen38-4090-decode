@@ -1,0 +1,299 @@
+From 694fcda0bf04df5e3eff3e504ef87be2284a8827 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 41/49] research30: GDN projected conv fused into the chunked
+ record (NINFER_FUSED_CONV_RECORD, bit-exact, +1.0% slower, off)
+
+---
+ src/ops/gdn_input_proj/gdn_projected_conv.cu  | 38 ++++++++
+ src/ops/gdn_input_proj/gdn_projected_conv.h   | 13 +++
+ .../gated_delta_net/recurrent.cu              | 28 ++++++
+ .../gated_delta_net/recurrent.cuh             | 89 +++++++++++++++++--
+ src/ops/wrapper/gdn_input_proj.cpp            | 17 ++++
+ 5 files changed, 180 insertions(+), 5 deletions(-)
+
+diff --git a/src/ops/gdn_input_proj/gdn_projected_conv.cu b/src/ops/gdn_input_proj/gdn_projected_conv.cu
+index 01135aa..1b4b78d 100644
+--- a/src/ops/gdn_input_proj/gdn_projected_conv.cu
++++ b/src/ops/gdn_input_proj/gdn_projected_conv.cu
+@@ -10,6 +10,8 @@
+ #include <cuda_bf16.h>
+ 
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::ops::detail {
+@@ -210,4 +212,40 @@ void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& c
+              tree_parents, query, key, value, NoHistoryPublish{}, stream);
+ }
+ 
++namespace {
++thread_local PendingRecordConv pending_record_conv;
++}
++
++bool fused_conv_record_enabled() {
++    static const bool on = [] {
++        const char* e = std::getenv("NINFER_FUSED_CONV_RECORD");
++        const bool v  = e != nullptr && std::atoi(e) == 1;
++        if (v) { std::fprintf(stderr, "NINFER_FUSED_CONV_RECORD=1: record convolution fused into the chunked record\n"); }
++        return v;
++    }();
++    return on;
++}
++
++void defer_record_conv(const PendingRecordConv& pending) {
++    if (pending_record_conv.set) {
++        throw std::logic_error("GDN record convolution deferred twice without a record launch");
++    }
++    pending_record_conv     = pending;
++    pending_record_conv.set = true;
++}
++
++PendingRecordConv take_pending_record_conv() {
++    PendingRecordConv out = pending_record_conv;
++    pending_record_conv   = PendingRecordConv{};
++    return out;
++}
++
++void run_pending_record_conv(PendingRecordConv& p) {
++    if (!p.set) { return; }
++    gdn_projected_conv_record_launch(p.conv_record, p.conv_weight, p.conv_states, p.valid_columns,
++                                     p.initial_state_slots, p.tree_parents, p.query, p.key, p.value,
++                                     p.stream);
++    p.set = false;
++}
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/gdn_input_proj/gdn_projected_conv.h b/src/ops/gdn_input_proj/gdn_projected_conv.h
+index 67cdd1d..df27471 100644
+--- a/src/ops/gdn_input_proj/gdn_projected_conv.h
++++ b/src/ops/gdn_input_proj/gdn_projected_conv.h
+@@ -22,4 +22,17 @@ void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& c
+                                       Tensor& query, Tensor& key, Tensor& value,
+                                       cudaStream_t stream);
+ 
++// research30 (NINFER_FUSED_CONV_RECORD=1): a record convolution deferred to the next GDN record launch, which
++// fuses it into the chunked record kernel or else launches it first (run_pending_record_conv).
++struct PendingRecordConv {
++    bool set = false;
++    Tensor conv_record, conv_weight, conv_states, valid_columns, initial_state_slots, tree_parents;
++    Tensor query, key, value;
++    cudaStream_t stream = nullptr;
++};
++bool fused_conv_record_enabled();
++void defer_record_conv(const PendingRecordConv& pending);
++PendingRecordConv take_pending_record_conv();
++void run_pending_record_conv(PendingRecordConv& pending);
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+index cdb151e..020a641 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -6,6 +6,7 @@
+ 
+ #include "core/device.h"
+ #include "ops/linear_attention/gated_delta_net/recurrent.cuh"
++#include "ops/gdn_input_proj/gdn_projected_conv.h"
+ 
+ #include <cuda_bf16.h>
+ 
+@@ -110,6 +111,33 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+     // Research flag NINFER_GDN_CHUNKED_RECORD=1: the chunked (WY-form) record, read at each launch.
+     const char* chunked_flag = std::getenv("NINFER_GDN_CHUNKED_RECORD");
+     const bool chunked       = chunked_flag != nullptr && chunked_flag[0] == '1';
++    // research30 (NINFER_FUSED_CONV_RECORD=1): a convolution deferred by compose_record. The chunked route fuses it;
++    // any other route (or a mismatch) launches it first, as before.
++    ops::detail::PendingRecordConv conv = ops::detail::take_pending_record_conv();
++    if (conv.set) {
++        const bool fuse = chunked && q.ne[2] <= kStagedRecordMaxWidth && conv.stream == stream &&
++                          conv.conv_record.ne[0] == 10240 && conv.conv_record.ne[1] == q.ne[2] &&
++                          conv.query.data == q.data && conv.key.data == k.data && conv.value.data == v.data &&
++                          conv.tree_parents.data == tree_parents.data && q.ne[1] == 16 && v.ne[1] == 48 &&
++                          (Masked ? conv.valid_columns.data == valid_columns.data : conv.valid_columns.data == nullptr);
++        if (fuse) {
++            access.conv_in           = static_cast<const __nv_bfloat16*>(conv.conv_record.data);
++            access.conv_weight       = static_cast<const __nv_bfloat16*>(conv.conv_weight.data);
++            access.conv_state        = static_cast<const __nv_bfloat16*>(conv.conv_states.data);
++            access.conv_slots        = static_cast<const std::int32_t*>(conv.initial_state_slots.data);
++            access.conv_channels     = 10240;
++            access.conv_key_offset   = 2048;
++            access.conv_value_offset = 4096;
++            if (tree_parents.data != nullptr) {
++                recurrent_record_chunked_kernel<Masked, true, true><<<grid, block, 0, stream>>>(access);
++            } else {
++                recurrent_record_chunked_kernel<Masked, false, true><<<grid, block, 0, stream>>>(access);
++            }
++            CUDA_CHECK(cudaGetLastError());
++            return;
++        }
++        ops::detail::run_pending_record_conv(conv);
++    }
+     if (tree_parents.data != nullptr) {
+         if (q.ne[2] > kStagedRecordMaxWidth) {
+             throw std::invalid_argument("GDN tree records support at most 16 columns");
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index e325686..9a898c6 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -7,6 +7,7 @@
+ #include "ops/linear_attention/gated_delta_net/common.cuh"
+ #include "ops/common/mma.cuh"
+ #include "ops/common/l2_fill.cuh"
++#include "ops/gdn_input_proj/gdn_conv.cuh"
+ #include "ops/linear_attention/gated_delta_net/launch.h"
+ 
+ #include <cuda_bf16.h>
+@@ -379,6 +380,16 @@ struct RecordAccess {
+     // research29 (NINFER_L2_FILL): the chunked record's L2 fill, and bit 2 = load (not prefetch) next_states.
+     ops::L2Fill fill{};
+     std::int32_t fill_flags = 0;
++    // research30 (NINFER_FUSED_CONV_RECORD): the projected convolution fused into the chunked record. conv_in is
++    // the conv record [batch * width, conv_channels] (query rows at 0, key rows at conv_key_offset, value rows at
++    // conv_value_offset), conv_weight [4, conv_channels], conv_state history slots [slot][3][conv_channels].
++    const __nv_bfloat16* conv_in       = nullptr;
++    const __nv_bfloat16* conv_weight   = nullptr;
++    const __nv_bfloat16* conv_state    = nullptr;
++    const std::int32_t* conv_slots     = nullptr;
++    std::int32_t conv_channels         = 0;
++    std::int32_t conv_key_offset       = 0;
++    std::int32_t conv_value_offset     = 0;
+ 
+     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
+         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+@@ -1010,7 +1021,9 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+ // (bf16 operands; the FP32 state enters as a three-term bf16 split, 24-bit mantissa), then one 16-step forward substitution per
+ // state row (ancestors precede descendants in DFS pre-order, so the system is lower triangular). Same grid,
+ // access and record side effects as the staged kernel; outputs agree to FP32 rounding, not bit for bit.
+-template <bool Masked, bool Tree>
++// research30 (FusedConv): the record convolution runs here (see RecordAccess::conv_in). The shared key, query
++// and value rows first receive the channels' projected inputs, then each thread convolves its channels in place.
++template <bool Masked, bool Tree, bool FusedConv = false>
+ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+     recurrent_record_chunked_kernel(RecordAccess<Masked> access) {
+     const RecurrentCoordinates coord = access.coordinates();
+@@ -1053,14 +1066,47 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+     for (int task = thread; task < valid * kPacksPerColumn; task += kThreads) {
+         const int token = task / kPacksPerColumn;
+         const int pack  = task - token * kPacksPerColumn;
+-        cp_async<16>(&key_raw[token][pack * 8], access.key_ptr(coord, token) + pack * 8);
+-        cp_async<16>(&query_raw[token][pack * 8], access.query_ptr(coord, token) + pack * 8);
++        if constexpr (FusedConv) {
++            const __nv_bfloat16* in = access.conv_in + access.column(coord, token) * access.conv_channels +
++                                      coord.qk_head * kStateDim + pack * 8;
++            cp_async<16>(&key_raw[token][pack * 8], in + access.conv_key_offset);
++            cp_async<16>(&query_raw[token][pack * 8], in);
++        } else {
++            cp_async<16>(&key_raw[token][pack * 8], access.key_ptr(coord, token) + pack * 8);
++            cp_async<16>(&query_raw[token][pack * 8], access.query_ptr(coord, token) + pack * 8);
++        }
+     }
+     for (int task = thread; task < valid * (kBlockDv / 8); task += kThreads) {
+         const int token = task / (kBlockDv / 8);
+         const int pack  = task - token * (kBlockDv / 8);
+-        cp_async<16>(&value_raw[token][pack * 8],
+-                     access.value_ptr(coord, token) + tile_dv + pack * 8);
++        if constexpr (FusedConv) {
++            cp_async<16>(&value_raw[token][pack * 8],
++                         access.conv_in + access.column(coord, token) * access.conv_channels +
++                             access.conv_value_offset + coord.value_head * kStateDim + tile_dv + pack * 8);
++        } else {
++            cp_async<16>(&value_raw[token][pack * 8],
++                         access.value_ptr(coord, token) + tile_dv + pack * 8);
++        }
++    }
++    // research30: this thread's channels (query row `thread`, key row `thread`, value row `thread` of the
++    // tile for thread < 16): four weights and three history taps, loaded beside the copies.
++    float conv_w[3][4] = {};
++    float conv_h[3][3] = {};
++    if constexpr (FusedConv) {
++        const std::int64_t C    = access.conv_channels;
++        const std::int64_t hist = static_cast<std::int64_t>(access.conv_slots[coord.batch]) * C * 3;
++        const std::int64_t chan[3] = {
++            static_cast<std::int64_t>(coord.qk_head) * kStateDim + thread,
++            access.conv_key_offset + static_cast<std::int64_t>(coord.qk_head) * kStateDim + thread,
++            access.conv_value_offset + static_cast<std::int64_t>(coord.value_head) * kStateDim + tile_dv +
++                (thread & (kBlockDv - 1))};
++#pragma unroll
++        for (int i = 0; i < 3; ++i) {
++#pragma unroll
++            for (int k = 0; k < 4; ++k) { conv_w[i][k] = __bfloat162float(access.conv_weight[k * C + chan[i]]); }
++#pragma unroll
++            for (int k = 0; k < 3; ++k) { conv_h[i][k] = __bfloat162float(access.conv_state[hist + k * C + chan[i]]); }
++        }
+     }
+     for (int token = thread; token < valid; token += kThreads) {
+         const std::int64_t offset =
+@@ -1087,6 +1133,39 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+     cp_wait<0>();
+     __syncthreads();
+ 
++    if constexpr (FusedConv) {
++        // gdn_projected_conv_kernel's convolution, per channel column: DFS pre-order puts every ancestor before its
++        // descendants, so walking the columns backwards leaves each column's taps unconverted until it is done.
++        std::uint64_t parents = 0;
++        if constexpr (Tree) {
++            parents = gdn_pack_tree_parents(access.tree_parents + static_cast<std::int64_t>(coord.batch) * access.width,
++                                            access.width);
++        } else {
++#pragma unroll
++            for (int column = 1; column < kW; ++column) {
++                parents |= static_cast<std::uint64_t>(column - 1) << (4 * column);
++            }
++        }
++        const auto convolve = [&](auto& rows, int col, const float (&w)[4], const float (&h)[3]) {
++            const auto tap = [&](int column) { return __bfloat162float(rows[column][col]); };
++#pragma unroll 1
++            for (int token = valid - 1; token >= 0; --token) {
++                float s0, s1, s2;
++                gdn_tree_conv_taps(parents, token, h[0], h[1], h[2], tap, s0, s1, s2);
++                const float p = __bfloat162float(rows[token][col]);
++                float conv    = fmaf(w[0], s0, 0.0F);
++                conv          = fmaf(w[1], s1, conv);
++                conv          = fmaf(w[2], s2, conv);
++                conv          = fmaf(w[3], p, conv);
++                rows[token][col] = __float2bfloat16_rn(ops::silu(conv));
++            }
++        };
++        convolve(query_raw, thread, conv_w[0], conv_h[0]);
++        convolve(key_raw, thread, conv_w[1], conv_h[1]);
++        if (thread < kBlockDv) { convolve(value_raw, thread, conv_w[2], conv_h[2]); }
++        __syncthreads();
++    }
++
+     // Records: the raw inputs, exactly as the staged kernel writes them.
+     if (coord.state_tile == 0 &&
+         static_cast<int>(coord.value_head) % access.heads.group_size() == 0) {
+diff --git a/src/ops/wrapper/gdn_input_proj.cpp b/src/ops/wrapper/gdn_input_proj.cpp
+index ea55238..f156cbd 100644
+--- a/src/ops/wrapper/gdn_input_proj.cpp
++++ b/src/ops/wrapper/gdn_input_proj.cpp
+@@ -411,6 +411,23 @@ void compose_record(const Tensor& x, const Tensor& conv_weight, const Tensor& co
+     Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
+     Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
+     project(x_flat, record_flat, z_flat);
++    // research30 (NINFER_FUSED_CONV_RECORD=1): the next record launch fuses (or runs) the convolution.
++    if (detail::fused_conv_record_enabled() && conv_record.ne[0] == 10240 && query.ne[0] == 2048 &&
++        key.ne[0] == 2048 && value.ne[0] == 6144 && conv_record.ne[1] <= 16) {
++        detail::PendingRecordConv pending;
++        pending.conv_record         = conv_record;
++        pending.conv_weight         = conv_weight;
++        pending.conv_states         = conv_states;
++        pending.valid_columns       = valid_columns;
++        pending.initial_state_slots = initial_state_slots;
++        pending.tree_parents        = tree_parents;
++        pending.query               = query;
++        pending.key                 = key;
++        pending.value               = value;
++        pending.stream              = stream;
++        detail::defer_record_conv(pending);
++        return;
++    }
+     detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
+                                              initial_state_slots, tree_parents, query, key, value,
+                                              stream);
+-- 
+2.34.1
+

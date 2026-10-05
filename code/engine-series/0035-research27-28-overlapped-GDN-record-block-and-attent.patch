@@ -1,0 +1,822 @@
+From b24922d6b186a923b9196efbec949d993dd6488a Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 12:20:42 +0800
+Subject: [PATCH 35/49] research27/28: overlapped GDN record block and
+ attention (NINFER_GDN_OVERLAP=1|2, NINFER_ATTN_OVERLAP=1)
+
+Default off. Bit-identical to the serial route (482/482 ids), but 0.4-0.7% slower per round: the overlapped
+kernels share DRAM (union-busy time unchanged) and each fork/join adds an idle gap. Kept for the record.
+---
+ include/ninfer/ops/attn_input_proj.h          | 14 ++++
+ include/ninfer/ops/gdn_gating_proj.h          |  8 ++
+ include/ninfer/ops/gdn_input_proj.h           | 21 +++++
+ src/models/qwen3_5/execution/attention.cpp    | 26 +++++++
+ src/models/qwen3_5/execution/attention.h      | 16 ++++
+ src/models/qwen3_5/execution/gdn.cpp          | 54 +++++++++++++
+ src/models/qwen3_5/execution/gdn.h            | 23 ++++++
+ src/models/qwen3_5/execution/text.cpp         | 43 +++++++++--
+ .../q4_q5/q4_q5_attn_input_kernels.h          |  7 ++
+ .../q4_q5/q4_q5_attn_input_small_t.cu         | 70 +++++++++++++++++
+ .../bf16/bf16_gdn_gating_proj_kernels.h       |  4 +
+ .../bf16/bf16_gdn_norm_gating_proj_27.cu      | 77 +++++++++++++++++++
+ .../q4_q5/q4_q5_gdn_input_independent.cu      | 75 ++++++++++++++++++
+ .../q4_q5/q4_q5_gdn_input_kernels.h           |  9 +++
+ src/ops/wrapper/attn_input_proj.cpp           | 25 ++++++
+ src/ops/wrapper/gdn_gating_proj.cpp           | 16 ++++
+ src/ops/wrapper/gdn_input_proj.cpp            | 40 ++++++++++
+ 17 files changed, 520 insertions(+), 8 deletions(-)
+
+diff --git a/include/ninfer/ops/attn_input_proj.h b/include/ninfer/ops/attn_input_proj.h
+index a032b8e..246e65b 100644
+--- a/include/ninfer/ops/attn_input_proj.h
++++ b/include/ninfer/ops/attn_input_proj.h
+@@ -96,4 +96,18 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
+ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tensor& q, Tensor& k,
+                      Tensor& v, cudaStream_t stream);
+ 
++/**
++ * research28 (NINFER_ATTN_OVERLAP): whether the paired-parent projection at `cols` columns can run as the halves below:
++ * all-Q4 parents of the Qwen3.8-27B geometry and T in [1, 16] (the dual Ada grid of the ParentSplitFixed plan).
++ */
++[[nodiscard]] bool attn_input_proj_halves_admit(const Weight& query_key_weight, const Weight& gate_value_weight,
++                                                std::int32_t cols);
++
++/**
++ * research28: one half of the paired-parent projection, bit for bit: gate_half == false writes q, k and v, true writes
++ * gate. The halves read only x and the parents, so they may run on different streams.
++ */
++void attn_input_proj_half(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
++                          Tensor& q, Tensor& gate, Tensor& k, Tensor& v, bool gate_half, cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/include/ninfer/ops/gdn_gating_proj.h b/include/ninfer/ops/gdn_gating_proj.h
+index b28bab5..b328692 100644
+--- a/include/ninfer/ops/gdn_gating_proj.h
++++ b/include/ninfer/ops/gdn_gating_proj.h
+@@ -130,4 +130,12 @@ void gdn_norm_gating_control(const Tensor& x, const Tensor& norm_weight, float e
+ void gdn_norm_gating_fp8_hidden(const Tensor& x, const Tensor& norm_weight, float eps,
+                                 Tensor& codes, Tensor& scales, cudaStream_t stream);
+ 
++/**
++ * research27: the hidden output h (BF16 [5120,T]) of gdn_norm_gating_proj alone, bit for bit as the complete Op writes
++ * it for the same x, norm_weight, eps and T, for problems gdn_norm_gating_split_admits. With
++ * gdn_norm_gating_control it splits the complete Op into a hidden and a control half.
++ */
++void gdn_norm_gating_hidden(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
++                            cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/include/ninfer/ops/gdn_input_proj.h b/include/ninfer/ops/gdn_input_proj.h
+index 094abb1..5fc676b 100644
+--- a/include/ninfer/ops/gdn_input_proj.h
++++ b/include/ninfer/ops/gdn_input_proj.h
+@@ -291,4 +291,25 @@ void gdn_input_proj_conv_record(const Tensor& codes, const Tensor& scales,
+                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                 Tensor& z, GdnRecordRows rows, cudaStream_t stream);
+ 
++/**
++ * research27 (NINFER_GDN_OVERLAP): whether the paired-parent record Op's composed tree route at this geometry can run
++ * as the halves below: plain Q4 parents (no Q3 shadow), B = 1, W in [2, 16], and the independent dual-grid plan.
++ */
++[[nodiscard]] bool gdn_input_proj_record_halves_admit(const Weight& qk_weight, const Weight& value_z_weight,
++                                                      std::int32_t batch_size, std::int32_t width);
++
++/**
++ * research27: one row half of the paired-parent record Op's projection, bit for bit: QueryKeyValue writes the projected
++ * query/key/value channels into conv_record (the convolution is not run; see gdn_input_proj_record_conv), OutputGate
++ * writes z. The halves read only x and the parents, so they may run on different streams.
++ */
++void gdn_input_proj_record_half(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                                Tensor& conv_record, Tensor& z, GdnRecordRows rows, cudaStream_t stream);
++
++/** research27: the record Op's convolution step on a projected conv_record (query, key, value), bit for bit. */
++void gdn_input_proj_record_conv(const Tensor& conv_weight, const Tensor& conv_states, const Tensor& valid_columns,
++                                const Tensor& initial_state_slots, const Tensor& tree_parents,
++                                const Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
++                                cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
+index 4bd13ca..79cc122 100644
+--- a/src/models/qwen3_5/execution/attention.cpp
++++ b/src/models/qwen3_5/execution/attention.cpp
+@@ -9,6 +9,8 @@
+ #include "ninfer/ops/rmsnorm_attn_input_proj.h"
+ #include "ninfer/ops/rope.h"
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::models::qwen3_5::execution {
+@@ -51,6 +53,30 @@ void attention_norm_projection(const Tensor& residual, const Tensor& norm, float
+     }
+ }
+ 
++bool attention_overlap_q4_admits(const AttentionParameters& parameters, std::int32_t tokens) {
++    static const bool on = [] {
++        const char* e = std::getenv("NINFER_ATTN_OVERLAP");
++        const bool v  = e != nullptr && std::atoi(e) > 0;
++        if (v) { std::fprintf(stderr, "NINFER_ATTN_OVERLAP: paired-Q4 attention block in overlapped form\n"); }
++        return v;
++    }();
++    if (!on) { return false; }
++    const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
++    return pair != nullptr && ops::attn_input_proj_halves_admit(pair->first, pair->second, tokens);
++}
++
++void attention_norm_projection_overlapped_q4(const Tensor& residual, const Tensor& norm, float eps,
++                                             const AttentionParameters& parameters, Tensor& hidden, Tensor& query,
++                                             Tensor& gate, Tensor& key, Tensor& value, const DeviceContext& device) {
++    const auto& pair        = std::get<ops::PairedProjectionWeights>(parameters.projection);
++    const cudaStream_t main = device.stream;
++    ops::rmsnorm(residual, norm, eps, true, hidden, main);
++    ops::attn_input_proj_half(hidden, pair.first, pair.second, query, gate, key, value, false, main);
++    CUDA_CHECK(cudaEventRecord(device.concurrent.events[kAttnQkvReady], main));
++    CUDA_CHECK(cudaStreamWaitEvent(device.concurrent.stream, device.concurrent.events[kAttnQkvReady], 0));
++    ops::attn_input_proj_half(hidden, pair.first, pair.second, query, gate, key, value, true, main);
++}
++
+ void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
+                cudaStream_t stream) {
+     require_rope_axes(positions, config);
+diff --git a/src/models/qwen3_5/execution/attention.h b/src/models/qwen3_5/execution/attention.h
+index 44c9741..47cfb55 100644
+--- a/src/models/qwen3_5/execution/attention.h
++++ b/src/models/qwen3_5/execution/attention.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include "models/qwen3_5/execution/parameters.h"
++#include "core/device.h"
+ 
+ namespace ninfer::models::qwen3_5::execution {
+ 
+@@ -17,6 +18,21 @@ void attention_norm_projection(const Tensor& residual, const Tensor& norm, float
+                                Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                                cudaStream_t stream);
+ 
++// research28 (NINFER_ATTN_OVERLAP=1): whether attention_norm_projection_overlapped_q4 serves this projection at T.
++[[nodiscard]] bool attention_overlap_q4_admits(const AttentionParameters& parameters, std::int32_t tokens);
++// Events of DeviceContext::concurrent for research28 (the GDN block's fork/join pairs complete before an attention
++// block starts, so the indices are shared).
++inline constexpr std::size_t kAttnQkvReady       = 1;
++inline constexpr std::size_t kAttnAttentionReady = 2;
++// research28: attention_norm_projection on the paired all-Q4 route in overlapped form. On device.stream: the norm, the
++// query/key/value half of the projection, a fork to device.concurrent.stream (kAttnQkvReady), then the gate half. The
++// caller queues the q/k norm-RoPE and the attention on device.concurrent.stream, records kAttnAttentionReady there,
++// and makes device.stream wait for it before the gate multiply. Every output equals attention_norm_projection's bit
++// for bit.
++void attention_norm_projection_overlapped_q4(const Tensor& residual, const Tensor& norm, float eps,
++                                             const AttentionParameters& parameters, Tensor& hidden, Tensor& query,
++                                             Tensor& gate, Tensor& key, Tensor& value, const DeviceContext& device);
++
+ void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
+                cudaStream_t stream);
+ // Unit-offset RMSNorm of every query and key head into the normalized tensors, then the configured
+diff --git a/src/models/qwen3_5/execution/gdn.cpp b/src/models/qwen3_5/execution/gdn.cpp
+index 9822ac9..2f273b3 100644
+--- a/src/models/qwen3_5/execution/gdn.cpp
++++ b/src/models/qwen3_5/execution/gdn.cpp
+@@ -8,6 +8,8 @@
+ #include "ninfer/ops/gdn_input_proj.h"
+ 
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::models::qwen3_5::execution {
+@@ -184,6 +186,58 @@ void gdn_projection_record_overlapped(const Tensor& residual, const Tensor& norm
+                                     ops::GdnRecordRows::OutputGate, main);
+ }
+ 
++int gdn_overlap_q4_level(const GdnParameters& parameters, std::int32_t batch, std::int32_t width) {
++    static const int level = [] {
++        const char* e = std::getenv("NINFER_GDN_OVERLAP");
++        const int v   = e != nullptr ? std::atoi(e) : 0;
++        if (v > 0) {
++            std::fprintf(stderr, "NINFER_GDN_OVERLAP=%d: paired-Q4 GDN record block in overlapped form%s\n", v,
++                         v >= 2 ? " (norm/control split)" : "");
++        }
++        return v;
++    }();
++    if (level <= 0) { return 0; }
++    const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection);
++    if (pair == nullptr || !ops::gdn_input_proj_record_halves_admit(pair->first, pair->second, batch, width)) {
++        return 0;
++    }
++    if (level >= 2 && !ops::gdn_norm_gating_split_admits(48, 5120, batch * width)) { return 1; }
++    return level >= 2 ? 2 : 1;
++}
++
++void gdn_norm_control_overlapped_q4(const Tensor& residual, const Tensor& norm, float epsilon,
++                                    const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
++                                    const DeviceContext& device) {
++    const cudaStream_t main = device.stream;
++    const cudaStream_t side = device.concurrent.stream;
++    ops::gdn_norm_gating_hidden(residual, norm, epsilon, hidden, main);
++    fork_concurrent(device, kGdnActivationReady, main);
++    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
++        ops::gdn_norm_gating_control(residual, norm, epsilon, pair->first, pair->second, parameters.a_log,
++                                     parameters.dt_bias, g, beta, side);
++    } else {
++        ops::gdn_norm_gating_control(residual, norm, epsilon, std::get<LinearParameters>(parameters.control).weight,
++                                     parameters.a_log, parameters.dt_bias, g, beta, side);
++    }
++}
++
++void gdn_projection_record_overlapped_q4(const Tensor& hidden, const GdnParameters& parameters,
++                                         const Tensor& conv_states, const Tensor& valid_columns,
++                                         const Tensor& initial_slots, const Tensor& tree_parents,
++                                         Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
++                                         const DeviceContext& device) {
++    const auto& pair        = std::get<ops::PairedProjectionWeights>(parameters.projection);
++    const cudaStream_t main = device.stream;
++    const cudaStream_t side = device.concurrent.stream;
++    ops::gdn_input_proj_record_half(hidden, pair.first, pair.second, conv_record, z,
++                                    ops::GdnRecordRows::QueryKeyValue, main);
++    fork_concurrent(device, kGdnQkvReady, main);
++    ops::gdn_input_proj_record_conv(parameters.convolution, conv_states, valid_columns, initial_slots, tree_parents,
++                                    conv_record, query, key, value, side);
++    ops::gdn_input_proj_record_half(hidden, pair.first, pair.second, conv_record, z, ops::GdnRecordRows::OutputGate,
++                                    main);
++}
++
+ void gdn_join_concurrent(const DeviceContext& device, std::size_t event, cudaStream_t stream) {
+     CUDA_CHECK(cudaStreamWaitEvent(stream, device.concurrent.events[event], 0));
+ }
+diff --git a/src/models/qwen3_5/execution/gdn.h b/src/models/qwen3_5/execution/gdn.h
+index b4018c6..6c00533 100644
+--- a/src/models/qwen3_5/execution/gdn.h
++++ b/src/models/qwen3_5/execution/gdn.h
+@@ -39,6 +39,29 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
+                            Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                            cudaStream_t stream);
+ 
++// research27 (NINFER_GDN_OVERLAP=1|2): the level of the overlapped paired-Q4 record block admitted for this
++// projection and geometry (0 = the serial route). See gdn_projection_record_overlapped_q4.
++[[nodiscard]] int gdn_overlap_q4_level(const GdnParameters& parameters, std::int32_t batch, std::int32_t width);
++
++// research27, level 2: the norm and controls of gdn_norm_control split in two. On `stream` (device.stream): the BF16
++// hidden; on device.concurrent.stream, forked from it: the control dots (g, beta). Every output equals
++// gdn_norm_control's bit for bit. residual must stay unmodified until the control dots are complete (the caller's
++// join before the output projection orders it).
++void gdn_norm_control_overlapped_q4(const Tensor& residual, const Tensor& norm, float epsilon,
++                                    const GdnParameters& parameters, Tensor& hidden, Tensor& g, Tensor& beta,
++                                    const DeviceContext& device);
++
++// research27: gdn_projection_record on the paired Q4 route in overlapped form. On device.stream: the qk + value half
++// of the projection into conv_record, then (after a fork) the z half. On device.concurrent.stream: the convolution
++// (query, key, value). The caller queues the recurrence on device.concurrent.stream, records kGdnRecurrenceReady there,
++// and makes device.stream wait for it before reading the recurrence output. Every output equals gdn_projection_record
++// bit for bit.
++void gdn_projection_record_overlapped_q4(const Tensor& hidden, const GdnParameters& parameters,
++                                         const Tensor& conv_states, const Tensor& valid_columns,
++                                         const Tensor& initial_slots, const Tensor& tree_parents,
++                                         Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
++                                         const DeviceContext& device);
++
+ // Event of DeviceContext::concurrent that the caller records on the concurrent stream once the
+ // recurrence it queued there after gdn_projection_record_overlapped is complete.
+ inline constexpr std::size_t kGdnRecurrenceReady = 2;
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 919e7d4..3c60605 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -991,8 +991,17 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
+     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
+     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
+-    attention_norm_projection(x, w.input_norm, config_.rms_norm_eps, p, h, q_flat, gate_flat,
+-                              k_flat, v_flat, work_, s);
++    // research28 (NINFER_ATTN_OVERLAP): norm-RoPE and attention beside the gate half (attention.h).
++    const bool attn_overlap =
++        ph == Phase::Verify && active_sequence_batch_ != 0 && attention_overlap_q4_admits(p, T);
++    if (attn_overlap) {
++        attention_norm_projection_overlapped_q4(x, w.input_norm, config_.rms_norm_eps, p, h, q_flat,
++                                                gate_flat, k_flat, v_flat, ctx_);
++    } else {
++        attention_norm_projection(x, w.input_norm, config_.rms_norm_eps, p, h, q_flat, gate_flat,
++                                  k_flat, v_flat, work_, s);
++    }
++    const cudaStream_t as = attn_overlap ? ctx_.concurrent.stream : s;
+ 
+     const auto results = workspace::text_attention_results(work_, config_, T);
+     Tensor qn =
+@@ -1006,7 +1015,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+     text_qk_rmsnorm_rope(rope_for_op, *config_.rope_parameters, q, k, p.query_norm, p.key_norm,
+-                         config_.rms_norm_eps, qn, kn, s);
++                         config_.rms_norm_eps, qn, kn, as);
+ 
+     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
+                                        dimension(config_.attention->num_attention_heads), T});
+@@ -1039,7 +1048,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+              dimension(config_.attention->num_key_value_heads)},
+             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
+-            a_batch, s);
++            a_batch, as);
+     } else {
+         ops::causal_softmax_attention(
+             qn, kn, v, cache_positions, Tensor{}, Tensor{}, kv_table_rows,
+@@ -1050,6 +1059,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
+             s);
+     }
++    if (attn_overlap) {
++        CUDA_CHECK(cudaEventRecord(ctx_.concurrent.events[kAttnAttentionReady], as));
++        CUDA_CHECK(cudaStreamWaitEvent(s, ctx_.concurrent.events[kAttnAttentionReady], 0));
++    }
+     ops::sigmoid_mul(gate, a, s);
+ 
+     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
+@@ -1070,7 +1083,15 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+         ph == Phase::Verify && gdn_state_action_ == GdnStateAction::RecordForReplay &&
+         active_sequence_batch_ > 0 &&
+         gdn_record_overlap_admits(p, active_sequence_batch_, active_sequence_width_);
+-    if (!overlapped) {
++    // research27 (NINFER_GDN_OVERLAP): the paired-Q4 record block in overlapped form (gdn.h).
++    const int overlap_q4 = !overlapped && ph == Phase::Verify &&
++                                   gdn_state_action_ == GdnStateAction::RecordForReplay &&
++                                   active_sequence_batch_ > 0
++                               ? gdn_overlap_q4_level(p, active_sequence_batch_, active_sequence_width_)
++                               : 0;
++    if (overlap_q4 >= 2) {
++        gdn_norm_control_overlapped_q4(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, ctx_);
++    } else if (!overlapped) {
+         gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+                          ctx_.execution_view());
+     }
+@@ -1120,6 +1141,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                     x, w.input_norm, config_.rms_norm_eps, p, conv_states, valid,
+                     *active_linear_state_source_slots_, tree_parents, records.conv, query_output,
+                     key_output, value_output, gate_output, g, beta, codes, scales, ctx_);
++            } else if (overlap_q4 > 0) {
++                gdn_projection_record_overlapped_q4(projection_input, p, conv_states, valid,
++                                                    *active_linear_state_source_slots_, tree_parents,
++                                                    records.conv, query_output, key_output, value_output,
++                                                    gate_output, ctx_);
+             } else {
+                 gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+                                       *active_linear_state_source_slots_, tree_parents,
+@@ -1182,7 +1208,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                                            ? state_.layer_view(next_layer).recurrent
+                                            : Tensor{};
+             // The overlapped route queues the recurrence on the concurrent stream beside z.
+-            const cudaStream_t record_stream = overlapped ? ctx_.concurrent.stream : s;
++            const cudaStream_t record_stream =
++                overlapped || overlap_q4 > 0 ? ctx_.concurrent.stream : s;
+             ops::gated_delta_net_replay_record(
+                 q_batch, k_batch, v_batch, g_batch, beta_batch,
+                 static_cast<float>(
+@@ -1190,7 +1217,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
+                 records.value, records.gate, out_batch, next_states,
+                 verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{}, record_stream);
+-            if (overlapped) {
++            if (overlapped || overlap_q4 > 0) {
+                 CUDA_CHECK(
+                     cudaEventRecord(ctx_.concurrent.events[kGdnRecurrenceReady], record_stream));
+             }
+@@ -1218,7 +1245,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                     .view({dimension(config_.gdn->linear_value_head_dim),
+                            dimension(config_.gdn->linear_num_value_heads), T});
+     // The overlapped route ran the recurrence on the concurrent stream.
+-    if (overlapped) { gdn_join_concurrent(ctx_, kGdnRecurrenceReady, s); }
++    if (overlapped || overlap_q4 > 0) { gdn_join_concurrent(ctx_, kGdnRecurrenceReady, s); }
+     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
+ 
+     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h
+index e9cd09c..d253be7 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h
+@@ -11,6 +11,13 @@ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_we
+                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
+                                      Tensor& k, Tensor& v, cudaStream_t stream);
+ 
++// research28 (NINFER_ATTN_OVERLAP): the all-Q4 dual Ada grid of q4_q5_attn_input_small_t_launch as two launches.
++// gate_half == false runs the query/key rows and the value rows of gate_value (q, k, v), true the gate rows alone.
++// Every CTA runs the code of its dual-grid CTA, so each output is bit for bit the dual grid's. All-Q4 parents only,
++// T in [1, 16].
++void q4_attn_input_half_launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
++                               Tensor& q, Tensor& gate, Tensor& k, Tensor& v, bool gate_half, cudaStream_t stream);
++
+ void q4_q5_attn_input_mixed_r32_c32_s2_launch(const Tensor& x, const Weight& w0, const Weight& w1,
+                                               Tensor& q, Tensor& g, Tensor& k, Tensor& v,
+                                               cudaStream_t stream);
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+index 297bc4a..878bca5 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+@@ -325,4 +325,74 @@ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_we
+     launch_q5(x, gate_value_weight, gate, v, stream);
+ }
+ 
++namespace {
++struct AttnRowsEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* out;
++    std::int32_t ld;
++
++    __device__ __forceinline__ void operator()(int row, int token, float result) const {
++        out[static_cast<std::int64_t>(token) * ld + row] = __float2bfloat16(result);
++    }
++};
++
++// The halves of launch_dual_ada<TokenTiles, GateValueRowTiles, QueryKeyGroups, true>.
++template <int TokenTiles, int GateValueRowTiles, int QueryKeyGroups>
++void launch_half_ada(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight, Tensor& q,
++                     Tensor& gate, Tensor& k, Tensor& v, bool gate_half, cudaStream_t stream) {
++    using SG = Q4AdaSmallTSchedule<GateValueRowTiles, 8, TokenTiles, 8, 2>;
++    using SQ = Q4AdaSmallTSchedule<2, 8, TokenTiles, QueryKeyGroups, 2>;
++    static_assert(kSplitRow % SG::kRowsPerCta == 0 && (kParentRows - kSplitRow) % SG::kRowsPerCta == 0 &&
++                  kParentRows % SQ::kRowsPerCta == 0);
++    const auto* x_data      = static_cast<const __nv_bfloat16*>(x.data);
++    const std::int32_t x_ld = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
++    if (gate_half) {
++        ada_small_t_mma_launch<SG, kHidden>(
++            x_data, x_ld, static_cast<const std::uint8_t*>(gate_value_weight.qdata), nullptr,
++            ada_scales(gate_value_weight), kSplitRow, x.ne[1],
++            AttnRowsEpilogue{static_cast<__nv_bfloat16*>(gate.data),
++                             static_cast<std::int32_t>(gate.nb[1] / sizeof(__nv_bfloat16))},
++            stream, ada_super(gate_value_weight));
++    } else {
++        // Row-split planes: 32 code bytes and one LS8 byte (or one FP16 scale) per row and 64-weight group, and one
++        // LS8 super-scale per row, so the value rows start kSplitRow rows in.
++        constexpr std::int64_t kGroups = kHidden / 64;
++        const std::int64_t scale_bytes = gate_value_weight.scales_ls8 != nullptr ? 1 : 2;
++        const float* super             = ada_super(gate_value_weight);
++        // Same strides as launch_dual_ada's query/key store.
++        const AttnQueryKeyEpilogue query_key_epilogue{static_cast<__nv_bfloat16*>(q.data), q.ne[0],
++                                                      static_cast<__nv_bfloat16*>(k.data), k.ne[0]};
++        ada_small_t_mma_dual_launch<SG, kHidden, SQ, kHidden>(
++            x_data, x_ld, x.ne[1],
++            AdaSmallTOperand<AttnRowsEpilogue>{
++                static_cast<const std::uint8_t*>(gate_value_weight.qdata) + kSplitRow * kGroups * 32, nullptr,
++                ada_scales(gate_value_weight) + kSplitRow * kGroups * scale_bytes,
++                AttnRowsEpilogue{static_cast<__nv_bfloat16*>(v.data),
++                                 static_cast<std::int32_t>(v.nb[1] / sizeof(__nv_bfloat16))},
++                super != nullptr ? super + kSplitRow : nullptr},
++            kParentRows - kSplitRow,
++            AdaSmallTOperand<AttnQueryKeyEpilogue>{static_cast<const std::uint8_t*>(query_key_weight.qdata),
++                                                   nullptr, ada_scales(query_key_weight), query_key_epilogue,
++                                                   ada_super(query_key_weight)},
++            kParentRows, stream);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++} // namespace
++
++void q4_attn_input_half_launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
++                               Tensor& q, Tensor& gate, Tensor& k, Tensor& v, bool gate_half, cudaStream_t stream) {
++    if (gate_value_weight.qtype != QType::Q4_G64_FP16 || query_key_weight.qtype != QType::Q4_G64_FP16 ||
++        query_key_weight.padded_shape[1] != kHidden || gate_value_weight.padded_shape[1] != kHidden ||
++        x.ne[1] < 1 || x.ne[1] > 16) {
++        throw std::invalid_argument("Q4 attention input halves: parents or T not admitted");
++    }
++    if (x.ne[1] <= 8) {
++        launch_half_ada<1, 2, 8>(x, query_key_weight, gate_value_weight, q, gate, k, v, gate_half, stream);
++    } else {
++        launch_half_ada<2, 4, 16>(x, query_key_weight, gate_value_weight, q, gate, k, v, gate_half, stream);
++    }
++}
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
+index 4254e84..cf51ac5 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h
+@@ -24,6 +24,10 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
+ void bf16_gdn_norm_27_fp8_hidden_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                         Tensor& codes, Tensor& scales, cudaStream_t stream);
+ 
++// research27: the fused route's h alone, BF16 [5120,T], bit for bit.
++void bf16_gdn_norm_27_bf16_hidden_launch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
++                                         cudaStream_t stream);
++
+ enum class Bf16GdnGatingTokenVariant {
+     None,
+     Full,
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
+index 460de91..55996f4 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
+@@ -204,8 +204,85 @@ __global__ __launch_bounds__(Threads) void gdn_norm_27_fp8_hidden_kernel(
+     }
+     if (tid == 0) { scales[blockIdx.x] = scale; }
+ }
++// research27: the h of gdn_norm_gating_27_simt<*, Threads> for one token per CTA, as BF16: the norm exactly as
++// gdn_norm_27_fp8_hidden_kernel forms it (the fused kernel's chunk partition, FMA order, warp reductions and in-order
++// warp sum), each value rounded to BF16 as the fused kernel stores it.
++template <int Threads>
++__global__ __launch_bounds__(Threads) void gdn_norm_27_bf16_hidden_kernel(
++    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ nw, __nv_bfloat16* __restrict__ h,
++    float eps) {
++    constexpr int D = kGdn27Hidden, Warps = Threads / 32, Chunks = (D / 8 + Threads - 1) / Threads;
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const std::int64_t row = std::int64_t(blockIdx.x) * D;
++    int4 xv[Chunks]{}, nv[Chunks]{};
++#pragma unroll
++    for (int c = 0; c < Chunks; ++c) {
++        const int base = (tid + c * Threads) * 8;
++        if (base < D) {
++            xv[c] = load_vec<int4>(x + row + base);
++            nv[c] = load_vec<int4>(nw + base);
++        }
++    }
++    float ss = 0.0f;
++#pragma unroll
++    for (int c = 0; c < Chunks; ++c) {
++        if ((tid + c * Threads) * 8 < D) {
++            const auto* xp = reinterpret_cast<const unsigned*>(&xv[c]);
++#pragma unroll
++            for (int p = 0; p < 4; ++p) {
++                const float2 v = bf16x2_bits_to_float2(xp[p]);
++                ss             = fmaf(v.x, v.x, ss);
++                ss             = fmaf(v.y, v.y, ss);
++            }
++        }
++    }
++    __shared__ float partial[Warps], inverse_shared;
++    ss = warp_reduce_sum(ss);
++    if (lane == 0) { partial[warp] = ss; }
++    __syncthreads();
++    if (tid == 0) {
++        float s = 0;
++#pragma unroll
++        for (int w = 0; w < Warps; ++w) { s += partial[w]; }
++        inverse_shared = rsqrtf(s / D + eps);
++    }
++    __syncthreads();
++    const float inv = inverse_shared;
++#pragma unroll
++    for (int c = 0; c < Chunks; ++c) {
++        const int base = (tid + c * Threads) * 8;
++        if (base < D) {
++            const auto* xp = reinterpret_cast<const unsigned*>(&xv[c]);
++            const auto* np = reinterpret_cast<const unsigned*>(&nv[c]);
++            uint4 out;
++            auto* op = reinterpret_cast<__nv_bfloat162*>(&out);
++#pragma unroll
++            for (int p = 0; p < 4; ++p) {
++                const float2 v = bf16x2_bits_to_float2(xp[p]);
++                const float2 n = bf16x2_bits_to_float2(np[p]);
++                op[p]          = __floats2bfloat162_rn(v.x * inv * (1 + n.x), v.y * inv * (1 + n.y));
++            }
++            *reinterpret_cast<uint4*>(h + row + base) = out;
++        }
++    }
++}
+ } // namespace
+ 
++void bf16_gdn_norm_27_bf16_hidden_launch(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
++                                         cudaStream_t stream) {
++    const auto launch = [&]<int Threads>() {
++        gdn_norm_27_bf16_hidden_kernel<Threads><<<x.ne[1], Threads, 0, stream>>>(
++            static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(norm_weight.data),
++            static_cast<__nv_bfloat16*>(h.data), eps);
++    };
++    if (gdn_norm_27_threads(x.ne[1]) == 512) {
++        launch.template operator()<512>();
++    } else {
++        launch.template operator()<256>();
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& alog, const Tensor& bias, Tensor& g,
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+index b068920..99ddc0d 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+@@ -401,4 +401,79 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
+     launch_q5(x, value_z_weight, value, z, stream);
+ }
+ 
++namespace {
++struct GdnZEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* z;
++    std::int32_t z_ld;
++
++    __device__ __forceinline__ void operator()(int row, int token, float result) const {
++        z[static_cast<std::int64_t>(token) * z_ld + row] = __float2bfloat16(result);
++    }
++};
++
++// The halves of launch_dual_ada<TokenTiles, true>: same schedules, same operands, rows split by launch.
++template <int TokenTiles>
++void launch_half_ada(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight, Tensor& qk,
++                     Tensor& value, Tensor& z, bool output_gate, cudaStream_t stream) {
++    using SV = Q4AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>;
++    using SQ = Q4AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>;
++    static_assert(kValueRows % SV::kRowsPerCta == 0 && kZRows % SV::kRowsPerCta == 0 &&
++                  kQkRows % SQ::kRowsPerCta == 0);
++    const auto* x_data      = static_cast<const __nv_bfloat16*>(x.data);
++    const std::int32_t x_ld = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
++    if (output_gate) {
++        // Row-split planes: 32 code bytes and one LS8 byte (or one FP16 scale) per row and 64-weight group, and one
++        // LS8 super-scale per row, so the z rows start kValueRows rows in.
++        constexpr std::int64_t kGroups = kHidden / 64;
++        const std::int64_t scale_bytes = value_z_weight.scales_ls8 != nullptr ? 1 : 2;
++        const float* super             = ada_super(value_z_weight);
++        ada_small_t_mma_launch<SV, kHidden>(
++            x_data, x_ld,
++            static_cast<const std::uint8_t*>(value_z_weight.qdata) + kValueRows * kGroups * 32, nullptr,
++            ada_scales(value_z_weight) + kValueRows * kGroups * scale_bytes, kZRows, x.ne[1],
++            GdnZEpilogue{static_cast<__nv_bfloat16*>(z.data),
++                         static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16))},
++            stream, super != nullptr ? super + kValueRows : nullptr);
++    } else {
++        const GdnValueZEpilogue value_epilogue{
++            static_cast<__nv_bfloat16*>(value.data),
++            static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16)),
++            static_cast<__nv_bfloat16*>(z.data), static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16))};
++        const GdnQkEpilogue qk_epilogue{static_cast<__nv_bfloat16*>(qk.data),
++                                        static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16))};
++        ada_small_t_mma_dual_launch<SV, kHidden, SQ, kHidden>(
++            x_data, x_ld, x.ne[1],
++            AdaSmallTOperand<GdnValueZEpilogue>{static_cast<const std::uint8_t*>(value_z_weight.qdata), nullptr,
++                                                ada_scales(value_z_weight), value_epilogue,
++                                                ada_super(value_z_weight)},
++            kValueRows,
++            AdaSmallTOperand<GdnQkEpilogue>{static_cast<const std::uint8_t*>(qk_weight.qdata), nullptr,
++                                            ada_scales(qk_weight), qk_epilogue, ada_super(qk_weight)},
++            kQkRows, stream);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++} // namespace
++
++bool q4_gdn_input_halves_admit(const Weight& qk_weight, const Weight& value_z_weight, std::int32_t tokens) {
++    return value_z_weight.qtype == QType::Q4_G64_FP16 && qk_weight.qtype == QType::Q4_G64_FP16 &&
++           qk_weight.q3_low == nullptr && value_z_weight.q3_low == nullptr &&
++           qk_weight.padded_shape[1] == kHidden && value_z_weight.padded_shape[1] == kHidden && tokens >= 1 &&
++           tokens <= 16;
++}
++
++void q4_gdn_input_half_launch(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                              Tensor& qk, Tensor& value, Tensor& z, bool output_gate, cudaStream_t stream) {
++    if (!q4_gdn_input_halves_admit(qk_weight, value_z_weight, x.ne[1])) {
++        throw std::invalid_argument("Q4 GDN input halves: parents or T not admitted");
++    }
++    if (x.ne[1] <= 8) {
++        launch_half_ada<1>(x, qk_weight, value_z_weight, qk, value, z, output_gate, stream);
++    } else {
++        launch_half_ada<2>(x, qk_weight, value_z_weight, qk, value, z, output_gate, stream);
++    }
++}
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h
+index 1ac24be..a007b45 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h
+@@ -24,6 +24,15 @@ void q4_q5_gdn_input_conv_snapshot_launch(const Tensor& x, const Weight& qk_weig
+                                           Tensor& key, Tensor& value, Tensor& z,
+                                           cudaStream_t stream);
+ 
++// research27 (NINFER_GDN_OVERLAP): the all-Q4 dual Ada grid of q4_q5_gdn_input_independent_launch as two launches.
++// output_gate == false runs the qk rows and the value rows of value_z (into qk and value), true the z rows alone (rows
++// [6144, 12288) of value_z by pointer offset into the row-split planes). Every CTA runs the code of its dual-grid CTA,
++// so each output is bit for bit the dual grid's. Only plain Q4 parents (no Q3 shadow) at T in [1, 16] are admitted.
++[[nodiscard]] bool q4_gdn_input_halves_admit(const Weight& qk_weight, const Weight& value_z_weight,
++                                             std::int32_t tokens);
++void q4_gdn_input_half_launch(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                              Tensor& qk, Tensor& value, Tensor& z, bool output_gate, cudaStream_t stream);
++
+ void q4_q5_gdn_input_conv_record_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, const Tensor& conv_weight,
+                                         const Tensor& conv_states, const Tensor& valid_columns,
+diff --git a/src/ops/wrapper/attn_input_proj.cpp b/src/ops/wrapper/attn_input_proj.cpp
+index c102266..476c4c7 100644
+--- a/src/ops/wrapper/attn_input_proj.cpp
++++ b/src/ops/wrapper/attn_input_proj.cpp
+@@ -4,6 +4,7 @@
+ #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+ #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
+ #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
++#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
+ #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
+ #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
+ #include "ops/linear/fp8/fp8_config.h"
+@@ -230,6 +231,30 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+                                       stream);
+ }
+ 
++bool attn_input_proj_halves_admit(const Weight& query_key_weight, const Weight& gate_value_weight,
++                                  std::int32_t cols) {
++    return query_key_weight.qtype == QType::Q4_G64_FP16 && gate_value_weight.qtype == QType::Q4_G64_FP16 &&
++           query_key_weight.n == 7168 && gate_value_weight.n == 7168 && query_key_weight.padded_shape[1] == 5120 &&
++           gate_value_weight.padded_shape[1] == 5120 && cols >= 1 && cols <= 16;
++}
++
++void attn_input_proj_half(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
++                          Tensor& q, Tensor& gate, Tensor& k, Tensor& v, bool gate_half, cudaStream_t stream) {
++    constexpr std::int32_t kHidden = 5120;
++    constexpr std::int32_t kQRows  = 6144;
++    constexpr std::int32_t kKvRows = 1024;
++    const std::int32_t cols        = x.ne[1];
++    require_matrix(x, kHidden, cols, "x");
++    require_matrix(q, kQRows, cols, "q");
++    require_matrix(gate, kQRows, cols, "gate");
++    require_matrix(k, kKvRows, cols, "k");
++    require_matrix(v, kKvRows, cols, "v");
++    if (!attn_input_proj_halves_admit(query_key_weight, gate_value_weight, cols)) {
++        throw std::invalid_argument("attn_input_proj_half: problem not admitted");
++    }
++    detail::q4_attn_input_half_launch(x, query_key_weight, gate_value_weight, q, gate, k, v, gate_half, stream);
++}
++
+ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
+                      Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                      WorkspaceArena& workspace, cudaStream_t stream) {
+diff --git a/src/ops/wrapper/gdn_gating_proj.cpp b/src/ops/wrapper/gdn_gating_proj.cpp
+index b53f819..92ce169 100644
+--- a/src/ops/wrapper/gdn_gating_proj.cpp
++++ b/src/ops/wrapper/gdn_gating_proj.cpp
+@@ -235,6 +235,22 @@ void gdn_norm_gating_control(const Tensor& x, const Tensor& norm_weight, float e
+                             dt_bias, g, beta, stream);
+ }
+ 
++void gdn_norm_gating_hidden(const Tensor& x, const Tensor& norm_weight, float eps, Tensor& h,
++                            cudaStream_t stream) {
++    constexpr const char* op  = "gdn_norm_gating_hidden";
++    const std::int32_t tokens = x.ne[1];
++    if (!(eps > 0.0F) || !std::isfinite(eps)) {
++        throw std::invalid_argument("gdn_norm_gating_hidden: eps must be positive and finite");
++    }
++    if (!gdn_norm_gating_split_admits(48, 5120, tokens)) {
++        throw std::invalid_argument("gdn_norm_gating_hidden: outside the fused route");
++    }
++    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
++    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
++    require_sequence_tensor(h, DType::BF16, 5120, tokens, op, "h");
++    detail::bf16_gdn_norm_27_bf16_hidden_launch(x, norm_weight, eps, h, stream);
++}
++
+ void gdn_norm_gating_fp8_hidden(const Tensor& x, const Tensor& norm_weight, float eps,
+                                 Tensor& codes, Tensor& scales, cudaStream_t stream) {
+     constexpr const char* op  = "gdn_norm_gating_fp8_hidden";
+diff --git a/src/ops/wrapper/gdn_input_proj.cpp b/src/ops/wrapper/gdn_input_proj.cpp
+index 60ac30a..ea55238 100644
+--- a/src/ops/wrapper/gdn_input_proj.cpp
++++ b/src/ops/wrapper/gdn_input_proj.cpp
+@@ -1061,6 +1061,46 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
+                                   key, value, z, LinearPolicy::A16Only, workspace, stream);
+ }
+ 
++bool gdn_input_proj_record_halves_admit(const Weight& qk_weight, const Weight& value_z_weight,
++                                        std::int32_t batch_size, std::int32_t width) {
++    if (batch_size != 1 || width < 2 || width > 16 || qk_weight.n != 4096 || value_z_weight.n != 12288 ||
++        !detail::q4_gdn_input_halves_admit(qk_weight, value_z_weight, width)) {
++        return false;
++    }
++    const detail::Q4Q5GdnInputProblem problem{5120, qk_weight.n, value_z_weight.n, 4096 + 6144, 6144,
++                                              qk_weight.padded_shape[1], width};
++    return detail::q4_q5_gdn_input_resolve_plan(problem).schedule ==
++           detail::Q4Q5GdnInputScheduleId::IndependentDirectFixed;
++}
++
++void gdn_input_proj_record_half(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                                Tensor& conv_record, Tensor& z, GdnRecordRows rows, cudaStream_t stream) {
++    constexpr std::int32_t kQkRows = 4096, kValueRows = 6144, kZRows = 6144;
++    const ConvGeometry geometry    = require_record_input(x, 5120);
++    require_conv_tensor(conv_record, kQkRows + kValueRows, geometry.width, geometry.batch,
++                        "gdn_input_proj_record_half", "conv record");
++    require_conv_tensor(z, kZRows, geometry.width, geometry.batch, "gdn_input_proj_record_half", "z");
++    if (!gdn_input_proj_record_halves_admit(qk_weight, value_z_weight, geometry.batch, geometry.width)) {
++        throw std::invalid_argument("gdn_input_proj_record_half: problem not admitted");
++    }
++    // As compose_record -> gdn_input_proj -> q4_q5_gdn_input_execute_plan (IndependentDirectFixed) slices them.
++    Tensor x_flat      = flatten_columns(x, x.ne[0], geometry);
++    Tensor record_flat = flatten_columns(conv_record, conv_record.ne[0], geometry);
++    Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
++    Tensor qk          = record_flat.slice(0, 0, kQkRows);
++    Tensor value       = record_flat.slice(0, kQkRows, kZRows);
++    detail::q4_gdn_input_half_launch(x_flat, qk_weight, value_z_weight, qk, value, z_flat,
++                                     rows == GdnRecordRows::OutputGate, stream);
++}
++
++void gdn_input_proj_record_conv(const Tensor& conv_weight, const Tensor& conv_states, const Tensor& valid_columns,
++                                const Tensor& initial_state_slots, const Tensor& tree_parents,
++                                const Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
++                                cudaStream_t stream) {
++    detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
++                                             initial_state_slots, tree_parents, query, key, value, stream);
++}
++
+ bool gdn_input_proj_conv_record_takes_activation(const Weight& weight, LinearPolicy policy,
+                                                  std::int32_t batch_size, std::int32_t width) {
+     validate_policy(policy);
+-- 
+2.34.1
+

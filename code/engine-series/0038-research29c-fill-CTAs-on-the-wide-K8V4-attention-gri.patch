@@ -1,0 +1,128 @@
+From 32dd6b56af36f99696be2c555d4cb25d90d521cb Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 38/49] research29c: fill CTAs on the wide K8V4 attention grid
+
+---
+ src/models/qwen3_5/execution/text.cpp         |  5 ++++
+ .../dense/causal_cache/small_t_k8v4.cu        | 26 +++++++++++++++----
+ .../dense/causal_cache/small_t_k8v4.cuh       | 19 ++++++++++++--
+ 3 files changed, 43 insertions(+), 7 deletions(-)
+
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 266b251..e943d16 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -1041,6 +1041,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+                                         active_sequence_batch_});
+         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
+         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
++        // research29c (NINFER_L2_FILL bit 64): the wide verify attention warms the output projection.
++        if ((ops::l2_fill_mask() & 64) && ph == Phase::Verify && !attn_overlap) {
++            ops::l2_fill_set(ops::l2_fill_for_weight(p.output.weight, 0, ops::l2_fill_bytes("ATTN", 8u << 20)));
++        }
+         ops::causal_softmax_attention(
+             q_batch, k_batch, v_batch, position_batch, valid,
+             verify_tree_masks_ != nullptr ? *verify_tree_masks_ : Tensor{}, kv_table_rows,
+@@ -1050,6 +1054,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
+             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
+             a_batch, as);
++        (void)ops::l2_fill_take();
+     } else {
+         ops::causal_softmax_attention(
+             qn, kn, v, cache_positions, Tensor{}, Tensor{}, kv_table_rows,
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+index 45af6a1..061cd77 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+@@ -8,6 +8,7 @@
+ #include "core/paged_kv_storage.h"
+ #include "ops/common/math.h"
+ #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
++#include "ninfer/ops/l2_fill.h"
+ 
+ #include <cstdint>
+ #include <stdexcept>
+@@ -76,11 +77,26 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+                 q_ptr, invocation.full_width, invocation.column_begin, invocation.batch_size,
+                 codes_ptr, scales_ptr);
+         CUDA_CHECK(cudaGetLastError());
+-        launch(causal_attention_small_t_k8v4_wide_kernel<Geometry, TokenTile, MultiBatch, Masked,
+-                                                         Tree, CacheInput, VInt8>,
+-               Schedule::Threads, static_cast<std::size_t>(Schedule::DynamicBytes),
+-               std::make_tuple(static_cast<const std::uint8_t*>(codes_ptr),
+-                               static_cast<const float*>(scales_ptr)));
++        // research29c (NINFER_L2_FILL bit 64): fill CTAs past the splits warm the next GEMM's weights.
++        const ops::L2Fill fill = ops::l2_fill_take();
++        const std::uint32_t fill_lines =
++            fill.range[0].lines + fill.range[1].lines + fill.range[2].lines;
++        constexpr std::uint32_t kLinesPerCta = 8u * Schedule::Threads;
++        std::int32_t fill_rows = static_cast<std::int32_t>(
++            (fill_lines + kLinesPerCta * Geometry::KVHeads - 1) / (kLinesPerCta * Geometry::KVHeads));
++        if ((splits + fill_rows) * Geometry::KVHeads * invocation.batch_size > 120) { fill_rows = 0; }
++        auto kernel = causal_attention_small_t_k8v4_wide_kernel<Geometry, TokenTile, MultiBatch,
++                                                                Masked, Tree, CacheInput, VInt8>;
++        static const cudaError_t attr = cudaFuncSetAttribute(
++            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::DynamicBytes);
++        CUDA_CHECK(attr);
++        const dim3 wide_grid(Geometry::KVHeads, splits + fill_rows, invocation.batch_size);
++        kernel<<<wide_grid, Schedule::Threads, Schedule::DynamicBytes, stream>>>(
++            codes_ptr, scales_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr,
++            v_scale_ptr, tables_ptr, valid_ptr, masks_ptr, rows_ptr, cache.block_tables.ne[0],
++            invocation.full_width, invocation.column_begin, logical_capacity, scale,
++            partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_rows);
++        CUDA_CHECK(cudaGetLastError());
+     } else {
+         constexpr int Warps     = RowTiles == 3 ? 12 : 8;
+         constexpr int KeyBlock  = TokenTile == 1 ? 32 : 64;
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+index 9ab51ce..cab8359 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+@@ -32,6 +32,8 @@
+ 
+ #include <cstdint>
+ 
++#include "ops/common/l2_fill.cuh"
++
+ namespace ninfer::ops {
+ 
+ // ----------------------------------------------------------------------------------------------
+@@ -1059,7 +1061,8 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile, VInt8>::Threads, 1) __gl
+         const std::int32_t* valid_columns, const std::int32_t* tree_masks,
+         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
+-        float* partial_acc, float* partial_m, float* partial_l) {
++        float* partial_acc, float* partial_m, float* partial_l, ops::L2Fill fill = {},
++        std::int32_t fill_rows = 0) {
+     using Schedule         = K8V4WideSchedule<Geometry, TokenTile, VInt8>;
+     namespace barrier      = k8v4_wide_barrier;
+     constexpr int RowCount = Schedule::RowCount;
+@@ -1118,10 +1121,22 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile, VInt8>::Threads, 1) __gl
+     const int kv_head     = static_cast<int>(blockIdx.x);
+     const int split       = static_cast<int>(blockIdx.y);
+     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
+-    const int split_count = static_cast<int>(gridDim.y);
++    // research29c (NINFER_L2_FILL bit 64): grid rows past the split capacity only fill L2.
++    const int split_count = static_cast<int>(gridDim.y) - fill_rows;
+     const int tid         = static_cast<int>(threadIdx.x);
+     const int warp        = tid >> 5;
+     const int lane        = tid & 31;
++    if (split >= split_count) {
++        if (batch == 0) {
++            detail::L2FillLoads<8> l2_fill;
++            l2_fill.issue(fill,
++                          static_cast<std::uint32_t>(((split - split_count) * static_cast<int>(gridDim.x) + kv_head) *
++                                                     Threads + tid),
++                          static_cast<std::uint32_t>(fill_rows * static_cast<int>(gridDim.x) * Threads));
++            l2_fill.consume(fill);
++        }
++        return;
++    }
+ 
+     int valid_tokens = TokenTile;
+     if constexpr (Masked) {
+-- 
+2.34.1
+

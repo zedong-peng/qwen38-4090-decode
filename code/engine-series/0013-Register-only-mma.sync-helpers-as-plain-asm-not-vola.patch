@@ -1,0 +1,83 @@
+From e84e3bcb5da4a516328739da437716c3facc9d00 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 17:23:52 +0800
+Subject: [PATCH 13/49] Register-only mma.sync helpers as plain asm (not
+ volatile)
+
+An MMA touches registers only; volatile pinned it against the surrounding cp.async/ld asm. Same
+instructions, bit-identical results. Ada small-T T=16 bench: value/z 37.70 -> 35.54 us, out 19.48 -> 19.15,
+down 49.60 -> 49.21, gate/up 96.35 -> 96.26.
+---
+ src/ops/common/mma.cuh | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/src/ops/common/mma.cuh b/src/ops/common/mma.cuh
+index 2f3ee3f..bb7e934 100644
+--- a/src/ops/common/mma.cuh
++++ b/src/ops/common/mma.cuh
+@@ -36,7 +36,7 @@ __device__ __forceinline__ void ldmatrix_x4_t(unsigned& r0, unsigned& r1, unsign
+ __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
+                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                          unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+@@ -45,7 +45,7 @@ __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float&
+ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
+                                         unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                         unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
++    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+@@ -55,7 +55,7 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float&
+ // twice the FP32-accumulating rate on SM120; callers bound the K extent so the sum stays finite.
+ __device__ __forceinline__ void mma_f16_f16acc(unsigned& d0, unsigned& d1, unsigned a0, unsigned a1,
+                                                unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
++    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                  "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};\n"
+                  : "=r"(d0), "=r"(d1)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0U));
+@@ -65,7 +65,7 @@ __device__ __forceinline__ void mma_f16_f16acc(unsigned& d0, unsigned& d1, unsig
+ __device__ __forceinline__ void mma_f16_f16acc(unsigned& d0, unsigned& d1, unsigned a0, unsigned a1,
+                                                unsigned a2, unsigned a3, unsigned b0, unsigned b1,
+                                                unsigned c0, unsigned c1) {
+-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
++    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                  "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%9};\n"
+                  : "=r"(d0), "=r"(d1)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(c0), "r"(c1));
+@@ -73,7 +73,7 @@ __device__ __forceinline__ void mma_f16_f16acc(unsigned& d0, unsigned& d1, unsig
+ 
+ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
+                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
++    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+@@ -82,7 +82,7 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
+ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
+                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                              unsigned b0, unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
++    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+@@ -91,7 +91,7 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
+ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
+                                               unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                               unsigned b0, unsigned b1) {
+-    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
++    asm("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+-- 
+2.34.1
+

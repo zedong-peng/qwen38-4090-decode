@@ -1,0 +1,31 @@
+From 75c28f0c6882227960ae8bf832c93e92adb9eb38 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 47/49] research32 probe: exact FP16 rounding mode
+ (NINFER_STATE_ROUND_BITS=16)
+
+---
+ .../gated_delta_net/chunked/state_passing.cuh              | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh
+index 0e6a6ae..3c41cbb 100644
+--- a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh
++++ b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh
+@@ -22,6 +22,13 @@ using ninfer::ops::exp2_approx;
+ __device__ int g_state_round_bits = 0;
+ 
+ __device__ __forceinline__ float round_state_mantissa(float x, int bits) {
++    if (bits == 16) {  // the FP16 storage format of research34
++        unsigned short h;
++        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(fminf(fmaxf(x, -65504.0f), 65504.0f)));
++        float y;
++        asm("cvt.f32.f16 %0, %1;" : "=f"(y) : "h"(h));
++        return y;
++    }
+     const unsigned shift = 23u - static_cast<unsigned>(bits);
+     unsigned u           = __float_as_uint(x);
+     u += ((1u << (shift - 1u)) - 1u) + ((u >> shift) & 1u);
+-- 
+2.34.1
+

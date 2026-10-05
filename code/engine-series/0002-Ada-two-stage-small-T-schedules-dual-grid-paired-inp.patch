@@ -1,0 +1,306 @@
+From 690152411dae2c8a5d261d866f1f0f963ab02324 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 00:20:52 +0800
+Subject: [PATCH 02/49] Ada: two-stage small-T schedules, dual-grid paired
+ input projections
+
+Measured with weights rotated past the 72 MB L2 (kernels/bench_ada.cu, bench_dual.cu):
+- every retuned schedule keeps Warps = 8, so accumulation order and bits are unchanged;
+  two pipeline stages beat three on every shape.
+- T in [7,16]: GDN qk and attention q/k (Q4) leave the Q4 K-split kernel for the Ada small-T
+  kernel, in one grid with their Q5 partner. GDN input 72.5 -> 57.4 us, attention input
+  70.1 -> 50.0 us at T=16.
+End to end (DFlash2-15 verify tree, K8V4): json 282 -> 311, code 347 -> 375, prose 131 -> 149,
+sustained 239 -> 262 tok/s.
+---
+ .../q4_q5/q4_q5_attn_input_small_t.cu         | 62 ++++++++++++++++++
+ .../q4_q5/q4_q5_gdn_input_independent.cu      | 55 +++++++++++++++-
+ src/ops/linear/ada_small_t_mma.cuh            | 64 ++++++++++++++++++-
+ .../q5/q5_linear_add_ada_small_t.cu           |  4 +-
+ .../q4/q4_linear_swiglu_ada_small_t.cu        |  3 +-
+ 5 files changed, 181 insertions(+), 7 deletions(-)
+
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+index cf3e6fb..1c9f1eb 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+@@ -240,11 +240,73 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
+     throw std::invalid_argument("attention Q5 split-output requires T in [1,16]");
+ }
+ 
++struct AttnQueryKeyEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* q;
++    std::int32_t q_ld;
++    __nv_bfloat16* key;
++    std::int32_t key_ld;
++
++    __device__ __forceinline__ void operator()(int row, int token, float result) const {
++        if (row < kSplitRow) {
++            q[static_cast<std::int64_t>(token) * q_ld + row] = __float2bfloat16_rn(result);
++        } else {
++            key[static_cast<std::int64_t>(token) * key_ld + row - kSplitRow] =
++                __float2bfloat16_rn(result);
++        }
++    }
++};
++
++// gate/value (Q5) and q/k (Q4) in one Ada small-T grid, gate/value CTAs first.
++template <int TokenTiles, int GateValueRowTiles, int QueryKeyGroups>
++void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
++                     const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
++                     Tensor& v, cudaStream_t stream) {
++    if (query_key_weight.padded_shape[1] != kHidden ||
++        gate_value_weight.padded_shape[1] != kHidden) {
++        throw std::invalid_argument("attention Ada dual requires padded K == hidden");
++    }
++    using SG = Q5AdaSmallTSchedule<GateValueRowTiles, 8, TokenTiles, 8, 2>;
++    using SQ = Q4AdaSmallTSchedule<2, 8, TokenTiles, QueryKeyGroups, 2>;
++    static_assert(kParentRows % SG::kRowsPerCta == 0 && kParentRows % SQ::kRowsPerCta == 0);
++    const AttnGateValueEpilogue gate_value_epilogue{
++        static_cast<__nv_bfloat16*>(gate.data),
++        static_cast<std::int32_t>(gate.nb[1] / sizeof(__nv_bfloat16)),
++        static_cast<__nv_bfloat16*>(v.data),
++        static_cast<std::int32_t>(v.nb[1] / sizeof(__nv_bfloat16))};
++    // Same strides as the K-split store this replaces.
++    const AttnQueryKeyEpilogue query_key_epilogue{static_cast<__nv_bfloat16*>(q.data), q.ne[0],
++                                                  static_cast<__nv_bfloat16*>(k.data), k.ne[0]};
++    ada_small_t_mma_dual_launch<SG, kHidden, SQ, kHidden>(
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
++        AdaSmallTOperand<AttnGateValueEpilogue>{
++            static_cast<const std::uint8_t*>(gate_value_weight.qdata),
++            static_cast<const std::uint8_t*>(gate_value_weight.qhigh),
++            static_cast<const std::uint8_t*>(gate_value_weight.scales), gate_value_epilogue},
++        kParentRows,
++        AdaSmallTOperand<AttnQueryKeyEpilogue>{
++            static_cast<const std::uint8_t*>(query_key_weight.qdata), nullptr,
++            static_cast<const std::uint8_t*>(query_key_weight.scales), query_key_epilogue},
++        kParentRows, stream);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ } // namespace
+ 
+ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
+                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
+                                      Tensor& k, Tensor& v, cudaStream_t stream) {
++    // Ada, T in [7,16]: one dual grid (50 us at T=16 vs 70 us for K-split q/k + Ada gate/value).
++    if (x.ne[1] >= 7 && x.ne[1] <= 8) {
++        launch_dual_ada<1, 2, 8>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
++        return;
++    }
++    if (x.ne[1] > 8 && x.ne[1] <= 16) {
++        launch_dual_ada<2, 4, 16>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
++        return;
++    }
+     launch_q4(x, query_key_weight, q, k, stream);
+     launch_q5(x, gate_value_weight, gate, v, stream);
+ }
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+index ebe6922..b72c08a 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+@@ -236,17 +236,70 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+     if (x.ne[1] <= 16) {
+         // Every weight byte is read once for the whole verify band; the column-tiled SIMT and
+         // row-block shapes re-read the Q5 weights per 4- or 8-column tile from T=7.
+-        launch_q5_ada<3, 8, 8, 3>(x, weight, value, z, stream);
++        launch_q5_ada<2, 8, 8, 2>(x, weight, value, z, stream);
+         return;
+     }
+     throw std::invalid_argument("Q4/Q5 GDN independent launch requires T in [1,16]");
+ }
+ 
++struct GdnQkEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* out;
++    std::int32_t out_ld;
++
++    __device__ __forceinline__ void operator()(int row, int token, float result) const {
++        out[static_cast<std::int64_t>(token) * out_ld + row] = __float2bfloat16_rn(result);
++    }
++};
++
++// value/z (Q5) and qk (Q4) in one Ada small-T grid; value/z CTAs first so the shorter Q4 CTAs
++// fill the tail.
++template <int TokenTiles>
++void launch_dual_ada(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                     Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
++    if (qk_weight.padded_shape[1] != kHidden || value_z_weight.padded_shape[1] != kHidden) {
++        throw std::invalid_argument("Q4/Q5 GDN Ada dual requires padded K == hidden");
++    }
++    using SV = Q5AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>;
++    using SQ = Q4AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>;
++    static_assert(kValueZRows % SV::kRowsPerCta == 0 && kQkRows % SQ::kRowsPerCta == 0);
++    const GdnValueZEpilogue value_z_epilogue{
++        static_cast<__nv_bfloat16*>(value.data),
++        static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16)),
++        static_cast<__nv_bfloat16*>(z.data),
++        static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16))};
++    const GdnQkEpilogue qk_epilogue{static_cast<__nv_bfloat16*>(qk.data),
++                                    static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16))};
++    ada_small_t_mma_dual_launch<SV, kHidden, SQ, kHidden>(
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
++        AdaSmallTOperand<GdnValueZEpilogue>{static_cast<const std::uint8_t*>(value_z_weight.qdata),
++                                            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
++                                            static_cast<const std::uint8_t*>(value_z_weight.scales),
++                                            value_z_epilogue},
++        kValueZRows,
++        AdaSmallTOperand<GdnQkEpilogue>{static_cast<const std::uint8_t*>(qk_weight.qdata), nullptr,
++                                        static_cast<const std::uint8_t*>(qk_weight.scales),
++                                        qk_epilogue},
++        kQkRows, stream);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ } // namespace
+ 
+ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                         Tensor& z, cudaStream_t stream) {
++    // Ada, T in [7,16]: one dual grid (57 us at T=16 vs 72 us for K-split qk + Ada value/z).
++    if (x.ne[1] >= 7 && x.ne[1] <= 8) {
++        launch_dual_ada<1>(x, qk_weight, value_z_weight, qk, value, z, stream);
++        return;
++    }
++    if (x.ne[1] > 8 && x.ne[1] <= 16) {
++        launch_dual_ada<2>(x, qk_weight, value_z_weight, qk, value, z, stream);
++        return;
++    }
+     launch_q4(x, qk_weight, qk, stream);
+     launch_q5(x, value_z_weight, value, z, stream);
+ }
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index 778874b..1ac532d 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -112,11 +112,12 @@ __device__ __forceinline__ unsigned q4_ada_decode_pair(unsigned byte) {
+ 
+ // Epilogue::kPairedHalves == false: epilogue(weight_row, token, dot) for every CTA row and live
+ // token. true: epilogue(output_row, token, gate_dot, up_dot) for the CTA's AdaPairedHalfRows pairs.
++// One CTA's work; `block` is the CTA index within this problem's grid.
+ template <class S, int K, class RowMap, class Epilogue>
+-__launch_bounds__(S::kThreads) __global__ void ada_small_t_mma_kernel(
++__device__ __forceinline__ void ada_small_t_mma_cta(
+     const __nv_bfloat16* __restrict__ x, std::int32_t x_ld, const std::uint8_t* __restrict__ codes,
+     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+-    std::int32_t tokens, Epilogue epilogue) {
++    std::int32_t tokens, const Epilogue& epilogue, int block) {
+     constexpr int kGroupK = 64;
+     static_assert(K % (kGroupK * S::kG) == 0);
+     constexpr int kGroups     = K / kGroupK;
+@@ -131,7 +132,6 @@ __launch_bounds__(S::kThreads) __global__ void ada_small_t_mma_kernel(
+     const int warp     = tid >> 5;
+     const int q        = lane & 3;
+     const int group_id = lane >> 2;
+-    const int block    = static_cast<int>(blockIdx.x);
+ 
+     const auto issue = [&](int stage) {
+         std::uint8_t* code_dst  = smem + (stage % S::kStages) * S::kStageBytes;
+@@ -320,6 +320,43 @@ __launch_bounds__(S::kThreads) __global__ void ada_small_t_mma_kernel(
+     }
+ }
+ 
++template <class S, int K, class RowMap, class Epilogue>
++__launch_bounds__(S::kThreads) __global__ void ada_small_t_mma_kernel(
++    const __nv_bfloat16* __restrict__ x, std::int32_t x_ld, const std::uint8_t* __restrict__ codes,
++    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
++    std::int32_t tokens, Epilogue epilogue) {
++    ada_small_t_mma_cta<S, K, RowMap>(x, x_ld, codes, high, scales, tokens, epilogue,
++                                      static_cast<int>(blockIdx.x));
++}
++
++// One weight matrix of a dual launch.
++template <class Epilogue>
++struct AdaSmallTOperand {
++    const std::uint8_t* codes;
++    const std::uint8_t* high;
++    const std::uint8_t* scales;
++    Epilogue epilogue;
++};
++
++// Two independent problems over the same x in one grid: CTAs [0, blocks_a) run A, the rest run B,
++// each exactly as its own launch would (same per-CTA code, so the same bits). One launch instead of
++// two removes a grid drain/fill between them, and the shorter problem's CTAs fill the longer one's
++// tail.
++template <class SA, int KA, class MapA, class EpiA, class SB, int KB, class MapB, class EpiB>
++__launch_bounds__(SA::kThreads) __global__ void ada_small_t_mma_dual_kernel(
++    const __nv_bfloat16* __restrict__ x, std::int32_t x_ld, std::int32_t tokens,
++    AdaSmallTOperand<EpiA> a, AdaSmallTOperand<EpiB> b, int blocks_a) {
++    static_assert(SA::kThreads == SB::kThreads, "dual launch needs one block size");
++    const int block = static_cast<int>(blockIdx.x);
++    if (block < blocks_a) {
++        ada_small_t_mma_cta<SA, KA, MapA>(x, x_ld, a.codes, a.high, a.scales, tokens, a.epilogue,
++                                          block);
++    } else {
++        ada_small_t_mma_cta<SB, KB, MapB>(x, x_ld, b.codes, b.high, b.scales, tokens, b.epilogue,
++                                          block - blocks_a);
++    }
++}
++
+ // Launches one CTA per 8 * RowTiles weight rows; `rows` must be a multiple of that.
+ template <class S, int K, class RowMap = AdaContiguousRows, class Epilogue>
+ void ada_small_t_mma_launch(const __nv_bfloat16* x, std::int32_t x_ld, const std::uint8_t* codes,
+@@ -337,4 +374,25 @@ void ada_small_t_mma_launch(const __nv_bfloat16* x, std::int32_t x_ld, const std
+                                                                         scales, tokens, epilogue);
+ }
+ 
++// Dual launch of A (rows_a rows) and B (rows_b rows) over one x; see ada_small_t_mma_dual_kernel.
++template <class SA, int KA, class SB, int KB, class MapA = AdaContiguousRows,
++          class MapB = AdaContiguousRows, class EpiA, class EpiB>
++void ada_small_t_mma_dual_launch(const __nv_bfloat16* x, std::int32_t x_ld, std::int32_t tokens,
++                                 const AdaSmallTOperand<EpiA>& a, std::int32_t rows_a,
++                                 const AdaSmallTOperand<EpiB>& b, std::int32_t rows_b,
++                                 cudaStream_t stream) {
++    constexpr int kSmem = std::max(SA::kSmemBytes, SB::kSmemBytes);
++    static const bool configured = [] {
++        CUDA_CHECK(cudaFuncSetAttribute(
++            ada_small_t_mma_dual_kernel<SA, KA, MapA, EpiA, SB, KB, MapB, EpiB>,
++            cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
++        return true;
++    }();
++    (void)configured;
++    const int blocks_a = rows_a / SA::kRowsPerCta;
++    const int blocks_b = rows_b / SB::kRowsPerCta;
++    ada_small_t_mma_dual_kernel<SA, KA, MapA, EpiA, SB, KB, MapB, EpiB>
++        <<<blocks_a + blocks_b, SA::kThreads, kSmem, stream>>>(x, x_ld, tokens, a, b, blocks_a);
++}
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu b/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu
+index 43b61de..015b778 100644
+--- a/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu
++++ b/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu
+@@ -58,9 +58,9 @@ void q5_linear_add_ada_small_t_launch(const Tensor& x, const Weight& w, Tensor&
+         throw std::invalid_argument("q5 linear_add ada small-T: T must be in [1,16]");
+     }
+     if (w.k == 6144 && w.padded_shape[1] == 6144) {
+-        launch<5, 8, 8, 3, 6144>(x, w, residual_out, stream);
++        launch<5, 8, 8, 2, 6144>(x, w, residual_out, stream);
+     } else if (w.k == 17408 && w.padded_shape[1] == 17408) {
+-        launch<5, 8, 16, 3, 17408>(x, w, residual_out, stream);
++        launch<5, 8, 8, 2, 17408>(x, w, residual_out, stream);
+     } else {
+         throw std::invalid_argument("q5 linear_add ada small-T: unsupported exact K");
+     }
+diff --git a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+index 4ab6579..f60f7ad 100644
+--- a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
++++ b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+@@ -61,7 +61,8 @@ void q4_linear_swiglu_ada_small_t_launch(const Tensor& x, const Weight& w, Tenso
+     if (x.ne[1] < 1 || x.ne[1] > 16) {
+         throw std::invalid_argument("q4 linear_swiglu ada small-T requires T in [1,16]");
+     }
+-    launch<4, 8, 8, 3>(x, w, out, stream);
++    // Two stages over 16-row CTAs: 103 us at T=16 vs 109 us for <4, 8, 8, 3> (same bits).
++    launch<2, 8, 8, 2>(x, w, out, stream);
+ }
+ 
+ } // namespace ninfer::ops::detail
+-- 
+2.34.1
+

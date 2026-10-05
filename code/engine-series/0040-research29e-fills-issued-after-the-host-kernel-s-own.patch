@@ -1,0 +1,148 @@
+From 8bfe4918ebdb98249b0088efd4bbb4a61684a7dc Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 40/49] research29e: fills issued after the host kernel's own
+ loads (mask 124: -0.40% ms/round)
+
+---
+ .../bf16/bf16_gdn_norm_gating_proj_27.cu      |  9 ++++----
+ src/ops/gdn_input_proj/gdn_projected_conv.cu  |  9 ++++----
+ src/ops/kernel/rmsnorm.cuh                    | 14 +++++++------
+ .../dense/causal_cache/small_t_k8v4.cuh       | 21 +++++++++++++------
+ 4 files changed, 33 insertions(+), 20 deletions(-)
+
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
+index c17b297..44575d9 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
+@@ -34,10 +34,9 @@ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_ga
+     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
+     float* beta, int tokens, float eps, ops::L2Fill fill = {}) {
+     constexpr int D = 5120, H = 48, Warps = Threads / 32, Groups = HeadGroups * TileGroups;
+-    // research29b (NINFER_L2_FILL bit 16): the input projection's first weight lines, consumed at the end.
+-    L2FillLoads<2> l2_fill;
+-    l2_fill.issue(fill, (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x,
+-                  gridDim.x * gridDim.y * blockDim.x);
++    // research29b (NINFER_L2_FILL bit 16): the input projection's first weight lines, issued after the dot
++    // loop's own loads (research29e) and consumed at the end.
++    L2FillLoads<2> l2_fill{};
+     const int group = threadIdx.x / Threads, tid = threadIdx.x % Threads, lane = tid & 31,
+               warp = tid >> 5, head = blockIdx.x * HeadGroups + group % HeadGroups,
+               first = (blockIdx.y * TileGroups + group / HeadGroups) * Tile;
+@@ -73,6 +72,8 @@ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_ga
+             }
+         }
+     }
++    l2_fill.issue(fill, (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x,
++                  gridDim.x * gridDim.y * blockDim.x);
+     __shared__ float partial[Groups][3][Tile][Warps], inverse[Groups][Tile];
+ #pragma unroll
+     for (int t = 0; t < Tile; ++t) {
+diff --git a/src/ops/gdn_input_proj/gdn_projected_conv.cu b/src/ops/gdn_input_proj/gdn_projected_conv.cu
+index 1fee003..01135aa 100644
+--- a/src/ops/gdn_input_proj/gdn_projected_conv.cu
++++ b/src/ops/gdn_input_proj/gdn_projected_conv.cu
+@@ -32,10 +32,9 @@ __global__ void gdn_projected_conv_kernel(
+     __shared__ float staged[Tree ? MaxWidth : 1][Threads];
+     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+     if (row >= Channels) { return; }
+-    // research29b (NINFER_L2_FILL bit 4): the next GEMM's first weight lines, consumed at the end.
+-    L2FillLoads<4> l2_fill;
+-    l2_fill.issue(fill, (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x,
+-                  gridDim.x * gridDim.y * blockDim.x);
++    // research29b (NINFER_L2_FILL bit 4): the next GEMM's first weight lines, issued after this thread's own
++    // preloads (research29e) and consumed at the end.
++    L2FillLoads<4> l2_fill{};
+     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
+ 
+     std::int32_t valid                 = valid_columns == nullptr ? width : valid_columns[batch];
+@@ -92,6 +91,8 @@ __global__ void gdn_projected_conv_kernel(
+         for (std::int32_t token = 0; token < MaxWidth; ++token) {
+             inputs[token] = token < valid ? input(token) : 0.0F;
+         }
++        l2_fill.issue(fill, (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x,
++                      gridDim.x * gridDim.y * blockDim.x);
+         if constexpr (Tree) {
+             const std::uint64_t parents = gdn_pack_tree_parents(
+                 tree_parents + static_cast<std::int64_t>(batch) * width, width);
+diff --git a/src/ops/kernel/rmsnorm.cuh b/src/ops/kernel/rmsnorm.cuh
+index f598346..2e90979 100644
+--- a/src/ops/kernel/rmsnorm.cuh
++++ b/src/ops/kernel/rmsnorm.cuh
+@@ -55,9 +55,9 @@ __launch_bounds__(Block) __global__
+     const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
+     const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+     if (row >= rows) { return; }
+-    // research29b (NINFER_L2_FILL): the next GEMM's first weight lines, consumed at the end.
+-    detail::L2FillLoads<2> l2_fill;
+-    l2_fill.issue(fill, blockIdx.x * Block + threadIdx.x, gridDim.x * Block);
++    // research29b (NINFER_L2_FILL): the next GEMM's first weight lines, issued after the row loads (research29e)
++    // and consumed at the end.
++    detail::L2FillLoads<2> l2_fill{};
+ 
+     const int pairs             = d / 2;
+     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+@@ -79,6 +79,7 @@ __launch_bounds__(Block) __global__
+             sum             = __fadd_rn(sum, rmsnorm_pair_square_sum(xf));
+         }
+     }
++    l2_fill.issue(fill, blockIdx.x * Block + threadIdx.x, gridDim.x * Block);
+ 
+     sum       = warp_reduce_sum(sum);
+     float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(d) + eps) : 0.0f;
+@@ -181,9 +182,9 @@ __launch_bounds__(Block) __global__
+                                    const __nv_bfloat162* z, std::type_identity_t<Output> out,
+                                    std::int32_t input_d, std::int64_t rows, float eps,
+                                    ops::L2Fill fill = {}) {
+-    // research29b (NINFER_L2_FILL): the next GEMM's first weight lines, consumed at the end.
+-    detail::L2FillLoads<4> l2_fill;
+-    l2_fill.issue(fill, blockIdx.x * Block + threadIdx.x, gridDim.x * Block);
++    // research29b (NINFER_L2_FILL): the next GEMM's first weight lines, issued after the row loads (research29e)
++    // and consumed at the end.
++    detail::L2FillLoads<4> l2_fill{};
+     const int d = FixedD ? FixedD : input_d;
+     static_assert(Block % kWarpSize == 0);
+     constexpr int kSlices = Output::kRowSlices;
+@@ -218,6 +219,7 @@ __launch_bounds__(Block) __global__
+             sum = __fadd_rn(sum, rmsnorm_pair_square_sum(__bfloat1622float2(values[k])));
+         }
+     }
++    l2_fill.issue(fill, blockIdx.x * Block + threadIdx.x, gridDim.x * Block);
+ 
+     __shared__ float warp_sums[Block / kWarpSize];
+     __shared__ float inv_shared;
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+index cab8359..29fb273 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+@@ -1128,12 +1128,21 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile, VInt8>::Threads, 1) __gl
+     const int lane        = tid & 31;
+     if (split >= split_count) {
+         if (batch == 0) {
+-            detail::L2FillLoads<8> l2_fill;
+-            l2_fill.issue(fill,
+-                          static_cast<std::uint32_t>(((split - split_count) * static_cast<int>(gridDim.x) + kv_head) *
+-                                                     Threads + tid),
+-                          static_cast<std::uint32_t>(fill_rows * static_cast<int>(gridDim.x) * Threads));
+-            l2_fill.consume(fill);
++            // research29e: start after the attention CTAs' first key/value requests, and keep at most two lines
++            // per thread in flight so their later misses queue behind little fill traffic.
++            __nanosleep(1500);
++            const std::uint32_t t = static_cast<std::uint32_t>(
++                ((split - split_count) * static_cast<int>(gridDim.x) + kv_head) * Threads + tid);
++            const std::uint32_t n = static_cast<std::uint32_t>(fill_rows * static_cast<int>(gridDim.x) * Threads);
++            std::uint32_t acc = 0U;
++#pragma unroll 1
++            for (int chunk = 0; chunk < 4; ++chunk) {
++                ops::L2Fill part = fill;
++                detail::L2FillLoads<2> l2_fill;
++                l2_fill.issue(part, t + static_cast<std::uint32_t>(chunk) * 2U * n, n);
++                acc ^= l2_fill.v[0] ^ l2_fill.v[1];
++            }
++            if (fill.sink != nullptr) { *fill.sink = acc; }
+         }
+         return;
+     }
+-- 
+2.34.1
+

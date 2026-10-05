@@ -1,0 +1,323 @@
+From e68593100bd6416fb126159aea0246db9ea70a19 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 17:23:51 +0800
+Subject: [PATCH 12/49] Two-graph DFlash rounds (NINFER_GRAPH_SPLIT=1): capture
+ ends at the drafter/verify seam
+
+Research flag, off by default. launch() submits the drafter graph before the verify graph. Same-GPU A/B
+on c96-ft1 (research6): no measurable change (json/code/prose/sustained within 0.6%), so it stays off.
+---
+ src/core/decode_graph.cpp              | 148 +++++++++++++++++++------
+ src/core/decode_graph.h                |  11 +-
+ src/models/qwen3_5/execution/draft.cpp |   3 +
+ 3 files changed, 127 insertions(+), 35 deletions(-)
+
+diff --git a/src/core/decode_graph.cpp b/src/core/decode_graph.cpp
+index 404a47e..32c11e6 100644
+--- a/src/core/decode_graph.cpp
++++ b/src/core/decode_graph.cpp
+@@ -7,8 +7,10 @@
+ #include "core/nvtx.h"
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <string>
++#include <vector>
+ 
+ namespace ninfer {
+ namespace {
+@@ -40,44 +42,86 @@ void discard_capture(cudaStream_t stream) noexcept {
+     destroy_graph(discard);
+ }
+ 
++bool graph_split_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_GRAPH_SPLIT");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++// The definition capturing on this thread, its stream, and the graph its first part ended in.
++struct ActiveCapture {
++    cudaStream_t stream = nullptr;
++    cudaGraph_t first   = nullptr;
++    bool active         = false;
++};
++thread_local ActiveCapture active_capture;
++
++std::pair<std::size_t, std::uint64_t> graph_signature(cudaGraph_t graph, std::uint64_t hash) {
++    std::size_t count = 0;
++    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &count));
++    std::vector<cudaGraphNode_t> nodes(count);
++    CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &count));
++    for (cudaGraphNode_t node : nodes) {
++        cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
++        CUDA_CHECK(cudaGraphNodeGetType(node, &type));
++        std::uint64_t payload = static_cast<std::uint64_t>(type) + 1U;
++        if (type == cudaGraphNodeTypeKernel) {
++            cudaKernelNodeParams params{};
++            CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
++            payload = payload * 1000003ULL ^ reinterpret_cast<std::uintptr_t>(params.func);
++        }
++        hash = (hash ^ payload) * 1099511628211ULL;
++    }
++    return {count, hash};
++}
++
+ } // namespace
+ 
++void DecodeGraphDefinition::split_point(cudaStream_t stream) {
++    if (!graph_split_enabled() || !active_capture.active || active_capture.stream != stream ||
++        active_capture.first != nullptr) {
++        return;
++    }
++    cudaGraph_t first     = nullptr;
++    const cudaError_t err = cudaStreamEndCapture(stream, &first);
++    if (err != cudaSuccess) {
++        destroy_graph(first);
++        CUDA_CHECK(err);
++    }
++    active_capture.first = first;
++    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
++}
++
+ DecodeGraphDefinition::~DecodeGraphDefinition() { reset(); }
+ 
+ DecodeGraphDefinition::DecodeGraphDefinition(DecodeGraphDefinition&& other) noexcept
+-    : graph_(other.graph_) {
+-    other.graph_ = nullptr;
++    : graph_(other.graph_), graph2_(other.graph2_) {
++    other.graph_  = nullptr;
++    other.graph2_ = nullptr;
+ }
+ 
+ DecodeGraphDefinition& DecodeGraphDefinition::operator=(DecodeGraphDefinition&& other) noexcept {
+     if (this == &other) { return *this; }
+ 
+     reset();
+-    graph_ = other.graph_;
++    graph_  = other.graph_;
++    graph2_ = other.graph2_;
+ 
+-    other.graph_ = nullptr;
++    other.graph_  = nullptr;
++    other.graph2_ = nullptr;
+     return *this;
+ }
+ 
+ std::pair<std::size_t, std::uint64_t> DecodeGraphDefinition::topology_signature() const {
+     if (graph_ == nullptr) { return {0, 0}; }
+-    std::size_t count = 0;
+-    CUDA_CHECK(cudaGraphGetNodes(graph_, nullptr, &count));
+-    std::vector<cudaGraphNode_t> nodes(count);
+-    CUDA_CHECK(cudaGraphGetNodes(graph_, nodes.data(), &count));
+-    std::uint64_t hash = 1469598103934665603ULL;
+-    for (cudaGraphNode_t node : nodes) {
+-        cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
+-        CUDA_CHECK(cudaGraphNodeGetType(node, &type));
+-        std::uint64_t payload = static_cast<std::uint64_t>(type) + 1U;
+-        if (type == cudaGraphNodeTypeKernel) {
+-            cudaKernelNodeParams params{};
+-            CUDA_CHECK(cudaGraphKernelNodeGetParams(node, &params));
+-            payload = payload * 1000003ULL ^ reinterpret_cast<std::uintptr_t>(params.func);
+-        }
+-        hash = (hash ^ payload) * 1099511628211ULL;
++    auto signature = graph_signature(graph_, 1469598103934665603ULL);
++    if (graph2_ != nullptr) {
++        const auto second = graph_signature(graph2_, signature.second ^ 0x9e3779b97f4a7c15ULL);
++        signature         = {signature.first + second.first, second.second};
+     }
+-    return {count, hash};
++    return signature;
+ }
+ 
+ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<void()>& body) {
+@@ -85,42 +129,59 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
+     reset();
+ 
+     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
++    active_capture = ActiveCapture{stream, nullptr, true};
+ 
+     try {
+         body();
+     } catch (...) {
++        destroy_graph(active_capture.first);
++        active_capture = ActiveCapture{};
+         discard_capture(stream);
+         throw;
+     }
++    cudaGraph_t first = active_capture.first;
++    active_capture    = ActiveCapture{};
+ 
+     cudaGraph_t graph = nullptr;
+ 
+     cudaError_t err = cudaStreamEndCapture(stream, &graph);
+     if (err != cudaSuccess) {
+         destroy_graph(graph);
++        destroy_graph(first);
+         CUDA_CHECK(err);
+     }
+ 
+-    graph_ = graph;
++    if (first != nullptr) {
++        graph_  = first;
++        graph2_ = graph;
++    } else {
++        graph_ = graph;
++    }
+ }
+ 
+ bool DecodeGraphDefinition::ready() const noexcept { return graph_ != nullptr; }
+ 
+-void DecodeGraphDefinition::reset() noexcept { destroy_graph(graph_); }
++void DecodeGraphDefinition::reset() noexcept {
++    destroy_graph(graph_);
++    destroy_graph(graph2_);
++}
+ 
+ DecodeGraphExecutable::~DecodeGraphExecutable() { reset(); }
+ 
+ DecodeGraphExecutable::DecodeGraphExecutable(DecodeGraphExecutable&& other) noexcept
+-    : exec_(other.exec_) {
+-    other.exec_ = nullptr;
++    : exec_(other.exec_), exec2_(other.exec2_) {
++    other.exec_  = nullptr;
++    other.exec2_ = nullptr;
+ }
+ 
+ DecodeGraphExecutable& DecodeGraphExecutable::operator=(DecodeGraphExecutable&& other) noexcept {
+     if (this == &other) { return *this; }
+ 
+     reset();
+-    exec_       = other.exec_;
+-    other.exec_ = nullptr;
++    exec_        = other.exec_;
++    exec2_       = other.exec2_;
++    other.exec_  = nullptr;
++    other.exec2_ = nullptr;
+     return *this;
+ }
+ 
+@@ -138,6 +199,15 @@ void DecodeGraphExecutable::instantiate(const DecodeGraphDefinition& definition)
+         CUDA_CHECK(err);
+     }
+     exec_ = exec;
++    if (definition.graph2_ != nullptr) {
++        cudaGraphExec_t exec2  = nullptr;
++        const cudaError_t err2 = cudaGraphInstantiate(&exec2, definition.graph2_, 0);
++        if (err2 != cudaSuccess) {
++            destroy_graph_exec(exec2);
++            CUDA_CHECK(err2);
++        }
++        exec2_ = exec2;
++    }
+ }
+ 
+ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+@@ -146,19 +216,27 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+         throw std::logic_error("CUDA Graph update requires a definition and executable");
+     }
+ 
+-    cudaGraphExecUpdateResultInfo result{};
+-    const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
+-    if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
+-        throw std::runtime_error(
+-            "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
+-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
++    if ((exec2_ != nullptr) != (definition.graph2_ != nullptr)) {
++        throw std::logic_error("CUDA Graph update across split and unsplit definitions");
+     }
++    const auto update_one = [](cudaGraphExec_t exec, cudaGraph_t graph) {
++        cudaGraphExecUpdateResultInfo result{};
++        const cudaError_t err = cudaGraphExecUpdate(exec, graph, &result);
++        if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
++            throw std::runtime_error(
++                "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
++                " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
++        }
++    };
++    update_one(exec_, definition.graph_);
++    if (exec2_ != nullptr) { update_one(exec2_, definition.graph2_); }
+ }
+ 
+ void DecodeGraphExecutable::upload(cudaStream_t stream) {
+     nvtx::ScopedRange upload_range(nvtx::Name::CudaGraphUpload, nvtx::Category::Graph);
+     if (!ready()) { throw std::logic_error("cannot upload an empty CUDA Graph executable"); }
+     CUDA_CHECK(cudaGraphUpload(exec_, stream));
++    if (exec2_ != nullptr) { CUDA_CHECK(cudaGraphUpload(exec2_, stream)); }
+ }
+ 
+ void DecodeGraphExecutable::launch(cudaStream_t stream) {
+@@ -166,10 +244,14 @@ void DecodeGraphExecutable::launch(cudaStream_t stream) {
+     nvtx::ScopedRange launch_range(nvtx::Name::CudaGraphLaunch, nvtx::Category::Graph);
+     if (!ready()) { throw std::logic_error("cannot launch an empty CUDA Graph executable"); }
+     CUDA_CHECK(cudaGraphLaunch(exec_, stream));
++    if (exec2_ != nullptr) { CUDA_CHECK(cudaGraphLaunch(exec2_, stream)); }
+ }
+ 
+ bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }
+ 
+-void DecodeGraphExecutable::reset() noexcept { destroy_graph_exec(exec_); }
++void DecodeGraphExecutable::reset() noexcept {
++    destroy_graph_exec(exec_);
++    destroy_graph_exec(exec2_);
++}
+ 
+ } // namespace ninfer
+diff --git a/src/core/decode_graph.h b/src/core/decode_graph.h
+index 7f83aab..576b324 100644
+--- a/src/core/decode_graph.h
++++ b/src/core/decode_graph.h
+@@ -30,9 +30,15 @@ public:
+     // executable can be updated across profiles only while the topology is unchanged.
+     [[nodiscard]] std::pair<std::size_t, std::uint64_t> topology_signature() const;
+ 
++    // Research flag NINFER_GRAPH_SPLIT=1: inside capture(), ends the capture on `stream` and continues
++    // in a second graph, so launch() can start the first part while the host submits the rest.
++    // A no-op outside a capture on this thread or when the flag is off.
++    static void split_point(cudaStream_t stream);
++
+ private:
+     friend class DecodeGraphExecutable;
+-    cudaGraph_t graph_ = nullptr;
++    cudaGraph_t graph_  = nullptr;
++    cudaGraph_t graph2_ = nullptr;
+ };
+ 
+ class DecodeGraphExecutable {
+@@ -53,7 +59,8 @@ public:
+     void reset() noexcept;
+ 
+ private:
+-    cudaGraphExec_t exec_ = nullptr;
++    cudaGraphExec_t exec_  = nullptr;
++    cudaGraphExec_t exec2_ = nullptr;
+ };
+ 
+ } // namespace ninfer
+diff --git a/src/models/qwen3_5/execution/draft.cpp b/src/models/qwen3_5/execution/draft.cpp
+index 9986f2e..22a4842 100644
+--- a/src/models/qwen3_5/execution/draft.cpp
++++ b/src/models/qwen3_5/execution/draft.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include "core/device.h"
+ #include "core/nvtx.h"
++#include "core/decode_graph.h"
+ #include "ninfer/ops/argmax.h"
+ #include "ninfer/ops/dynamic_grouped_conv.h"
+ #include "ninfer/ops/context_kv_materialize.h"
+@@ -699,6 +700,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
+         // The previous round's replay fold may still run on its side stream; the drafter above
+         // reads no GDN state, the target verification below does. Inside a capture the wait is
+         // an external event node, which each launch resolves against the latest record.
++        // NINFER_GRAPH_SPLIT=1: the drafter part above becomes its own graph (see split_point).
++        DecodeGraphDefinition::split_point(state.execution.device.stream);
+         if (state.replay_fold_done != nullptr) {
+             const cudaStream_t stream      = state.execution.device.stream;
+             cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+-- 
+2.34.1
+

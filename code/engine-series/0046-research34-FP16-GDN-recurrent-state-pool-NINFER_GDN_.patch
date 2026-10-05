@@ -1,0 +1,506 @@
+From b7683d3d7fab54499beb2af12a6dfd34d21d7042 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 46/49] research34: FP16 GDN recurrent state pool
+ (NINFER_GDN_STATE_F16=1; forced +0.84..0.90% tok/s)
+
+---
+ src/core/linear_attention_state.cpp           |  19 ++-
+ src/core/linear_attention_state.h             |   3 +
+ .../gated_delta_net/gated_delta_net.cpp       |  28 +++++
+ .../linear_attention/gated_delta_net/launch.h |   5 +
+ .../gated_delta_net/recurrent.cu              |  58 ++++++++-
+ .../gated_delta_net/recurrent.cuh             | 115 +++++++++++++++++-
+ .../gated_delta_net/replay.cpp                |  11 +-
+ 7 files changed, 225 insertions(+), 14 deletions(-)
+
+diff --git a/src/core/linear_attention_state.cpp b/src/core/linear_attention_state.cpp
+index ab85f75..6e6c9d1 100644
+--- a/src/core/linear_attention_state.cpp
++++ b/src/core/linear_attention_state.cpp
+@@ -6,7 +6,18 @@
+ #include <stdexcept>
+ #include <string>
+ 
++#include <cstdlib>
++
+ namespace ninfer {
++
++DType linear_attention_recurrent_dtype() {
++    static const DType dtype = [] {
++        const char* e = std::getenv("NINFER_GDN_STATE_F16");
++        return e != nullptr && e[0] == '1' ? DType::FP16 : DType::FP32;
++    }();
++    return dtype;
++}
++
+ namespace {
+ 
+ constexpr std::size_t kArenaAlign = 256;
+@@ -95,7 +106,7 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
+     const Tensor conv_shape(nullptr, spec.conv_dtype,
+                             {spec.conv_channels, spec.conv_width, spec.slot_count});
+     const Tensor recurrent_shape(
+-        nullptr, DType::FP32,
++        nullptr, linear_attention_recurrent_dtype(),
+         {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
+ 
+     LinearAttentionStatePoolLayout layout;
+@@ -123,7 +134,7 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
+     const Tensor conv_shape(nullptr, spec_.conv_dtype,
+                             {spec_.conv_channels, spec_.conv_width, spec_.slot_count});
+     const Tensor recurrent_shape(
+-        nullptr, DType::FP32,
++        nullptr, linear_attention_recurrent_dtype(),
+         {spec_.key_head_dim, spec_.value_head_dim, spec_.value_heads, spec_.slot_count});
+     conv_.reserve(layout.conv.size());
+     recurrent_.reserve(layout.recurrent.size());
+@@ -137,7 +148,7 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
+                            std::initializer_list<std::int32_t>{spec_.conv_channels,
+                                                                spec_.conv_width, spec_.slot_count});
+         recurrent_.emplace_back(
+-            layout.recurrent[layer].bind(backing).data, DType::FP32,
++            layout.recurrent[layer].bind(backing).data, linear_attention_recurrent_dtype(),
+             std::initializer_list<std::int32_t>{spec_.key_head_dim, spec_.value_head_dim,
+                                                 spec_.value_heads, spec_.slot_count});
+     }
+@@ -183,7 +194,7 @@ LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() co
+         validate_state_tensor(conv_[layer], spec_.conv_dtype,
+                               {spec_.conv_channels, spec_.conv_width, spec_.slot_count}, "conv");
+         validate_state_tensor(
+-            recurrent_[layer], DType::FP32,
++            recurrent_[layer], linear_attention_recurrent_dtype(),
+             {spec_.key_head_dim, spec_.value_head_dim, spec_.value_heads, spec_.slot_count},
+             "recurrent");
+     }
+diff --git a/src/core/linear_attention_state.h b/src/core/linear_attention_state.h
+index 88a2d14..f8c4174 100644
+--- a/src/core/linear_attention_state.h
++++ b/src/core/linear_attention_state.h
+@@ -11,6 +11,9 @@
+ 
+ namespace ninfer {
+ 
++// research34 (NINFER_GDN_STATE_F16=1): FP16 recurrent states; FP32 otherwise.
++[[nodiscard]] DType linear_attention_recurrent_dtype();
++
+ struct LinearAttentionStatePoolSpec {
+     std::uint32_t layers        = 0;
+     std::int32_t conv_channels  = 0;
+diff --git a/src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp b/src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+index 57bb631..cd26725 100644
+--- a/src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
++++ b/src/ops/linear_attention/gated_delta_net/gated_delta_net.cpp
+@@ -212,6 +212,14 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
+ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                      Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
++    if (ssm_state.dtype == DType::FP16) {
++        // research34: FP16 state storage; this path runs on an FP32 copy.
++        Tensor state32 = detail::gated_delta_net::state_scratch(0, ssm_state);
++        detail::gated_delta_net::convert_state(ssm_state, state32, stream);
++        gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, state32, out, stream);
++        detail::gated_delta_net::convert_state(state32, ssm_state, stream);
++        return;
++    }
+     if (q.ne[2] != 1) {
+         gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
+                         stream);
+@@ -230,6 +238,9 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
+                                   const Tensor& source_state_slots,
+                                   const Tensor& destination_state_slots, Tensor& out,
+                                   cudaStream_t stream) {
++    if (ssm_states.dtype == DType::FP16) {
++        throw std::invalid_argument("gated_delta_net_batch_update: FP16 states are not supported (research34)");
++    }
+     validate_recurrent_batch_update(q, k, v, g, beta, scale, ssm_states, source_state_slots,
+                                     destination_state_slots, out);
+ 
+@@ -242,6 +253,23 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                      cudaStream_t stream) {
++    if (ssm_state_in.dtype == DType::FP16 || ssm_state_out.dtype == DType::FP16) {
++        // research34: FP16 state storage; the prefill runs on FP32 copies (one conversion each way per call).
++        Tensor in32  = detail::gated_delta_net::state_scratch(0, ssm_state_in);
++        Tensor out32 = detail::gated_delta_net::state_scratch(1, ssm_state_out);
++        if (ssm_state_in.dtype == DType::FP16) {
++            detail::gated_delta_net::convert_state(ssm_state_in, in32, stream);
++        } else {
++            CUDA_CHECK(cudaMemcpyAsync(in32.data, ssm_state_in.data, in32.bytes(), cudaMemcpyDeviceToDevice, stream));
++        }
++        gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, in32, out32, out, stream);
++        if (ssm_state_out.dtype == DType::FP16) {
++            detail::gated_delta_net::convert_state(out32, ssm_state_out, stream);
++        } else {
++            CUDA_CHECK(cudaMemcpyAsync(ssm_state_out.data, out32.data, out32.bytes(), cudaMemcpyDeviceToDevice, stream));
++        }
++        return;
++    }
+     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+ 
+     auto scratch_scope   = ws.scope();
+diff --git a/src/ops/linear_attention/gated_delta_net/launch.h b/src/ops/linear_attention/gated_delta_net/launch.h
+index 0f081c1..add06ba 100644
+--- a/src/ops/linear_attention/gated_delta_net/launch.h
++++ b/src/ops/linear_attention/gated_delta_net/launch.h
+@@ -52,6 +52,11 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
+                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                         const std::int32_t* record_columns, cudaStream_t stream);
+ 
++// research34 (NINFER_GDN_STATE_F16): an FP32 scratch shaped like one FP16 state slot (index 0 or 1), and the
++// FP16 <-> FP32 conversion between them.
++Tensor state_scratch(int index, const Tensor& like);
++void convert_state(const Tensor& src, Tensor& dst, cudaStream_t stream);
++
+ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens);
+ 
+ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+index c5e869e..3c6b9e9 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -10,6 +10,9 @@
+ #include "ninfer/ops/fused_tail.h"
+ 
+ #include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <algorithm>
+ 
+ #include <cstdint>
+ #include <stdexcept>
+@@ -24,6 +27,22 @@ constexpr int kNormCounterBatches = 64;
+ constexpr int kNormCounterHeads   = 64;
+ __device__ int g_gdn_norm_counters[kNormCounterBatches * kNormCounterHeads];
+ 
++// research34: FP32 copies of FP16 slots for the prefill and T = 1 paths (two [128, 128, <= 64 heads] states).
++constexpr int kStateScratchHeads = 64;
++__device__ float g_gdn_state_scratch[2][kStateScratchHeads * kStateDim * kStateDim];
++
++__global__ void convert_state_kernel(const void* src, void* dst, std::int64_t n, bool to_half) {
++    for (std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x; i < n;
++         i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
++        if (to_half) {
++            const float x = static_cast<const float*>(src)[i];
++            static_cast<__half*>(dst)[i] = __float2half_rn(fminf(fmaxf(x, -65504.0f), 65504.0f));
++        } else {
++            static_cast<float*>(dst)[i] = __half2float(static_cast<const __half*>(src)[i]);
++        }
++    }
++}
++
+ static_assert(sizeof(GdnReplayFoldKernelRow) == 16);
+ static_assert(alignof(GdnReplayFoldKernelRow) == 16);
+ static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
+@@ -112,6 +131,9 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+         static_cast<const float*>(next_states.data),
+         static_cast<const std::int32_t*>(tree_parents.data),
+     };
++    // research34: FP16 states (chunked route only); the next-layer warm assumes FP32 tiles and is skipped.
++    access.state_f16 = ssm_states.dtype == DType::FP16;
++    if (access.state_f16) { access.next_states = nullptr; }
+     // research29 (NINFER_L2_FILL): a fill handed over by the model, and bit 2 for the next-state tiles.
+     access.fill       = ops::l2_fill_take();
+     access.fill_flags = ops::l2_fill_mask() & 2;
+@@ -163,6 +185,9 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+         }
+         ops::detail::run_pending_record_conv(conv);
+     }
++    if (access.state_f16 && (!chunked || q.ne[2] > kStagedRecordMaxWidth)) {
++        throw std::invalid_argument("GDN FP16 states need the chunked record (NINFER_GDN_CHUNKED_RECORD=1, T <= 16)");
++    }
+     if (tree_parents.data != nullptr) {
+         if (q.ne[2] > kStagedRecordMaxWidth) {
+             throw std::invalid_argument("GDN tree records support at most 16 columns");
+@@ -189,20 +214,22 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
+                               LinearAttentionStateAllLayersView states,
+                               const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                               const std::int32_t* record_columns, cudaStream_t stream) {
+-    const FoldAccess<Geometry> access{
++    FoldAccess<Geometry> access{
+         static_cast<const __nv_bfloat16*>(records.key.data),
+         static_cast<const __nv_bfloat16*>(records.value.data),
+         reinterpret_cast<const uint2*>(records.gate.data),
+         static_cast<const __nv_bfloat16*>(records.conv.data),
+         static_cast<float*>(states.recurrent_layer0.data),
+         static_cast<__nv_bfloat16*>(states.conv_layer0.data),
+-        states.recurrent_layer_stride_bytes / static_cast<std::int64_t>(sizeof(float)),
++        states.recurrent_layer_stride_bytes /
++            static_cast<std::int64_t>(dtype_size(states.recurrent_layer0.dtype)),
+         states.conv_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
+         records.spec.record_capacity,
+         records.spec.width,
+         rows,
+         record_columns,
+     };
++    access.state_f16 = states.recurrent_layer0.dtype == DType::FP16;
+     const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
+                     static_cast<unsigned>(active_rows),
+                     static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
+@@ -217,6 +244,33 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
+ 
+ } // namespace
+ 
++Tensor state_scratch(int index, const Tensor& like) {
++    static float* const base = [] {
++        void* p = nullptr;
++        CUDA_CHECK(cudaGetSymbolAddress(&p, g_gdn_state_scratch));
++        return static_cast<float*>(p);
++    }();
++    if (index < 0 || index > 1 || like.ne[0] != kStateDim || like.ne[1] != kStateDim || like.ne[2] <= 0 ||
++        like.ne[2] > kStateScratchHeads || like.ne[3] != 1) {
++        throw std::invalid_argument("GDN FP16 state scratch: unsupported state shape");
++    }
++    return Tensor(base + static_cast<std::int64_t>(index) * kStateScratchHeads * kStateDim * kStateDim, DType::FP32,
++                  {like.ne[0], like.ne[1], like.ne[2]});
++}
++
++void convert_state(const Tensor& src, Tensor& dst, cudaStream_t stream) {
++    const std::int64_t n = static_cast<std::int64_t>(src.ne[0]) * src.ne[1] * src.ne[2] * src.ne[3];
++    const bool to_half   = dst.dtype == DType::FP16;
++    if (n != static_cast<std::int64_t>(dst.ne[0]) * dst.ne[1] * dst.ne[2] * dst.ne[3] ||
++        src.dtype != (to_half ? DType::FP32 : DType::FP16) || (!to_half && dst.dtype != DType::FP32) ||
++        !src.is_contiguous() || !dst.is_contiguous()) {
++        throw std::invalid_argument("GDN FP16 state conversion: mismatched tensors");
++    }
++    convert_state_kernel<<<static_cast<unsigned>(std::min<std::int64_t>((n + 255) / 256, 1024)), 256, 0, stream>>>(
++        src.data, dst.data, n, to_half);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                       const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
+                       Tensor& out, cudaStream_t stream) {
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index 24be899..baa47e9 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -12,6 +12,7 @@
+ #include "ops/linear_attention/gated_delta_net/launch.h"
+ 
+ #include <cuda_bf16.h>
++#include <cuda_fp16.h>
+ 
+ #include <cstdint>
+ 
+@@ -36,6 +37,30 @@ __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], fl
+     store_vec(base + dqk_base, load_vec<float4>(reg));
+ }
+ 
++// research34 (NINFER_GDN_STATE_F16): FP16 state lanes. Stores round to nearest and saturate to +-65504.
++__device__ __forceinline__ void load_qk_lane_h(float (&reg)[kQkPerLane], const __half* base,
++                                               std::uint32_t dqk_base) {
++    const uint2 bits = *reinterpret_cast<const uint2*>(base + dqk_base);
++    const float2 a   = __half22float2(*reinterpret_cast<const __half2*>(&bits.x));
++    const float2 b   = __half22float2(*reinterpret_cast<const __half2*>(&bits.y));
++    reg[0]           = a.x;
++    reg[1]           = a.y;
++    reg[2]           = b.x;
++    reg[3]           = b.y;
++}
++
++__device__ __forceinline__ unsigned state_half2_bits(float x, float y) {
++    constexpr float kMax = 65504.0f;
++    const __half2 h      = __floats2half2_rn(fminf(fmaxf(x, -kMax), kMax), fminf(fmaxf(y, -kMax), kMax));
++    return *reinterpret_cast<const unsigned*>(&h);
++}
++
++__device__ __forceinline__ void store_qk_lane_h(const float (&reg)[kQkPerLane], __half* base,
++                                                std::uint32_t dqk_base) {
++    *reinterpret_cast<uint2*>(base + dqk_base) =
++        make_uint2(state_half2_bits(reg[0], reg[1]), state_half2_bits(reg[2], reg[3]));
++}
++
+ inline constexpr float kQkL2NormEps = 1.0e-6f;
+ 
+ struct RawQkLane {
+@@ -399,6 +424,14 @@ struct RecordAccess {
+     float norm_eps                   = 0.0F;
+     std::int32_t norm_d              = 0;
+     int* norm_counters               = nullptr;
++    // research34: `states` holds FP16 (same element strides).
++    bool state_f16 = false;
++
++    __device__ __forceinline__ const __half* state_read_base_h(const RecurrentCoordinates& coord) const {
++        return reinterpret_cast<const __half*>(states) +
++               static_cast<std::int64_t>(initial_slots[coord.batch]) * state_slot_stride +
++               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
++    }
+ 
+     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
+         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+@@ -504,6 +537,21 @@ struct FoldAccess {
+     // tree's accepted path). Null commits the record prefix itself. The kernel stages the row's
+     // columns into coord.record_path.
+     const std::int32_t* record_columns;
++    // research34: recurrent_layer0 holds FP16 (recurrent_layer_stride in FP16 elements).
++    bool state_f16 = false;
++
++    __device__ __forceinline__ std::int64_t state_offset(const RecurrentCoordinates& coord, std::int32_t slot) const {
++        const std::int64_t slot_stride =
++            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim * kStateDim;
++        return static_cast<std::int64_t>(coord.layer) * recurrent_layer_stride +
++               static_cast<std::int64_t>(slot) * slot_stride +
++               static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
++    }
++
++    __device__ __forceinline__ const __half* state_read_base_h(const RecurrentCoordinates& coord) const {
++        return reinterpret_cast<const __half*>(recurrent_layer0) +
++               state_offset(coord, rows.row[coord.batch].source_state_slot);
++    }
+ 
+     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
+         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
+@@ -586,6 +634,17 @@ struct FoldAccess {
+     __device__ __forceinline__ void
+     store_final_state(const RecurrentCoordinates& coord,
+                       const float (&state)[kDvPerWarp][kQkPerLane]) const {
++        if (state_f16) {
++            __half* half_destination = reinterpret_cast<__half*>(recurrent_layer0) +
++                                       state_offset(coord, rows.row[coord.batch].destination_state_slot);
++#pragma unroll
++            for (int r = 0; r < kDvPerWarp; ++r) {
++                store_qk_lane_h(state[r],
++                                half_destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
++                                coord.dqk_base);
++            }
++            return;
++        }
+         float* destination = state_write_base(coord);
+ #pragma unroll
+         for (int r = 0; r < kDvPerWarp; ++r) {
+@@ -652,6 +711,15 @@ __device__ __forceinline__ void load_state_tile(float (&state)[kDvPerWarp][kQkPe
+     }
+ }
+ 
++__device__ __forceinline__ void load_state_tile_h(float (&state)[kDvPerWarp][kQkPerLane],
++                                                  const __half* base, const RecurrentCoordinates& coord) {
++#pragma unroll
++    for (int r = 0; r < kDvPerWarp; ++r) {
++        load_qk_lane_h(state[r], base + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
++                       coord.dqk_base);
++    }
++}
++
+ __device__ __forceinline__ void store_state_tile(const float (&state)[kDvPerWarp][kQkPerLane],
+                                                  float* base, const RecurrentCoordinates& coord) {
+ #pragma unroll
+@@ -1064,7 +1132,16 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+     __shared__ float delta_s[kBlockDv][kW + 1];
+ 
+     const std::uint32_t tile_dv = static_cast<std::uint32_t>(coord.state_tile * kBlockDv);
+-    {
++    if (access.state_f16) {
++        // research34: the FP16 tile lands packed (256-byte rows) at the start of state_tile; widened below.
++        const __half* state_base = access.state_read_base_h(coord) + static_cast<std::int64_t>(tile_dv) * kStateDim;
++        auto* packed             = reinterpret_cast<__half*>(&state_tile[0][0]);
++        for (int task = thread; task < kBlockDv * (kStateDim / 8); task += kThreads) {
++            const int row = task / (kStateDim / 8);
++            const int c8  = task - row * (kStateDim / 8);
++            cp_async<16>(packed + row * kStateDim + c8 * 8, state_base + static_cast<std::int64_t>(row) * kStateDim + c8 * 8);
++        }
++    } else {
+         const float* state_base = access.state_read_base(coord) + static_cast<std::int64_t>(tile_dv) * kStateDim;
+         for (int task = thread; task < kBlockDv * (kStateDim / 4); task += kThreads) {
+             const int row = task / (kStateDim / 4);
+@@ -1136,6 +1213,30 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+     std::uint32_t next_state_word = 0U;
+     cp_wait<0>();
+     __syncthreads();
++    if (access.state_f16) {
++        // research34: widen the packed FP16 tile in place; every thread holds its halves across the barrier.
++        constexpr int kPacks = kBlockDv * kStateDim / 8 / kThreads;
++        static_assert(kPacks * kThreads * 8 == kBlockDv * kStateDim);
++        uint4 bits[kPacks];
++        const auto* packed = reinterpret_cast<const uint4*>(&state_tile[0][0]);
++#pragma unroll
++        for (int i = 0; i < kPacks; ++i) { bits[i] = packed[thread + i * kThreads]; }
++        __syncthreads();
++#pragma unroll
++        for (int i = 0; i < kPacks; ++i) {
++            const int pack   = thread + i * kThreads;
++            const int row    = pack / (kStateDim / 8);
++            const int col    = pack % (kStateDim / 8) * 8;
++            const auto* half = reinterpret_cast<const __half2*>(&bits[i]);
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                const float2 f             = __half22float2(half[j]);
++                state_tile[row][col + 2 * j]     = f.x;
++                state_tile[row][col + 2 * j + 1] = f.y;
++            }
++        }
++        __syncthreads();
++    }
+     // research29: the next GEMM's weight lines; research29f: issued once this CTA's own copies have landed.
+     ops::detail::L2FillLoads<2> l2_fill{};
+     l2_fill.issue(access.fill,
+@@ -1461,7 +1562,11 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+         coord.record_path = record_path;
+     }
+     __align__(16) float state[kDvPerWarp][kQkPerLane];
+-    load_state_tile(state, access.state_read_base(coord), coord);
++    if (access.state_f16) {
++        load_state_tile_h(state, access.state_read_base_h(coord), coord);
++    } else {
++        load_state_tile(state, access.state_read_base(coord), coord);
++    }
+     run_recurrent_sequence<true, FoldEffects>(state, access, coord, valid);
+     access.store_final_state(coord, state);
+     access.publish_final_conv_history(coord, valid);
+@@ -1492,7 +1597,11 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+ 
+     // The state tile is independent of the records, so its DRAM latency overlaps their staging.
+     __align__(16) float state[kDvPerWarp][kQkPerLane];
+-    load_state_tile(state, access.state_read_base(coord), coord);
++    if (access.state_f16) {
++        load_state_tile_h(state, access.state_read_base_h(coord), coord);
++    } else {
++        load_state_tile(state, access.state_read_base(coord), coord);
++    }
+ 
+     if (access.record_columns != nullptr) {
+         if (thread < valid) {
+diff --git a/src/ops/linear_attention/gated_delta_net/replay.cpp b/src/ops/linear_attention/gated_delta_net/replay.cpp
+index f7719f6..7e314c2 100644
+--- a/src/ops/linear_attention/gated_delta_net/replay.cpp
++++ b/src/ops/linear_attention/gated_delta_net/replay.cpp
+@@ -120,8 +120,8 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
+     require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
+     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
+     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
+-    require_tensor(states, DType::FP32, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
+-                   "states");
++    require_tensor(states, states.dtype == DType::FP16 ? DType::FP16 : DType::FP32,
++                   {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp, "states");
+     require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
+     if (valid_columns.data != nullptr) {
+         require_tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
+@@ -203,12 +203,13 @@ void validate_fold_states(const GdnReplayRecords& records,
+     }
+     require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
+                    256, kOp, "conv state layer 0");
+-    require_tensor(states.recurrent_layer0, DType::FP32,
++    const DType recurrent_dtype = states.recurrent_layer0.dtype == DType::FP16 ? DType::FP16 : DType::FP32;
++    require_tensor(states.recurrent_layer0, recurrent_dtype,
+                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
+                    "recurrent state layer 0");
+     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
+         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
+-        states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(sizeof(float)) != 0 ||
++        states.recurrent_layer_stride_bytes % static_cast<std::int64_t>(dtype_size(recurrent_dtype)) != 0 ||
+         static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
+         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
+             states.recurrent_layer0.bytes()) {
+@@ -304,7 +305,7 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
+     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
+                            key_record, value_record, gate_record, out);
+     if (next_states.data != nullptr) {
+-        require_tensor(next_states, DType::FP32,
++        require_tensor(next_states, ssm_states.dtype == DType::FP16 ? DType::FP16 : DType::FP32,
+                        {kStateDim, kStateDim, ssm_states.ne[2], ssm_states.ne[3]}, 16,
+                        "gated_delta_net_replay_record", "next states");
+     }
+-- 
+2.34.1
+

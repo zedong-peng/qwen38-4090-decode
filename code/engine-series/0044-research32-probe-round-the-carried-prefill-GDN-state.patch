@@ -1,0 +1,93 @@
+From f17b1f6f4c324dcd6bf0ee548f293d7622b391a4 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 44/49] research32 probe: round the carried prefill GDN state
+ to N mantissa bits (NINFER_STATE_ROUND_BITS)
+
+---
+ .../gated_delta_net/chunked/state_passing.cu  | 12 ++++++++++
+ .../gated_delta_net/chunked/state_passing.cuh | 22 +++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+index 73223a4..375ebbf 100644
+--- a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
++++ b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cu
+@@ -1,6 +1,8 @@
+ #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
+ #include "ops/linear_attention/gated_delta_net/chunked/state_passing.cuh"
+ 
++#include <cstdlib>
++
+ namespace ninfer::ops::detail::gated_delta_net::chunked {
+ namespace {
+ 
+@@ -39,6 +41,16 @@ cudaError_t launch_state_passing(const state_passing_config& cfg) {
+ 
+     const auto qk_map     = head_map::of((int)cfg.H_qk, (int)cfg.H_v);
+     const std::int64_t NT = cfg.L / BT;
++    static const int round_bits = [] {
++        const char* e = std::getenv("NINFER_STATE_ROUND_BITS");
++        return e != nullptr ? std::atoi(e) : 0;
++    }();
++    static bool round_set = false;
++    if (round_bits > 0 && round_bits < 23 && !round_set) {
++        NINFER_GATED_DELTA_NET_PROPAGATE(
++            cudaMemcpyToSymbol(kernel::g_state_round_bits, &round_bits, sizeof(round_bits)));
++        round_set = true;
++    }
+     if (cfg.H_v >= 48) {
+         NINFER_GATED_DELTA_NET_PROPAGATE(v.check_grid(
+             static_cast<std::int64_t>(cfg.H_v) * kernel::kernel_dims<16>::D_STRIPS, 1));
+diff --git a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh
+index 09bc5d4..0e6a6ae 100644
+--- a/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh
++++ b/src/ops/linear_attention/gated_delta_net/chunked/state_passing.cuh
+@@ -18,6 +18,16 @@ using ninfer::ops::ldmatrix_x2_t;
+ using ninfer::ops::smem_addr;
+ using ninfer::ops::exp2_approx;
+ 
++// NINFER_STATE_ROUND_BITS probe: explicit mantissa bits kept at chunk boundaries (0 = off).
++__device__ int g_state_round_bits = 0;
++
++__device__ __forceinline__ float round_state_mantissa(float x, int bits) {
++    const unsigned shift = 23u - static_cast<unsigned>(bits);
++    unsigned u           = __float_as_uint(x);
++    u += ((1u << (shift - 1u)) - 1u) + ((u >> shift) & 1u);
++    return __uint_as_float(u & ~((1u << shift) - 1u));
++}
++
+ static_assert(kChunkSize == 64, "stage_state_passing: kChunkSize must be 64");
+ static_assert(kStateDim == 128);
+ 
+@@ -310,8 +320,16 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
+     int64_t hc_base     = hc_block_base;
+     int64_t vn_base     = vn_block_base;
+     int64_t g_cs_offset = 0;
++    const int round_bits = g_state_round_bits;
+     for (int chunk = 0; chunk < chunks; ++chunk) {
+         const int64_t W_base_next = W_base + W_chunk_stride;
++        if (round_bits > 0) {
++#pragma unroll
++            for (int m = 0; m < M_TILES_H_PW; ++m) {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) h_frag[m][i] = round_state_mantissa(h_frag[m][i], round_bits);
++            }
++        }
+         const int64_t k_base_next = k_base + k_chunk_stride;
+ 
+         // === Phase A: drain W + scatter h_frag to snap ===
+@@ -524,6 +542,10 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
+ 
+ #pragma unroll
+     for (int m = 0; m < M_TILES_H_PW; ++m) {
++        if (round_bits > 0) {
++#pragma unroll
++            for (int i = 0; i < 4; ++i) h_frag[m][i] = round_state_mantissa(h_frag[m][i], round_bits);
++        }
+         const int k_g0 = s_idx * S_PER_WARP + m * MMA_M + lane_g;
+         const int k_g1 = k_g0 + 8;
+         const int d0   = warp_d_global + 2 * lane_t;
+-- 
+2.34.1
+

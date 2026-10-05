@@ -1,0 +1,390 @@
+From 6cf11518339c6ade59dc1a5c8f5986c4538e009f Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 17:43:09 +0800
+Subject: [PATCH 28/49] Stage-packed Q3 shadow tiles (NINFER_Q3_TILED); drafter
+ qkv/conv fake-quant knobs (research20)
+
+---
+ include/ninfer/ops/linear_topk.h              |  3 +
+ include/ninfer/ops/q3_shadow.h                |  8 +++
+ src/core/weight.h                             |  3 +
+ src/models/qwen3_5/execution/parameters.cpp   | 64 +++++++++++++++++++
+ src/ops/linear/ada_small_t_mma.cuh            | 32 +++++++++-
+ src/ops/linear/q3_shadow.cu                   | 50 +++++++++++++++
+ src/ops/linear_add/q4/q4_linear_add.cu        | 14 ++++
+ .../q4/q4_linear_swiglu_ada_small_t.cu        | 24 ++++++-
+ src/ops/linear_topk/two_level_head.cu         | 32 ++++++++++
+ 9 files changed, 226 insertions(+), 4 deletions(-)
+
+diff --git a/include/ninfer/ops/linear_topk.h b/include/ninfer/ops/linear_topk.h
+index 01a1fc2..9e0ce5a 100644
+--- a/include/ninfer/ops/linear_topk.h
++++ b/include/ninfer/ops/linear_topk.h
+@@ -71,6 +71,9 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
+ // Research: requantize a Q8 G32 row-split weight in place onto a BITS-bit G64 grid (see
+ // NINFER_DRAFT_FAKEQ). The weight keeps its Q8 storage; every value becomes c*s with |c| <= 2^(BITS-1)-1.
+ void q8_fake_requantize_inplace(const Weight& q8, int bits, cudaStream_t stream);
++// Research: the same grid for a contiguous BF16 [n, k] weight (k % 64 == 0), stored back as BF16 c*s
++// (see NINFER_DRAFT_FAKEQ_CONV).
++void bf16_fake_requantize_inplace(const Weight& w, int bits, cudaStream_t stream);
+ 
+ void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_scales,
+                                cudaStream_t stream);
+diff --git a/include/ninfer/ops/q3_shadow.h b/include/ninfer/ops/q3_shadow.h
+index 9fd862a..b0ea8e9 100644
+--- a/include/ninfer/ops/q3_shadow.h
++++ b/include/ninfer/ops/q3_shadow.h
+@@ -17,5 +17,13 @@ std::size_t q3_high_bytes(const Weight& w);
+ // Repack w's Q4 codes into the pair-split Q3 planes of ada_small_t_mma.cuh: u = c + 4 for codes in
+ // [-4, 3], or u = (d + 7) / 2 for odd codes d (odd = true).
+ void q3_transcode(const Weight& w, void* low, void* high, bool odd, cudaStream_t stream);
++// Research (NINFER_Q3_TILED): bytes of w's stage-packed Q3 tiles (25 per 64-weight group).
++std::size_t q3_packed_bytes(const Weight& w);
++// Packs w's Q3 planes and LS8 bytes per (CTA, pipeline stage) of an Ada small-T schedule with rows_cta rows per CTA
++// and groups_per_stage groups per stage: tile (b, s) = [low chunks row-major | high chunks | LS8 bytes rows x G].
++// paired_offset > 0: CTA b's local rows [0, rows_cta / 2) are weight rows b * rows_cta / 2 + r and the rest
++// paired_offset + b * rows_cta / 2 + r - rows_cta / 2 (AdaPairedHalfRows); 0: contiguous rows.
++void q3_pack_tiles(const Weight& w, void* dst, int rows_cta, int groups_per_stage, int paired_offset,
++                   cudaStream_t stream);
+ 
+ } // namespace ninfer::ops
+diff --git a/src/core/weight.h b/src/core/weight.h
+index bbf7842..1bcb3a4 100644
+--- a/src/core/weight.h
++++ b/src/core/weight.h
+@@ -54,6 +54,9 @@ struct Weight {
+     const void* q3_low         = nullptr;
+     const void* q3_high        = nullptr;
+     bool q3_odd                = false; // the planes hold odd codes 2c + 1 (half grid), u = (d + 7) / 2
++    // Research (NINFER_Q3_TILED): 0 row-major Q3 planes; 1 / 2 q3_low holds stage-packed tiles
++    // [low | high | LS8 bytes] of the gate/up (R4 G8, paired halves) / down (R5 G16) route, q3_high is null.
++    int q3_tile                = 0;
+     float input_scale_divisor  = 0.0F;
+ };
+ 
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 9f7b84d..86950b4 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -381,6 +381,40 @@ Parameters::Parameters(const Model& source) : model(source) {
+             std::fprintf(stderr, "drafter fake-quant: %d Q8 projections on a %d-bit G64 grid\n", count,
+                          bits);
+         }
++        // Research: NINFER_DRAFT_FAKEQ_QKV=B (fused qkv + context key/value, Q8) and NINFER_DRAFT_FAKEQ_CONV=B
++        // (BF16 dynamic-conv kernel projections) on a B-bit G64 grid. Requantizing an aliased weight twice is
++        // idempotent (its absmax and scale do not change).
++        if (const char* fake = std::getenv("NINFER_DRAFT_FAKEQ_QKV"); fake != nullptr && *fake) {
++            const int bits = std::atoi(fake);
++            int count      = 0;
++            for (const auto& layer : draft->layers) {
++                for (const LinearParameters* p :
++                     {&layer.query_key_value, &layer.context_key, &layer.context_value}) {
++                    if (p->weight.qtype == QType::Q8_G32_FP16 && p->weight.qdata != nullptr) {
++                        ops::q8_fake_requantize_inplace(p->weight, bits, nullptr);
++                        ++count;
++                    }
++                }
++            }
++            CUDA_CHECK(cudaDeviceSynchronize());
++            std::fprintf(stderr, "drafter fake-quant: %d qkv/context projections on a %d-bit G64 grid\n",
++                         count, bits);
++        }
++        if (const char* fake = std::getenv("NINFER_DRAFT_FAKEQ_CONV"); fake != nullptr && *fake) {
++            const int bits = std::atoi(fake);
++            int count      = 0;
++            for (const auto& layer : draft->layers) {
++                for (const auto* conv : {&layer.attention_conv, &layer.mlp_conv}) {
++                    if (conv->has_value()) {
++                        ops::bf16_fake_requantize_inplace((*conv)->kernel_projection.weight, bits, nullptr);
++                        ++count;
++                    }
++                }
++            }
++            CUDA_CHECK(cudaDeviceSynchronize());
++            std::fprintf(stderr, "drafter fake-quant: %d conv kernel projections on a %d-bit G64 grid\n",
++                         count, bits);
++        }
+     }
+     if (const char* ls8 = std::getenv("NINFER_LS8"); ls8 != nullptr && std::atoi(ls8) == 1) {
+         Ls8Pass pass;
+@@ -428,6 +462,36 @@ Parameters::Parameters(const Model& source) : model(source) {
+         CUDA_CHECK(cudaDeviceSynchronize());
+         std::fprintf(stderr, "Q3 shadow: %d of %d MLP/GDN-input weights (%d half grid), %.1f MiB of Q3 planes\n",
+                      pass.weights, pass.checked, pass.odd, static_cast<double>(pass.bytes) / (1 << 20));
++        // Research: NINFER_Q3_TILED=1 packs the target MLP weights' Q3 planes + LS8 bytes per (CTA, stage) tile of
++        // the route that reads them (gate/up R4 G8 paired halves, down R5 G16); see ops::q3_pack_tiles.
++        if (const char* tiled = std::getenv("NINFER_Q3_TILED"); tiled != nullptr && std::atoi(tiled) == 1) {
++            int packed = 0;
++            const auto pack = [&](Weight& w, int kind, int rows_cta, int groups_per_stage, int paired) {
++                if (w.q3_low == nullptr || w.q3_high == nullptr || w.scales_ls8 == nullptr || w.q3_tile != 0) {
++                    return;
++                }
++                void* memory = nullptr;
++                CUDA_CHECK(cudaMalloc(&memory, ops::q3_packed_bytes(w)));
++                ops::q3_pack_tiles(w, memory, rows_cta, groups_per_stage, paired, nullptr);
++                CUDA_CHECK(cudaDeviceSynchronize());
++                CUDA_CHECK(cudaFree(const_cast<void*>(w.q3_low)));  // the low and high planes share one allocation
++                w.q3_low  = memory;
++                w.q3_high = nullptr;
++                w.q3_tile = kind;
++                ++packed;
++            };
++            for (auto& block : text.layers) {
++                if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
++                    if (dense->gate_up.weight.n == 34816 && dense->gate_up.weight.k == 5120) {
++                        pack(dense->gate_up.weight, 1, 32, 8, 17408);
++                    }
++                    if (dense->down.weight.n == 5120 && dense->down.weight.k == 17408) {
++                        pack(dense->down.weight, 2, 40, 16, 0);
++                    }
++                }
++            }
++            std::fprintf(stderr, "Q3 tiled: %d target MLP weights packed per CTA stage\n", packed);
++        }
+     }
+     if (w.proposal) {
+         proposal =
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index 96ed989..bd095e3 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -39,7 +39,7 @@ inline const float* ada_super(const Weight& w) { return w.scales_ls8 != nullptr
+ enum class AdaWeightFormat { Q4, Q5, Q3, Q3Odd };
+ 
+ template <AdaWeightFormat Format, int RowTiles, int Warps, int TokenTiles, int GroupsPerStage,
+-          int Stages, bool EvictFirst = true>
++          int Stages, bool EvictFirst = true, bool Packed = false>
+ struct AdaSmallTSchedule {
+     static constexpr AdaWeightFormat kFormat = Format;
+     // Weight fills carry an L2 evict-first hint: each weight byte is read once per call.
+@@ -58,6 +58,12 @@ struct AdaSmallTSchedule {
+     static constexpr int kThreads            = 32 * Warps;
+     static constexpr int kMaxTokens          = 8 * TokenTiles;
+     static constexpr int kGroupsPerWarp      = kG / kWarps;
++    // Research (NINFER_Q3_TILED): `codes` holds stage-packed tiles [low | high | LS8 bytes] (q3_pack_tiles); the
++    // high and scale pointers are unused and super must be set.
++    static constexpr bool kPacked            = Packed;
++    static constexpr int kLowTileBytes       = 8 * RowTiles * kLowBytes * GroupsPerStage;
++    static constexpr int kHighTileBytes      = (Format != AdaWeightFormat::Q4) ? 8 * RowTiles * 8 * GroupsPerStage : 0;
++    static constexpr int kTileBytes          = kLowTileBytes + kHighTileBytes + 8 * RowTiles * GroupsPerStage;
+ 
+     static constexpr int kCodeStride  = kLowBytes * kG + kLowBytes;
+     static constexpr int kHighStride  = kHasHigh ? 8 * kG + 16 : 0;
+@@ -196,6 +202,30 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+         const int g0            = stage * S::kG;
+ 
+         constexpr int kCodeChunks = S::kLowBytes * S::kG / 16;
++        if constexpr (S::kPacked) {
++            static_assert(S::kQ3, "packed tiles hold Q3 planes");
++            const std::uint8_t* tile =
++                codes + (static_cast<std::int64_t>(block) * kPipeStages + stage) * S::kTileBytes;
++            for (int i = tid; i < kRows * kCodeChunks; i += S::kThreads) {
++                fill16(code_dst + (i / kCodeChunks) * S::kCodeStride + 16 * (i % kCodeChunks), tile + 16 * i);
++            }
++            constexpr int kHighChunks = S::kG / 2;
++            for (int i = tid; i < kRows * kHighChunks; i += S::kThreads) {
++                fill16(high_dst + (i / kHighChunks) * S::kHighStride + 16 * (i % kHighChunks),
++                       tile + S::kLowTileBytes + 16 * i);
++            }
++            for (int row = tid; row < kRows; row += S::kThreads) {
++                const std::uint8_t* src = tile + S::kLowTileBytes + S::kHighTileBytes + row * S::kG;
++                if constexpr (S::kG == 4) {
++                    cp_async<4>(scale_dst + row * S::kScaleStride, src);
++                } else if constexpr (S::kG == 8) {
++                    cp_async<8>(scale_dst + row * S::kScaleStride, src);
++                } else {
++                    fill16(scale_dst + row * S::kScaleStride, src);
++                }
++            }
++            return;
++        }
+         for (int i = tid; i < kRows * kCodeChunks; i += S::kThreads) {
+             const int row = i / kCodeChunks;
+             const int c   = i % kCodeChunks;
+diff --git a/src/ops/linear/q3_shadow.cu b/src/ops/linear/q3_shadow.cu
+index 9ffcfde..0b939ea 100644
+--- a/src/ops/linear/q3_shadow.cu
++++ b/src/ops/linear/q3_shadow.cu
+@@ -61,8 +61,58 @@ __global__ void q3_transcode_kernel(const uint4* __restrict__ codes, std::int64_
+     high[g] = make_uint2(hi[0], hi[1]);
+ }
+ 
++// One CTA per (block, stage) tile; see q3_pack_tiles.
++__global__ void q3_pack_tiles_kernel(const std::uint8_t* __restrict__ low, const std::uint8_t* __restrict__ high,
++                                     const std::uint8_t* __restrict__ ls8, std::uint8_t* __restrict__ dst,
++                                     int stages, int rows_cta, int g, int groups, int paired) {
++    const std::int64_t tile = blockIdx.x;
++    const int stage         = static_cast<int>(tile % stages);
++    const std::int64_t b    = tile / stages;
++    const int low_chunks = g, high_chunks = g / 2, half = rows_cta / 2;
++    std::uint8_t* out = dst + tile * static_cast<std::int64_t>(rows_cta) * g * 25;
++    const auto row_of = [&](int r) -> std::int64_t {
++        return paired > 0 ? (r < half ? b * half + r : paired + b * half + r - half) : b * rows_cta + r;
++    };
++    for (int i = threadIdx.x; i < rows_cta * low_chunks; i += blockDim.x) {
++        const int r = i / low_chunks, c = i % low_chunks;
++        reinterpret_cast<uint4*>(out)[i] =
++            reinterpret_cast<const uint4*>(low + (row_of(r) * groups + static_cast<std::int64_t>(stage) * g) * 16)[c];
++    }
++    std::uint8_t* out_high = out + static_cast<std::int64_t>(rows_cta) * low_chunks * 16;
++    for (int i = threadIdx.x; i < rows_cta * high_chunks; i += blockDim.x) {
++        const int r = i / high_chunks, c = i % high_chunks;
++        reinterpret_cast<uint4*>(out_high)[i] =
++            reinterpret_cast<const uint4*>(high + (row_of(r) * groups + static_cast<std::int64_t>(stage) * g) * 8)[c];
++    }
++    std::uint8_t* out_scales = out_high + static_cast<std::int64_t>(rows_cta) * high_chunks * 16;
++    for (int i = threadIdx.x; i < rows_cta * g; i += blockDim.x) {
++        const int r = i / g, c = i % g;
++        out_scales[i] = ls8[row_of(r) * groups + static_cast<std::int64_t>(stage) * g + c];
++    }
++}
++
+ } // namespace
+ 
++std::size_t q3_packed_bytes(const Weight& w) { return static_cast<std::size_t>(groups(w)) * 25; }
++
++void q3_pack_tiles(const Weight& w, void* dst, int rows_cta, int groups_per_stage, int paired_offset,
++                   cudaStream_t stream) {
++    require_q4(w);
++    const int row_groups = w.k / 64;
++    if (w.q3_low == nullptr || w.q3_high == nullptr || w.scales_ls8 == nullptr || w.q3_tile != 0 ||
++        rows_cta <= 0 || w.n % rows_cta != 0 || groups_per_stage % 2 != 0 || row_groups % groups_per_stage != 0 ||
++        (paired_offset > 0 && (rows_cta % 2 != 0 || 2 * paired_offset != w.n))) {
++        throw std::invalid_argument("q3 pack tiles: needs row-major Q3 planes, LS8 scales and a dividing schedule");
++    }
++    const int stages = row_groups / groups_per_stage;
++    const std::int64_t tiles = static_cast<std::int64_t>(w.n / rows_cta) * stages;
++    q3_pack_tiles_kernel<<<static_cast<unsigned>(tiles), 256, 0, stream>>>(
++        static_cast<const std::uint8_t*>(w.q3_low), static_cast<const std::uint8_t*>(w.q3_high),
++        static_cast<const std::uint8_t*>(w.scales_ls8), static_cast<std::uint8_t*>(dst), stages, rows_cta,
++        groups_per_stage, row_groups, paired_offset);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ int q3_codes_kind(const Weight& w, cudaStream_t stream) {
+     require_q4(w);
+     int* misfit = nullptr;
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index b1416e7..746e9a0 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -112,6 +112,20 @@ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t
+         // Q3 shadow planes (NINFER_Q3_SHADOW): 16 groups per stage, 42.1 us at K = 17408, T = 16
+         // against 50.1 us for the Q4 codes (kernels/q3/bench_q3_sweep.cu); the same bits.
+         constexpr int kG = K == 17408 ? 16 : 8;
++        // NINFER_Q3_TILED: the planes are packed per (40-row CTA, 16-group stage) tile; same bits.
++        if (w.q3_tile != 0) {
++            if (K != 17408 || w.q3_tile != 2 || ada_super(w) == nullptr) {
++                throw std::invalid_argument("q4 linear_add ada small-T: Q3 tiles packed for another route");
++            }
++            if (w.q3_odd) {
++                launch_ada_q3<AdaSmallTSchedule<AdaWeightFormat::Q3Odd, 5, 8, TokenTiles, kG, 2, true, true>, K>(
++                    x, w, epilogue, stream);
++            } else {
++                launch_ada_q3<AdaSmallTSchedule<AdaWeightFormat::Q3, 5, 8, TokenTiles, kG, 2, true, true>, K>(
++                    x, w, epilogue, stream);
++            }
++            return;
++        }
+         if (w.q3_odd) {
+             launch_ada_q3<Q3OddAdaSmallTSchedule<5, 8, TokenTiles, kG, 2>, K>(x, w, epilogue, stream);
+         } else {
+diff --git a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+index 56b9b39..3441cfd 100644
+--- a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
++++ b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+@@ -29,7 +29,7 @@ struct SwiGluEpilogue {
+     }
+ };
+ 
+-template <AdaWeightFormat Format, int RowTiles, int Warps, int G, int Stages>
++template <AdaWeightFormat Format, int RowTiles, int Warps, int G, int Stages, bool Packed = false>
+ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+     const SwiGluEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data),
+                                   static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16))};
+@@ -42,12 +42,12 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream)
+     const float* sup = ada_super(w);
+     using Rows       = AdaPairedHalfRows<kIntermediate>;
+     if (x.ne[1] <= 8) {
+-        using S = AdaSmallTSchedule<Format, RowTiles, Warps, 1, G, Stages>;
++        using S = AdaSmallTSchedule<Format, RowTiles, Warps, 1, G, Stages, true, Packed>;
+         static_assert(kGateUpRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden, Rows>(xp, x_ld, code, hi, sc, kGateUpRows, x.ne[1],
+                                                  epilogue, stream, sup);
+     } else {
+-        using S = AdaSmallTSchedule<Format, RowTiles, Warps, 2, G, Stages>;
++        using S = AdaSmallTSchedule<Format, RowTiles, Warps, 2, G, Stages, true, Packed>;
+         static_assert(kGateUpRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden, Rows>(xp, x_ld, code, hi, sc, kGateUpRows, x.ne[1],
+                                                  epilogue, stream, sup);
+@@ -73,6 +73,24 @@ void q4_linear_swiglu_ada_small_t_launch(const Tensor& x, const Weight& w, Tenso
+             const char* e = std::getenv("NINFER_Q3_EXACT");
+             return e != nullptr && std::atoi(e) == 1;
+         }();
++        // NINFER_Q3_TILED: the planes are packed per (32-row CTA, 8-group stage) tile; same bits.
++        if (w.q3_tile != 0) {
++            if (w.q3_tile != 1 || ada_super(w) == nullptr) {
++                throw std::invalid_argument("q4 linear_swiglu ada small-T: Q3 tiles packed for another route");
++            }
++            if (exact) {
++                if (w.q3_odd) {
++                    launch<AdaWeightFormat::Q3Odd, 4, 8, 8, 2, true>(x, w, out, stream);
++                } else {
++                    launch<AdaWeightFormat::Q3, 4, 8, 8, 2, true>(x, w, out, stream);
++                }
++            } else if (w.q3_odd) {
++                launch<AdaWeightFormat::Q3Odd, 4, 4, 8, 2, true>(x, w, out, stream);
++            } else {
++                launch<AdaWeightFormat::Q3, 4, 4, 8, 2, true>(x, w, out, stream);
++            }
++            return;
++        }
+         if (exact) {
+             if (w.q3_odd) {
+                 launch<AdaWeightFormat::Q3Odd, 4, 8, 8, 2>(x, w, out, stream);
+diff --git a/src/ops/linear_topk/two_level_head.cu b/src/ops/linear_topk/two_level_head.cu
+index ac27827..3ff68c1 100644
+--- a/src/ops/linear_topk/two_level_head.cu
++++ b/src/ops/linear_topk/two_level_head.cu
+@@ -157,6 +157,38 @@ void require_q8_head(const Weight& head) {
+ 
+ } // namespace
+ 
++namespace {
++// One thread per (row, 64-wide group) of a contiguous BF16 weight: canonical FP16 absmax scale, round-to-nearest
++// codes clamped to [-qmax, qmax], each value replaced by the BF16 rounding of c * s.
++__global__ void bf16_fake_requant_kernel(__nv_bfloat16* __restrict__ w, std::int64_t rows, int k, int bits) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const int groups         = k / 64;
++    if (index >= rows * groups) { return; }
++    __nv_bfloat16* p = w + (index / groups) * k + (index % groups) * 64;
++    float absmax     = 0.0f;
++    for (int i = 0; i < 64; ++i) { absmax = fmaxf(absmax, fabsf(__bfloat162float(p[i]))); }
++    const int qmax = (1 << (bits - 1)) - 1;
++    __half scale   = __float2half_rn(absmax / static_cast<float>(qmax));
++    if (__half2float(scale) == 0.0f && absmax > 0.0f) { scale = __ushort_as_half(1); }
++    const float s       = __half2float(scale);
++    const float inverse = s > 0.0f ? 1.0f / s : 0.0f;
++    for (int i = 0; i < 64; ++i) {
++        const int q = max(-qmax, min(qmax, __float2int_rn(__bfloat162float(p[i]) * inverse)));
++        p[i]        = __float2bfloat16_rn(static_cast<float>(q) * s);
++    }
++}
++} // namespace
++
++void bf16_fake_requantize_inplace(const Weight& w, int bits, cudaStream_t stream) {
++    if (w.qtype != QType::BF16 || w.k % 64 != 0 || w.qdata == nullptr || bits < 2 || bits > 8) {
++        throw std::invalid_argument("bf16 fake requantize: requires a contiguous BF16 weight with k % 64 == 0");
++    }
++    const std::int64_t threads = static_cast<std::int64_t>(w.n) * (w.k / 64);
++    bf16_fake_requant_kernel<<<static_cast<unsigned>((threads + 127) / 128), 128, 0, stream>>>(
++        static_cast<__nv_bfloat16*>(const_cast<void*>(w.qdata)), w.n, w.k, bits);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void q8_fake_requantize_inplace(const Weight& q8, int bits, cudaStream_t stream) {
+     if (q8.qtype != QType::Q8_G32_FP16 || q8.layout != QuantLayout::RowSplit || q8.k % 64 != 0 ||
+         bits < 2 || bits > 7) {
+-- 
+2.34.1
+

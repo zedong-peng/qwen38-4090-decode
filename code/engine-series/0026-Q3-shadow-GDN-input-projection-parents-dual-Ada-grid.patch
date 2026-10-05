@@ -1,0 +1,158 @@
+From 8834b85bf4660650b405fc917e1cc0c323cb501c Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 02:09:13 +0800
+Subject: [PATCH 26/49] Q3 shadow: GDN input projection parents (dual Ada grid,
+ Q4/Q3/Q3Odd per parent)
+
+---
+ src/models/qwen3_5/execution/parameters.cpp   | 12 ++-
+ .../q4_q5/q4_q5_gdn_input_independent.cu      | 84 +++++++++++++++++++
+ 2 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 475f55b..9f7b84d 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -328,6 +328,15 @@ struct Q3ShadowPass {
+         bytes += low + high;
+         ++weights;
+     }
++    void operator()(ops::ProjectionWeights& p) {
++        if (auto* single = std::get_if<ops::SingleProjectionWeight>(&p)) {
++            (*this)(single->weight);
++        } else {
++            auto& paired = std::get<ops::PairedProjectionWeights>(p);
++            (*this)(paired.first);
++            (*this)(paired.second);
++        }
++    }
+ };
+ 
+ } // namespace
+@@ -404,6 +413,7 @@ Parameters::Parameters(const Model& source) : model(source) {
+     if (const char* q3 = std::getenv("NINFER_Q3_SHADOW"); q3 != nullptr && std::atoi(q3) == 1) {
+         Q3ShadowPass pass;
+         for (auto& block : text.layers) {
++            if (auto* gdn = std::get_if<GdnParameters>(&block.mixer)) { pass(gdn->projection); }
+             if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+                 pass(dense->gate_up.weight);
+                 pass(dense->down.weight);
+@@ -416,7 +426,7 @@ Parameters::Parameters(const Model& source) : model(source) {
+             }
+         }
+         CUDA_CHECK(cudaDeviceSynchronize());
+-        std::fprintf(stderr, "Q3 shadow: %d of %d MLP weights (%d half grid), %.1f MiB of Q3 planes\n",
++        std::fprintf(stderr, "Q3 shadow: %d of %d MLP/GDN-input weights (%d half grid), %.1f MiB of Q3 planes\n",
+                      pass.weights, pass.checked, pass.odd, static_cast<double>(pass.bytes) / (1 << 20));
+     }
+     if (w.proposal) {
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+index d66894a..b068920 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+@@ -14,6 +14,7 @@
+ 
+ #include <cstdint>
+ #include <stdexcept>
++#include <utility>
+ #include <type_traits>
+ 
+ namespace ninfer::ops::detail {
+@@ -290,11 +291,94 @@ void launch_dual_ada(const Tensor& x, const Weight& qk_weight, const Weight& val
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// All-Q4 parents with optional Q3 shadow planes (NINFER_Q3_SHADOW): each parent runs as Q4, Q3 or Q3Odd.
++template <int TokenTiles, AdaWeightFormat FV, AdaWeightFormat FQ>
++void launch_dual_ada_q3(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                        Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
++    if (qk_weight.padded_shape[1] != kHidden || value_z_weight.padded_shape[1] != kHidden) {
++        throw std::invalid_argument("Q4/Q3 GDN Ada dual requires padded K == hidden");
++    }
++    using SV = AdaSmallTSchedule<FV, 2, 8, TokenTiles, 8, 2>;
++    using SQ = AdaSmallTSchedule<FQ, 2, 8, TokenTiles, 8, 2>;
++    static_assert(kValueZRows % SV::kRowsPerCta == 0 && kQkRows % SQ::kRowsPerCta == 0);
++    const auto planes = [](const Weight& w, AdaWeightFormat f) {
++        const bool q3 = f != AdaWeightFormat::Q4;
++        return std::pair{static_cast<const std::uint8_t*>(q3 ? w.q3_low : w.qdata),
++                         q3 ? static_cast<const std::uint8_t*>(w.q3_high) : nullptr};
++    };
++    const auto [v_codes, v_high] = planes(value_z_weight, FV);
++    const auto [q_codes, q_high] = planes(qk_weight, FQ);
++    const GdnValueZEpilogue value_z_epilogue{
++        static_cast<__nv_bfloat16*>(value.data),
++        static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16)),
++        static_cast<__nv_bfloat16*>(z.data),
++        static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16))};
++    const GdnQkEpilogue qk_epilogue{static_cast<__nv_bfloat16*>(qk.data),
++                                    static_cast<std::int32_t>(qk.nb[1] / sizeof(__nv_bfloat16))};
++    ada_small_t_mma_dual_launch<SV, kHidden, SQ, kHidden>(
++        static_cast<const __nv_bfloat16*>(x.data),
++        static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
++        AdaSmallTOperand<GdnValueZEpilogue>{v_codes, v_high, ada_scales(value_z_weight),
++                                            value_z_epilogue, ada_super(value_z_weight)},
++        kValueZRows,
++        AdaSmallTOperand<GdnQkEpilogue>{q_codes, q_high, ada_scales(qk_weight), qk_epilogue,
++                                        ada_super(qk_weight)},
++        kQkRows, stream);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++AdaWeightFormat shadow_format(const Weight& w) {
++    return w.q3_low == nullptr ? AdaWeightFormat::Q4
++           : w.q3_odd          ? AdaWeightFormat::Q3Odd
++                               : AdaWeightFormat::Q3;
++}
++
++template <int TokenTiles, AdaWeightFormat FV>
++void launch_dual_ada_q3_v(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                          Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
++    switch (shadow_format(qk_weight)) {
++    case AdaWeightFormat::Q3:
++        return launch_dual_ada_q3<TokenTiles, FV, AdaWeightFormat::Q3>(x, qk_weight, value_z_weight,
++                                                                       qk, value, z, stream);
++    case AdaWeightFormat::Q3Odd:
++        return launch_dual_ada_q3<TokenTiles, FV, AdaWeightFormat::Q3Odd>(
++            x, qk_weight, value_z_weight, qk, value, z, stream);
++    default:
++        return launch_dual_ada_q3<TokenTiles, FV, AdaWeightFormat::Q4>(x, qk_weight, value_z_weight,
++                                                                       qk, value, z, stream);
++    }
++}
++
++template <int TokenTiles>
++void launch_dual_ada_shadow(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
++                            Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
++    switch (shadow_format(value_z_weight)) {
++    case AdaWeightFormat::Q3:
++        return launch_dual_ada_q3_v<TokenTiles, AdaWeightFormat::Q3>(x, qk_weight, value_z_weight, qk,
++                                                                     value, z, stream);
++    case AdaWeightFormat::Q3Odd:
++        return launch_dual_ada_q3_v<TokenTiles, AdaWeightFormat::Q3Odd>(x, qk_weight, value_z_weight,
++                                                                        qk, value, z, stream);
++    default:
++        return launch_dual_ada_q3_v<TokenTiles, AdaWeightFormat::Q4>(x, qk_weight, value_z_weight, qk,
++                                                                     value, z, stream);
++    }
++}
++
+ } // namespace
+ 
+ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                         Tensor& z, cudaStream_t stream) {
++    if (value_z_weight.qtype == QType::Q4_G64_FP16 &&
++        (qk_weight.q3_low != nullptr || value_z_weight.q3_low != nullptr)) {
++        if (x.ne[1] <= 8) {
++            launch_dual_ada_shadow<1>(x, qk_weight, value_z_weight, qk, value, z, stream);
++        } else {
++            launch_dual_ada_shadow<2>(x, qk_weight, value_z_weight, qk, value, z, stream);
++        }
++        return;
++    }
+     if (value_z_weight.qtype == QType::Q4_G64_FP16) {
+         // All-Q4 parents: the dual Ada grid at every T of the small-T band.
+         if (x.ne[1] <= 8) {
+-- 
+2.34.1
+

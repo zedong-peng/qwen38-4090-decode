@@ -1,0 +1,745 @@
+From 6f7616522aeb6dda42bffc50db5e7db4d3bc7bd9 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 48/49] research35: verify RMSNorms folded into Ada GEMM
+ epilogues (NINFER_NORM_HANDOFF, not bit-exact, +1.5% slower, off)
+
+---
+ include/ninfer/ops/norm_handoff.h             |  45 ++++++
+ src/models/qwen3_5/execution/attention.cpp    |  15 +-
+ src/models/qwen3_5/execution/text.cpp         |  13 ++
+ .../q4_q5/q4_q5_attn_input_small_t.cu         |  39 +++--
+ src/ops/common/norm_handoff.cuh               |  95 ++++++++++++
+ src/ops/linear/ada_small_t_mma.cuh            |  22 ++-
+ src/ops/linear/norm_handoff.cu                | 137 ++++++++++++++++++
+ src/ops/linear/sources.cmake                  |   1 +
+ src/ops/linear_add/q4/q4_linear_add.cu        |  49 ++++++-
+ .../linear_add/q4/q4_linear_add_dispatch.h    |   5 +
+ .../q4/q4_linear_swiglu_ada_small_t.cu        |  24 ++-
+ src/ops/wrapper/linear_add.cpp                |   9 ++
+ src/ops/wrapper/rmsnorm_swiglu_ffn.cpp        |  17 ++-
+ 13 files changed, 445 insertions(+), 26 deletions(-)
+ create mode 100644 include/ninfer/ops/norm_handoff.h
+ create mode 100644 src/ops/common/norm_handoff.cuh
+ create mode 100644 src/ops/linear/norm_handoff.cu
+
+diff --git a/include/ninfer/ops/norm_handoff.h b/include/ninfer/ops/norm_handoff.h
+new file mode 100644
+index 0000000..703397a
+--- /dev/null
++++ b/include/ninfer/ops/norm_handoff.h
+@@ -0,0 +1,45 @@
++#pragma once
++
++// ninfer::ops - research35 (NINFER_NORM_HANDOFF=1): a verify RMSNorm folded into the GEMMs around it.
++//
++// The model arms a handoff (residual, norm weight, eps) before the GEMM that adds into the residual. linear_add
++// ends every armed handoff; its Q4 Ada small-T route publishes it, writing xs = bf16(x * (1 + w)) beside the
++// residual and the per-token sums of x^2 into a site slot. The norm's caller takes the published handoff instead
++// of running the norm, hands it to the next Ada small-T GEMM (gemm_set) and runs that GEMM on xs; the GEMM
++// scales its dots by rsqrt(sum / d + eps).
++
++#include "core/tensor.h"
++
++#include <cuda_runtime.h>
++
++#include <cstdint>
++
++namespace ninfer::ops {
++
++struct NormHandoff {
++    const void* norm              = nullptr; // BF16 [d] norm weight (unit offset)
++    void* xs                      = nullptr; // BF16 [d, T]: bf16(x * (1 + w))
++    unsigned long long* slot      = nullptr; // 16 per-token sums of x^2, fixed point 2^-16
++    unsigned long long* zero      = nullptr; // the producer's CTA 0 zeroes zero[0, 16 * zero_count)
++    std::int32_t zero_count       = 0;
++    float eps                     = 0.0F;
++    std::int32_t d                = 0;
++};
++
++// NINFER_NORM_HANDOFF=1 (read once).
++bool norm_handoff_enabled();
++// Start of a verify forward: sites count from 0 again.
++void norm_handoff_round_begin(cudaStream_t stream);
++// The next linear_add into `residual` publishes the norm (residual, norm, eps) if its route can.
++void norm_handoff_arm(const Tensor& residual, const Tensor& norm, float eps);
++// linear_add: ends the armed handoff; publishes it when it targets `residual` and route_ok.
++NormHandoff norm_handoff_publish(const Tensor& residual, std::int32_t tokens, bool route_ok);
++// The norm's caller: the published handoff for (residual, norm), once; empty otherwise.
++NormHandoff norm_handoff_take_consumer(const Tensor& residual, const Tensor& norm);
++// The next Ada small-T GEMM launcher that takes it scales its dots by the handoff's RMS factor.
++void norm_handoff_gemm_set(const NormHandoff& handoff);
++NormHandoff norm_handoff_gemm_take();
++// Throws (and clears) when the GEMM given a handoff did not take it.
++void norm_handoff_gemm_require_taken(const char* what);
++
++} // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
+index 79cc122..337bc7a 100644
+--- a/src/models/qwen3_5/execution/attention.cpp
++++ b/src/models/qwen3_5/execution/attention.cpp
+@@ -4,6 +4,7 @@
+ #include "models/qwen3_5/execution/attention.h"
+ 
+ #include "ninfer/ops/attn_input_proj.h"
++#include "ninfer/ops/norm_handoff.h"
+ #include "ninfer/ops/qk_rmsnorm_rope.h"
+ #include "ninfer/ops/rmsnorm.h"
+ #include "ninfer/ops/rmsnorm_attn_input_proj.h"
+@@ -44,8 +45,18 @@ void attention_norm_projection(const Tensor& residual, const Tensor& norm, float
+                                Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                                cudaStream_t stream) {
+     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+-        ops::rmsnorm(residual, norm, eps, true, hidden, stream);
+-        ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
++        // research35 (NINFER_NORM_HANDOFF): the producer left bf16(x * (1 + w)); the dual GEMM applies the factor.
++        const ops::NormHandoff handoff = ops::norm_handoff_take_consumer(residual, norm);
++        const std::int32_t tokens      = residual.ne[1];
++        if (handoff.slot != nullptr && tokens >= 9 && tokens <= 16) {
++            const Tensor xs(handoff.xs, DType::BF16, {residual.ne[0], tokens});
++            ops::norm_handoff_gemm_set(handoff);
++            ops::attn_input_proj(xs, pair->first, pair->second, query, gate, key, value, stream);
++            ops::norm_handoff_gemm_require_taken("attention input projection");
++        } else {
++            ops::rmsnorm(residual, norm, eps, true, hidden, stream);
++            ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
++        }
+     } else {
+         const auto& single = std::get<LinearParameters>(parameters.projection);
+         ops::rmsnorm_attn_input_proj(residual, norm, eps, true, single.weight, query, gate, key,
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 545efba..2ab6739 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -34,6 +34,7 @@
+ #include "ninfer/ops/kv_cache_append.h"
+ #include "ninfer/ops/speculative_round.h"
+ #include "ninfer/ops/linear_add.h"
++#include "ninfer/ops/norm_handoff.h"
+ #include "ninfer/ops/linear_pair.h"
+ #include "ninfer/ops/linear_swiglu.h"
+ #include "ninfer/ops/mtp_pack.h"
+@@ -1076,6 +1077,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+     }
+     if (!ops::attn_gate_finish()) { ops::sigmoid_mul(gate, a, s); }
+ 
++    // research35 (NINFER_NORM_HANDOFF): the output projection publishes the post-attention norm.
++    if (ph == Phase::Verify && !attn_overlap) { ops::norm_handoff_arm(x, w.post_attention_norm, config_.rms_norm_eps); }
+     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
+                     p.output.policy, work_, s);
+ }
+@@ -1304,6 +1307,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+     if (!ops::gated_norm_finish()) { ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s); }
+     (void)ops::l2_fill_take();
+ 
++    // research35 (NINFER_NORM_HANDOFF): the output projection publishes the post-attention norm.
++    if (ph == Phase::Verify && !overlapped && overlap_q4 == 0) {
++        ops::norm_handoff_arm(x, w.post_attention_norm, config_.rms_norm_eps);
++    }
+     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
+                     p.output.policy, work_, s);
+ }
+@@ -1335,6 +1342,7 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
+ template <class Tap>
+ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+     const bool prefill = ph == Phase::Prefill;
++    if (ph == Phase::Verify) { ops::norm_handoff_round_begin(ctx_.stream); }
+     for (std::size_t layer = 0; layer < parameters_.text.layers.size(); ++layer) {
+         const auto& block  = parameters_.text.layers[layer];
+         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+@@ -1361,6 +1369,11 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+                                                 : nvtx::Name::VerifyPostMixer,
+                                         nvtx::Category::PostMixer, layer);
+                 auto scope = work_.scope();
++                // research35 (NINFER_NORM_HANDOFF): an MLP down projection publishes the next attention input norm.
++                if (ph == Phase::Verify && layer + 1 < parameters_.text.layers.size() &&
++                    config_.layer_types[layer + 1] == MixerKind::FullAttention) {
++                    ops::norm_handoff_arm(x, parameters_.text.layers[layer + 1].input_norm, config_.rms_norm_eps);
++                }
+                 mlp_tail(block, x, ph, next_projection_hints(static_cast<int>(layer)));
+             }
+             if constexpr (Tap::enabled) {
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+index 878bca5..df46ac0 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+@@ -7,6 +7,8 @@
+ #include "ops/linear/q4/q4_ksplit_strided_store.cuh"
+ #include "ops/linear/q4/q4_rowsplit_gemv.cuh"
+ #include "ops/linear/ada_small_t_mma.cuh"
++#include "ninfer/ops/norm_handoff.h"
++#include "ops/common/norm_handoff.cuh"
+ #include "ops/linear/q5/q5_rowsplit_gemm_simt.cuh"
+ #include "ops/linear/q5/q5_rowsplit_gemv.cuh"
+ 
+@@ -281,18 +283,31 @@ void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
+     // Same strides as the K-split store this replaces.
+     const AttnQueryKeyEpilogue query_key_epilogue{static_cast<__nv_bfloat16*>(q.data), q.ne[0],
+                                                   static_cast<__nv_bfloat16*>(k.data), k.ne[0]};
+-    ada_small_t_mma_dual_launch<SG, kHidden, SQ, kHidden>(
+-        static_cast<const __nv_bfloat16*>(x.data),
+-        static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
+-        AdaSmallTOperand<AttnGateValueEpilogue>{
+-            static_cast<const std::uint8_t*>(gate_value_weight.qdata),
+-            GateQ4 ? nullptr : static_cast<const std::uint8_t*>(gate_value_weight.qhigh),
+-            ada_scales(gate_value_weight), gate_value_epilogue, ada_super(gate_value_weight)},
+-        kParentRows,
+-        AdaSmallTOperand<AttnQueryKeyEpilogue>{
+-            static_cast<const std::uint8_t*>(query_key_weight.qdata), nullptr,
+-            ada_scales(query_key_weight), query_key_epilogue, ada_super(query_key_weight)},
+-        kParentRows, stream);
++    const auto dual = [&](const auto& gv, const auto& qk) {
++        using EG = std::decay_t<decltype(gv)>;
++        using EQ = std::decay_t<decltype(qk)>;
++        ada_small_t_mma_dual_launch<SG, kHidden, SQ, kHidden>(
++            static_cast<const __nv_bfloat16*>(x.data),
++            static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
++            AdaSmallTOperand<EG>{
++                static_cast<const std::uint8_t*>(gate_value_weight.qdata),
++                GateQ4 ? nullptr : static_cast<const std::uint8_t*>(gate_value_weight.qhigh),
++                ada_scales(gate_value_weight), gv, ada_super(gate_value_weight)},
++            kParentRows,
++            AdaSmallTOperand<EQ>{
++                static_cast<const std::uint8_t*>(query_key_weight.qdata), nullptr,
++                ada_scales(query_key_weight), qk, ada_super(query_key_weight)},
++            kParentRows, stream);
++    };
++    // research35 (NINFER_NORM_HANDOFF): x is the producer's bf16(x * (1 + w)); the RMS factor scales the dots.
++    const ops::NormHandoff handoff = ops::norm_handoff_gemm_take();
++    if (handoff.slot != nullptr) {
++        const float d = static_cast<float>(handoff.d);
++        dual(AdaRinvEpilogue<AttnGateValueEpilogue>{gate_value_epilogue, handoff.slot, handoff.eps, d},
++             AdaRinvEpilogue<AttnQueryKeyEpilogue>{query_key_epilogue, handoff.slot, handoff.eps, d});
++    } else {
++        dual(gate_value_epilogue, query_key_epilogue);
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/common/norm_handoff.cuh b/src/ops/common/norm_handoff.cuh
+new file mode 100644
+index 0000000..3e11ada
+--- /dev/null
++++ b/src/ops/common/norm_handoff.cuh
+@@ -0,0 +1,95 @@
++#pragma once
++
++// research35 (NINFER_NORM_HANDOFF=1): the Ada small-T epilogues of the verify norm handoff
++// (include/ninfer/ops/norm_handoff.h).
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// Producer: the residual epilogue (same bits) plus xs = bf16(x_new * (1 + w[row])) and the CTA's per-token sum
++// of x_new^2 (rows j, j + 8, ... per lane, then a fixed xor tree) added to the site's fixed-point slots.
++struct AdaNormHandoffResidualEpilogue {
++    static constexpr bool kPairedHalves = false;
++    static constexpr bool kRowsHook     = true;
++    static constexpr int kMaxRows       = 40;
++
++    __nv_bfloat16* out;
++    std::int32_t out_ld;
++    const __nv_bfloat16* norm;
++    __nv_bfloat16* xs;
++    std::int32_t xs_ld;
++    unsigned long long* slot;
++    unsigned long long* zero;
++    std::int32_t zero_count;
++
++    __device__ static float (&squares())[kMaxRows][16] {
++        __shared__ float s[kMaxRows][16];
++        return s;
++    }
++
++    __device__ __forceinline__ void operator()(int, int, float) const {}
++
++    __device__ __forceinline__ void element(int weight_row, int row, int token, float value) const {
++        __nv_bfloat16* p        = out + static_cast<std::int64_t>(token) * out_ld + weight_row;
++        const __nv_bfloat16 sum = __float2bfloat16(value + __bfloat162float(*p));
++        *p                      = sum;
++        const float x           = __bfloat162float(sum);
++        xs[static_cast<std::int64_t>(token) * xs_ld + weight_row] =
++            __float2bfloat16_rn(x * (1.0f + __bfloat162float(norm[weight_row])));
++        squares()[row][token] = x * x;
++    }
++
++    __device__ __forceinline__ void rows_done(int block, int rows, int tokens, int tid, int threads) const {
++        __syncthreads();
++        if (tid < 128) {
++            const int token = tid >> 3;
++            const int j     = tid & 7;
++            float s         = 0.0f;
++            for (int r = j; r < rows; r += 8) { s += squares()[r][token]; }
++            s += __shfl_xor_sync(0xffffffffu, s, 1);
++            s += __shfl_xor_sync(0xffffffffu, s, 2);
++            s += __shfl_xor_sync(0xffffffffu, s, 4);
++            if (j == 0 && token < tokens) { atomicAdd(slot + token, __float2ull_rn(s * 65536.0f)); }
++        }
++        if (block == 0) {
++            for (int i = tid; i < 16 * zero_count; i += threads) { zero[i] = 0ull; }
++        }
++    }
++};
++
++// Consumer: Inner's epilogue on dots scaled by the token's rsqrt(sum / d + eps).
++template <class Inner>
++struct AdaRinvEpilogue {
++    static constexpr bool kPairedHalves = Inner::kPairedHalves;
++
++    Inner inner;
++    const unsigned long long* slot;
++    float eps;
++    float d;
++
++    __device__ static float* factors() {
++        __shared__ float f[16];
++        return f;
++    }
++
++    __device__ __forceinline__ void preload(int, int tid) const {
++        if (tid < 16) {
++            const double sum = static_cast<double>(slot[tid]) * (1.0 / 65536.0);
++            factors()[tid]   = rsqrtf(static_cast<float>(sum) / d + eps);
++        }
++    }
++
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        inner(row, token, value * factors()[token]);
++    }
++
++    __device__ __forceinline__ void operator()(int row, int token, float gate, float up) const {
++        const float f = factors()[token];
++        inner(row, token, gate * f, up * f);
++    }
++};
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index e9275a8..59dc1de 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -164,6 +164,15 @@ __device__ __forceinline__ unsigned q4_ada_decode_pair(unsigned byte) {
+ template <class E>
+ concept AdaConvRowsEpilogue = requires { E::kConvRows; };
+ 
++// research35: any epilogue with preload(first_weight_row, tid) gets it right after the pipeline prologue.
++template <class E>
++concept AdaPreloadEpilogue = requires(const E& e) { e.preload(0, 0); };
++
++// research35: kRowsHook epilogues get element(weight_row, local_row, token, dot) for every live element and then
++// rows_done(block, rows, tokens, tid, threads) from every thread (single launches only).
++template <class E>
++concept AdaRowsHookEpilogue = requires { E::kRowsHook; };
++
+ // Epilogue::kPairedHalves == false: epilogue(weight_row, token, dot) for every CTA row and live
+ // token. true: epilogue(output_row, token, gate_dot, up_dot) for the CTA's AdaPairedHalfRows pairs.
+ // One CTA's work; `block` is the CTA index within this problem's grid.
+@@ -396,7 +405,7 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+         if (s < kPipeStages) { issue(s); }
+         cp_commit();
+     }
+-    if constexpr (AdaConvRowsEpilogue<Epilogue>) { epilogue.preload(RowMap::weight_row(block, 0, kRows), tid); }
++    if constexpr (AdaPreloadEpilogue<Epilogue>) { epilogue.preload(RowMap::weight_row(block, 0, kRows), tid); }
+     XFragment current[J];
+     load_x(0, current);
+     for (int s = 0; s < kPipeStages; ++s) {
+@@ -449,6 +458,17 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+             }
+             epilogue(block * kHalf + row, token, gate, up);
+         }
++    } else if constexpr (AdaRowsHookEpilogue<Epilogue>) {
++        for (int index = tid; index < kRows * S::kMaxTokens; index += S::kThreads) {
++            const int row   = index % kRows;
++            const int token = index / kRows;
++            if (token >= tokens) { continue; }
++            const int weight_row = RowMap::weight_row(block, row, kRows);
++            float value          = reduce(row, token);
++            if (super != nullptr) { value *= super[weight_row]; }
++            epilogue.element(weight_row, row, token, value);
++        }
++        epilogue.rows_done(block, kRows, tokens, tid, S::kThreads);
+     } else if constexpr (AdaConvRowsEpilogue<Epilogue>) {
+         for (int index = tid; index < kRows * S::kMaxTokens; index += S::kThreads) {
+             const int row   = index % kRows;
+diff --git a/src/ops/linear/norm_handoff.cu b/src/ops/linear/norm_handoff.cu
+new file mode 100644
+index 0000000..8ce1bfb
+--- /dev/null
++++ b/src/ops/linear/norm_handoff.cu
+@@ -0,0 +1,137 @@
++// research35 (NINFER_NORM_HANDOFF=1): host state and device buffers of the verify norm handoff.
++#include "ninfer/ops/norm_handoff.h"
++
++#include "core/device.h"
++
++#include <cuda_bf16.h>
++
++#include <cstdlib>
++#include <stdexcept>
++#include <string>
++
++namespace ninfer::ops {
++namespace {
++
++constexpr int kSlots  = 256;
++constexpr int kHidden = 5120;
++constexpr int kTokens = 16;
++
++__device__ unsigned long long g_norm_handoff_slots[kSlots * kTokens];
++__device__ __nv_bfloat16 g_norm_handoff_xs[kTokens * kHidden];
++
++struct State {
++    const void* armed_residual     = nullptr;
++    const void* armed_norm         = nullptr;
++    float armed_eps                = 0.0F;
++    const void* published_residual = nullptr;
++    NormHandoff published{};
++    NormHandoff gemm{};
++    int site = 0;
++};
++
++State& state() {
++    static State s;
++    return s;
++}
++
++unsigned long long* slots() {
++    static unsigned long long* const p = [] {
++        void* q = nullptr;
++        CUDA_CHECK(cudaGetSymbolAddress(&q, g_norm_handoff_slots));
++        return static_cast<unsigned long long*>(q);
++    }();
++    return p;
++}
++
++void* xs_buffer() {
++    static void* const p = [] {
++        void* q = nullptr;
++        CUDA_CHECK(cudaGetSymbolAddress(&q, g_norm_handoff_xs));
++        return q;
++    }();
++    return p;
++}
++
++} // namespace
++
++bool norm_handoff_enabled() {
++    static const bool on = [] {
++        const char* e = std::getenv("NINFER_NORM_HANDOFF");
++        return e != nullptr && e[0] == '1';
++    }();
++    return on;
++}
++
++void norm_handoff_round_begin(cudaStream_t stream) {
++    if (!norm_handoff_enabled()) { return; }
++    State& s = state();
++    // A forward with a single site leaves its slot 0 unzeroed.
++    if (s.site == 1) {
++        CUDA_CHECK(cudaMemsetAsync(slots(), 0, kTokens * sizeof(unsigned long long), stream));
++    }
++    s = State{};
++}
++
++void norm_handoff_arm(const Tensor& residual, const Tensor& norm, float eps) {
++    if (!norm_handoff_enabled()) { return; }
++    State& s         = state();
++    s.armed_residual = residual.data;
++    s.armed_norm     = norm.data;
++    s.armed_eps      = eps;
++}
++
++NormHandoff norm_handoff_publish(const Tensor& residual, std::int32_t tokens, bool route_ok) {
++    State& s         = state();
++    const bool armed = s.armed_residual != nullptr && s.armed_residual == residual.data;
++    s.armed_residual = nullptr;
++    if (!armed || !route_ok || s.site >= kSlots || residual.ne[0] != kHidden || tokens < 1 ||
++        tokens > kTokens) {
++        return {};
++    }
++    NormHandoff h;
++    h.norm = s.armed_norm;
++    h.xs   = xs_buffer();
++    h.slot = slots() + kTokens * s.site;
++    h.eps  = s.armed_eps;
++    h.d    = kHidden;
++    if (s.site == 0) {
++        h.zero       = slots() + kTokens;
++        h.zero_count = kSlots - 1;
++    } else if (s.site == 1) {
++        h.zero       = slots();
++        h.zero_count = 1;
++    }
++    ++s.site;
++    s.published          = h;
++    s.published_residual = residual.data;
++    return h;
++}
++
++NormHandoff norm_handoff_take_consumer(const Tensor& residual, const Tensor& norm) {
++    State& s = state();
++    if (s.published.slot == nullptr || s.published_residual != residual.data || s.published.norm != norm.data) {
++        return {};
++    }
++    const NormHandoff h = s.published;
++    s.published         = {};
++    return h;
++}
++
++void norm_handoff_gemm_set(const NormHandoff& handoff) { state().gemm = handoff; }
++
++NormHandoff norm_handoff_gemm_take() {
++    State& s            = state();
++    const NormHandoff h = s.gemm;
++    s.gemm              = {};
++    return h;
++}
++
++void norm_handoff_gemm_require_taken(const char* what) {
++    State& s = state();
++    if (s.gemm.slot != nullptr) {
++        s.gemm = {};
++        throw std::logic_error(std::string("norm handoff: ") + what + " did not take the Ada small-T route");
++    }
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/linear/sources.cmake b/src/ops/linear/sources.cmake
+index f102e95..0ad18a1 100644
+--- a/src/ops/linear/sources.cmake
++++ b/src/ops/linear/sources.cmake
+@@ -2,6 +2,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/ls8_scales.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q3_shadow.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/l2_fill.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/norm_handoff.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+ )
+ 
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index a7fb4aa..1b1d12c 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -4,6 +4,7 @@
+ #include "ops/linear/q4/q4_ksplit_mma.cuh"
+ #include "ops/linear/q4/q4_mma_launch.cuh"
+ #include "ops/linear/ada_small_t_mma.cuh"
++#include "ops/common/norm_handoff.cuh"
+ 
+ #include <stdexcept>
+ 
+@@ -96,8 +97,8 @@ void launch_ada_q3(const Tensor& x, const Weight& w, const Epilogue& epilogue, c
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-template <int K, int TokenTiles>
+-void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
++template <int K, int TokenTiles, class Epilogue>
++void launch_ada_with(const Tensor& x, const Weight& w, const Epilogue& epilogue, cudaStream_t stream) {
+     // K = 6144 (GDN / attention output): 16 rows per CTA (320 CTAs) beat 40 (128 CTAs) by 2.9% in
+     // kernels/mma/bench_sweep2.cu; the warp split is unchanged, so the result is bit-identical.
+     using S = Q4AdaSmallTSchedule<K == 6144 ? 2 : 5, 8, TokenTiles, 8, 2>;
+@@ -105,9 +106,6 @@ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t
+     if (w.padded_shape[1] != K) {
+         throw std::invalid_argument("q4 linear_add ada small-T: padded K differs");
+     }
+-    const AdaResidualEpilogue epilogue{
+-        static_cast<__nv_bfloat16*>(residual.data),
+-        static_cast<std::int32_t>(residual.nb[1] / sizeof(__nv_bfloat16))};
+     if (w.q3_low != nullptr) {
+         // Q3 shadow planes (NINFER_Q3_SHADOW): 16 groups per stage, 42.1 us at K = 17408, T = 16
+         // against 50.1 us for the Q4 codes (kernels/q3/bench_q3_sweep.cu); the same bits.
+@@ -141,8 +139,49 @@ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++template <int K, int TokenTiles>
++void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
++    launch_ada_with<K, TokenTiles>(
++        x, w,
++        AdaResidualEpilogue{static_cast<__nv_bfloat16*>(residual.data),
++                            static_cast<std::int32_t>(residual.nb[1] / sizeof(__nv_bfloat16))},
++        stream);
++}
++
+ } // namespace
+ 
++void q4_linear_add_ada_handoff_launch(const Tensor& x, const Weight& w, Tensor& residual,
++                                      const NormHandoff& handoff, cudaStream_t stream) {
++    const AdaNormHandoffResidualEpilogue epilogue{
++        static_cast<__nv_bfloat16*>(residual.data),
++        static_cast<std::int32_t>(residual.nb[1] / sizeof(__nv_bfloat16)),
++        static_cast<const __nv_bfloat16*>(handoff.norm),
++        static_cast<__nv_bfloat16*>(handoff.xs),
++        handoff.d,
++        handoff.slot,
++        handoff.zero,
++        handoff.zero_count};
++    const std::int32_t t = x.ne[1];
++    if (w.n != 5120 || t < 2 || t > 16 || handoff.d != 5120) {
++        throw std::invalid_argument("q4 linear_add norm handoff: unsupported shape");
++    }
++    if (w.k == 17408) {
++        if (t <= 8) {
++            launch_ada_with<17408, 1>(x, w, epilogue, stream);
++        } else {
++            launch_ada_with<17408, 2>(x, w, epilogue, stream);
++        }
++    } else if (w.k == 6144) {
++        if (t <= 8) {
++            launch_ada_with<6144, 1>(x, w, epilogue, stream);
++        } else {
++            launch_ada_with<6144, 2>(x, w, epilogue, stream);
++        }
++    } else {
++        throw std::invalid_argument("q4 linear_add norm handoff: unsupported K");
++    }
++}
++
+ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
+     if (rows != 5120 || (k != 6144 && k != 17408) || tokens <= 0) {
+         throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
+diff --git a/src/ops/linear_add/q4/q4_linear_add_dispatch.h b/src/ops/linear_add/q4/q4_linear_add_dispatch.h
+index af99774..a7ea6db 100644
+--- a/src/ops/linear_add/q4/q4_linear_add_dispatch.h
++++ b/src/ops/linear_add/q4/q4_linear_add_dispatch.h
+@@ -2,6 +2,7 @@
+ 
+ #include "core/tensor.h"
+ #include "core/weight.h"
++#include "ninfer/ops/norm_handoff.h"
+ 
+ #include <cuda_runtime.h>
+ 
+@@ -11,4 +12,8 @@ using Q4LinearAddLaunch = void (*)(const Tensor&, const Weight&, Tensor&, cudaSt
+ 
+ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens);
+ 
++// research35: the Ada small-T residual add of select_q4_linear_add (T in [2, 16]) publishing a norm handoff.
++void q4_linear_add_ada_handoff_launch(const Tensor& x, const Weight& w, Tensor& residual,
++                                      const NormHandoff& handoff, cudaStream_t stream);
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+index 3441cfd..e64b0be 100644
+--- a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
++++ b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+@@ -4,6 +4,8 @@
+ #include "core/device.h"
+ #include "ops/common/math.cuh"
+ #include "ops/linear/ada_small_t_mma.cuh"
++#include "ninfer/ops/norm_handoff.h"
++#include "ops/common/norm_handoff.cuh"
+ 
+ #include <cuda_bf16.h>
+ 
+@@ -29,10 +31,8 @@ struct SwiGluEpilogue {
+     }
+ };
+ 
+-template <AdaWeightFormat Format, int RowTiles, int Warps, int G, int Stages, bool Packed = false>
+-void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+-    const SwiGluEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data),
+-                                  static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16))};
++template <AdaWeightFormat Format, int RowTiles, int Warps, int G, int Stages, bool Packed, class Epilogue>
++void launch_with(const Tensor& x, const Weight& w, const Epilogue& epilogue, cudaStream_t stream) {
+     const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+     const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+     constexpr bool kQ3 = Format == AdaWeightFormat::Q3 || Format == AdaWeightFormat::Q3Odd;
+@@ -55,6 +55,22 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream)
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++template <AdaWeightFormat Format, int RowTiles, int Warps, int G, int Stages, bool Packed = false>
++void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
++    const SwiGluEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data),
++                                  static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16))};
++    // research35 (NINFER_NORM_HANDOFF): x is the producer's bf16(x * (1 + w)); the RMS factor scales the dots.
++    const ops::NormHandoff handoff = ops::norm_handoff_gemm_take();
++    if (handoff.slot != nullptr) {
++        launch_with<Format, RowTiles, Warps, G, Stages, Packed>(
++            x, w,
++            AdaRinvEpilogue<SwiGluEpilogue>{epilogue, handoff.slot, handoff.eps, static_cast<float>(handoff.d)},
++            stream);
++    } else {
++        launch_with<Format, RowTiles, Warps, G, Stages, Packed>(x, w, epilogue, stream);
++    }
++}
++
+ } // namespace
+ 
+ void q4_linear_swiglu_ada_small_t_launch(const Tensor& x, const Weight& w, Tensor& out,
+diff --git a/src/ops/wrapper/linear_add.cpp b/src/ops/wrapper/linear_add.cpp
+index d2139e6..86ac407 100644
+--- a/src/ops/wrapper/linear_add.cpp
++++ b/src/ops/wrapper/linear_add.cpp
+@@ -1,5 +1,6 @@
+ #include "core/weight.h"
+ #include "ninfer/ops/linear_add.h"
++#include "ninfer/ops/norm_handoff.h"
+ 
+ #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
+ #include "ops/linear/fp8/fp8_config.h"
+@@ -155,6 +156,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
+     if (overlaps(x, residual_out)) {
+         throw std::invalid_argument("linear_add: x and residual_out must not overlap");
+     }
++    // research35 (NINFER_NORM_HANDOFF): every call ends an armed norm handoff; the Q4 Ada small-T route publishes it.
++    const NormHandoff handoff = norm_handoff_publish(
++        residual_out, t,
++        w.qtype == QType::Q4_G64_FP16 && w.n == 5120 && (w.k == 6144 || w.k == 17408) && t >= 2 && t <= 16);
+ 
+     if (w.qtype == QType::BF16) {
+         require_bf16(w);
+@@ -179,6 +184,10 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
+             throw std::invalid_argument(
+                 "linear_add: Q4 requires 16-byte x/residual/code/scale alignment");
+         }
++        if (handoff.slot != nullptr) {
++            detail::q4_linear_add_ada_handoff_launch(x, w, residual_out, handoff, stream);
++            return;
++        }
+         launch(x, w, residual_out, stream);
+         return;
+     }
+diff --git a/src/ops/wrapper/rmsnorm_swiglu_ffn.cpp b/src/ops/wrapper/rmsnorm_swiglu_ffn.cpp
+index a2edd8f..5da2737 100644
+--- a/src/ops/wrapper/rmsnorm_swiglu_ffn.cpp
++++ b/src/ops/wrapper/rmsnorm_swiglu_ffn.cpp
+@@ -3,6 +3,7 @@
+ #include "core/layout.h"
+ #include "ninfer/ops/linear_add.h"
+ #include "ninfer/ops/linear_swiglu.h"
++#include "ninfer/ops/norm_handoff.h"
+ #include "ninfer/ops/rmsnorm.h"
+ #include "ops/linear/fp8/fp8_a8_plan.h"
+ #include "ops/linear/nvfp4/nvfp4_format.h"
+@@ -219,8 +220,20 @@ void rmsnorm_swiglu_ffn(Tensor& residual, const Tensor& norm_weight, float eps,
+         return;
+     }
+     ComposedWorkspace scratch = allocate_composed(workspace, profile, tokens);
+-    rmsnorm(residual, norm_weight, eps, unit_offset, scratch.hidden, stream);
+-    {
++    // research35 (NINFER_NORM_HANDOFF): the producer left bf16(x * (1 + w)) and the sums of squares; the gate/up
++    // GEMM scales by the RMS factor instead of a norm kernel.
++    const NormHandoff handoff = norm_handoff_take_consumer(residual, norm_weight);
++    if (handoff.slot != nullptr && unit_offset && gate_up_weight.qtype == QType::Q4_G64_FP16 && tokens >= 9 &&
++        tokens <= 16) {
++        const Tensor xs(handoff.xs, DType::BF16, {gate_up_weight.k, tokens});
++        norm_handoff_gemm_set(handoff);
++        {
++            auto call = workspace.scope();
++            linear_swiglu(xs, gate_up_weight, scratch.activation, gate_up_policy, workspace, stream);
++        }
++        norm_handoff_gemm_require_taken("rmsnorm_swiglu_ffn gate/up");
++    } else {
++        rmsnorm(residual, norm_weight, eps, unit_offset, scratch.hidden, stream);
+         auto call = workspace.scope();
+         linear_swiglu(scratch.hidden, gate_up_weight, scratch.activation, gate_up_policy, workspace,
+                       stream);
+-- 
+2.34.1
+

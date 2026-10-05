@@ -1,0 +1,346 @@
+From 825e4bbc77d1dc16471ea46aa0533afaf939002e Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:18 +0800
+Subject: [PATCH 36/49] research29: L2 fills of the next GEMM's weights from
+ latency-bound kernels (NINFER_L2_FILL mask, default off)
+
+---
+ include/ninfer/ops/l2_fill.h                  | 39 ++++++++
+ src/models/qwen3_5/execution/text.cpp         |  6 ++
+ src/ops/common/l2_fill.cuh                    | 49 ++++++++++
+ src/ops/linear/l2_fill.cpp                    | 98 +++++++++++++++++++
+ src/ops/linear/sources.cmake                  |  1 +
+ .../gated_delta_net/recurrent.cu              |  5 +-
+ .../gated_delta_net/recurrent.cuh             | 22 ++++-
+ 7 files changed, 216 insertions(+), 4 deletions(-)
+ create mode 100644 include/ninfer/ops/l2_fill.h
+ create mode 100644 src/ops/common/l2_fill.cuh
+ create mode 100644 src/ops/linear/l2_fill.cpp
+
+diff --git a/include/ninfer/ops/l2_fill.h b/include/ninfer/ops/l2_fill.h
+new file mode 100644
+index 0000000..5a9c88d
+--- /dev/null
++++ b/include/ninfer/ops/l2_fill.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++// ninfer::ops - research29 (NINFER_L2_FILL): L2 fills of the next GEMM's first weight lines.
++//
++// A latency-bound kernel between two DRAM-bound GEMMs leaves DRAM almost idle. Given an L2Fill, it issues
++// 128-byte line loads (ld.global.cg.L2::128B) of the following GEMM's first weight rows at its start and
++// consumes them at its end, so the loads complete under its own work and the GEMM finds those rows in L2.
++// prefetch.global.L2 does not fill L2 on Ada (kernels/prefetch/bench_pf.cu). The loaded values only feed
++// a store through `sink`, which is always null, so no result changes.
++
++#include "core/weight.h"
++
++#include <cstdint>
++
++namespace ninfer::ops {
++
++struct L2FillRange {
++    const void* base    = nullptr; // 128-byte aligned
++    std::uint32_t lines = 0;       // 128-byte lines from base
++};
++
++struct L2Fill {
++    L2FillRange range[3];
++    std::uint32_t* sink = nullptr; // always null
++};
++
++// NINFER_L2_FILL (bit mask, read once); 0 when unset.
++int l2_fill_mask();
++// NINFER_L2_FILL_<name>_KB in bytes (read once per call site's name), or fallback.
++std::uint64_t l2_fill_bytes(const char* name, std::uint64_t fallback);
++// The lines holding the rows [skip_bytes, skip_bytes + bytes) of w, counted over every plane an Ada
++// small-T launch of w reads per row (Q4 codes or Q3 planes, then the group scales). Empty for other
++// layouts or unaligned planes.
++L2Fill l2_fill_for_weight(const Weight& w, std::uint64_t skip_bytes, std::uint64_t bytes);
++// Hands a fill from the model to the next launcher that takes one on this thread.
++void l2_fill_set(const L2Fill& fill);
++L2Fill l2_fill_take();
++
++} // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 3c60605..cc365cd 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -28,6 +28,7 @@
+ #include "ninfer/ops/gdn_gating.h"
+ #include "ninfer/ops/gdn_gating_proj.h"
+ #include "ninfer/ops/gdn_input_proj.h"
++#include "ninfer/ops/l2_fill.h"
+ #include "ninfer/ops/linear.h"
+ #include "ninfer/ops/kv_cache_append.h"
+ #include "ninfer/ops/speculative_round.h"
+@@ -1210,6 +1211,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+             // The overlapped route queues the recurrence on the concurrent stream beside z.
+             const cudaStream_t record_stream =
+                 overlapped || overlap_q4 > 0 ? ctx_.concurrent.stream : s;
++            // research29 (NINFER_L2_FILL bit 1): the record warms the output projection's first rows.
++            if (ops::l2_fill_mask() & 1) {
++                ops::l2_fill_set(ops::l2_fill_for_weight(p.output.weight, 0,
++                                                         ops::l2_fill_bytes("RECORD", 4u << 20)));
++            }
+             ops::gated_delta_net_replay_record(
+                 q_batch, k_batch, v_batch, g_batch, beta_batch,
+                 static_cast<float>(
+diff --git a/src/ops/common/l2_fill.cuh b/src/ops/common/l2_fill.cuh
+new file mode 100644
+index 0000000..362320b
+--- /dev/null
++++ b/src/ops/common/l2_fill.cuh
+@@ -0,0 +1,49 @@
++#pragma once
++
++// research29 (NINFER_L2_FILL): device side of ninfer/ops/l2_fill.h.
++
++#include "ninfer/ops/l2_fill.h"
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// Up to L line loads per thread: thread t of T takes lines t, t + T, ... of the fill's ranges in order.
++template <int L>
++struct L2FillLoads {
++    std::uint32_t v[L];
++
++    __device__ __forceinline__ void issue(const L2Fill& fill, std::uint32_t t, std::uint32_t threads) {
++#pragma unroll
++        for (int j = 0; j < L; ++j) {
++            v[j]            = 0U;
++            std::uint32_t i = t + static_cast<std::uint32_t>(j) * threads;
++            const char* p   = nullptr;
++            if (i < fill.range[0].lines) {
++                p = static_cast<const char*>(fill.range[0].base) + static_cast<std::size_t>(i) * 128;
++            } else if ((i -= fill.range[0].lines) < fill.range[1].lines) {
++                p = static_cast<const char*>(fill.range[1].base) + static_cast<std::size_t>(i) * 128;
++            } else if ((i -= fill.range[1].lines) < fill.range[2].lines) {
++                p = static_cast<const char*>(fill.range[2].base) + static_cast<std::size_t>(i) * 128;
++            }
++            if (p != nullptr) { asm volatile("ld.global.cg.L2::128B.u32 %0, [%1];" : "=r"(v[j]) : "l"(p)); }
++        }
++    }
++
++    // Waits for the loads; `extra` joins another kept load.
++    __device__ __forceinline__ void consume(const L2Fill& fill, std::uint32_t extra = 0U) const {
++        std::uint32_t acc = extra;
++#pragma unroll
++        for (int j = 0; j < L; ++j) { acc ^= v[j]; }
++        if (fill.sink != nullptr) { *fill.sink = acc; }
++    }
++};
++
++__device__ __forceinline__ std::uint32_t l2_fill_line_load(const void* p) {
++    std::uint32_t v;
++    asm volatile("ld.global.cg.L2::128B.u32 %0, [%1];" : "=r"(v) : "l"(p));
++    return v;
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/l2_fill.cpp b/src/ops/linear/l2_fill.cpp
+new file mode 100644
+index 0000000..234831d
+--- /dev/null
++++ b/src/ops/linear/l2_fill.cpp
+@@ -0,0 +1,98 @@
++// research29 (NINFER_L2_FILL): host side of ninfer/ops/l2_fill.h.
++#include "ninfer/ops/l2_fill.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <map>
++#include <mutex>
++#include <string>
++
++namespace ninfer::ops {
++namespace {
++
++thread_local L2Fill pending_fill{};
++
++} // namespace
++
++int l2_fill_mask() {
++    static const int mask = [] {
++        const char* e = std::getenv("NINFER_L2_FILL");
++        const int m   = e != nullptr ? std::atoi(e) : 0;
++        if (m != 0) { std::fprintf(stderr, "NINFER_L2_FILL=%d: L2 fills of the next GEMM's weights\n", m); }
++        return m;
++    }();
++    return mask;
++}
++
++std::uint64_t l2_fill_bytes(const char* name, std::uint64_t fallback) {
++    static std::mutex mutex;
++    static std::map<std::string, std::uint64_t> cache;
++    const std::lock_guard<std::mutex> lock(mutex);
++    const auto it = cache.find(name);
++    if (it != cache.end()) { return it->second; }
++    const std::string key = std::string("NINFER_L2_FILL_") + name + "_KB";
++    const char* e         = std::getenv(key.c_str());
++    const std::uint64_t v = e != nullptr ? static_cast<std::uint64_t>(std::atoll(e)) << 10 : fallback;
++    if (e != nullptr) { std::fprintf(stderr, "%s=%s\n", key.c_str(), e); }
++    cache.emplace(name, v);
++    return v;
++}
++
++L2Fill l2_fill_for_weight(const Weight& w, std::uint64_t skip_bytes, std::uint64_t bytes) {
++    L2Fill fill{};
++    const std::int64_t rows = w.n;
++    const std::int64_t k    = w.k;
++    if (bytes == 0 || w.layout != QuantLayout::RowSplit || rows <= 0 || k <= 0 || k % 64 != 0) { return fill; }
++    const std::uint64_t groups = static_cast<std::uint64_t>(k / 64);
++    struct Plane {
++        const void* base;
++        std::uint64_t row_bytes;
++    };
++    Plane planes[3] = {};
++    int count       = 0;
++    const bool ls8  = w.scales_ls8 != nullptr;
++    if (w.q3_low != nullptr) {
++        if (w.q3_tile != 0) {
++            // Stage-packed tiles [low | high | LS8] in CTA order: a prefix is the first CTAs' rows.
++            planes[count++] = {w.q3_low, groups * (16 + 8 + 1)};
++        } else {
++            planes[count++] = {w.q3_low, groups * 16};
++            planes[count++] = {w.q3_high, groups * 8};
++        }
++    } else if (w.qtype == QType::Q4_G64_FP16 && w.qdata != nullptr) {
++        planes[count++] = {w.qdata, groups * 32};
++    } else {
++        return fill;
++    }
++    if (w.q3_tile == 0) {
++        planes[count++] = {ls8 ? w.scales_ls8 : w.scales, groups * (ls8 ? 1 : 2)};
++    }
++    std::uint64_t row_bytes = 0;
++    for (int i = 0; i < count; ++i) {
++        if (planes[i].base == nullptr || reinterpret_cast<std::uintptr_t>(planes[i].base) % 128 != 0) {
++            return L2Fill{};
++        }
++        row_bytes += planes[i].row_bytes;
++    }
++    const std::uint64_t r0 = std::min<std::uint64_t>(skip_bytes / row_bytes, rows);
++    const std::uint64_t r1 = std::min<std::uint64_t>((skip_bytes + bytes) / row_bytes, rows);
++    if (r1 <= r0) { return fill; }
++    for (int i = 0; i < count; ++i) {
++        const std::uint64_t first = r0 * planes[i].row_bytes / 128;
++        const std::uint64_t last  = (r1 * planes[i].row_bytes + 127) / 128;
++        fill.range[i]             = {static_cast<const char*>(planes[i].base) + first * 128,
++                                     static_cast<std::uint32_t>(last - first)};
++    }
++    return fill;
++}
++
++void l2_fill_set(const L2Fill& fill) { pending_fill = fill; }
++
++L2Fill l2_fill_take() {
++    const L2Fill fill = pending_fill;
++    pending_fill      = L2Fill{};
++    return fill;
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/linear/sources.cmake b/src/ops/linear/sources.cmake
+index b8eb1a6..f102e95 100644
+--- a/src/ops/linear/sources.cmake
++++ b/src/ops/linear/sources.cmake
+@@ -1,6 +1,7 @@
+ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/ls8_scales.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q3_shadow.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/l2_fill.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+ )
+ 
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+index 2507e14..cdb151e 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -84,7 +84,7 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+     const dim3 block(kWarpSize, kNumWarps, 1);
+     const std::int64_t state_slot_stride =
+         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
+-    const RecordAccess<Masked> access{
++    RecordAccess<Masked> access{
+         static_cast<const __nv_bfloat16*>(q.data),
+         static_cast<const __nv_bfloat16*>(k.data),
+         static_cast<const __nv_bfloat16*>(v.data),
+@@ -104,6 +104,9 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+         static_cast<const float*>(next_states.data),
+         static_cast<const std::int32_t*>(tree_parents.data),
+     };
++    // research29 (NINFER_L2_FILL): a fill handed over by the model, and bit 2 for the next-state tiles.
++    access.fill       = ops::l2_fill_take();
++    access.fill_flags = ops::l2_fill_mask() & 2;
+     // Research flag NINFER_GDN_CHUNKED_RECORD=1: the chunked (WY-form) record, read at each launch.
+     const char* chunked_flag = std::getenv("NINFER_GDN_CHUNKED_RECORD");
+     const bool chunked       = chunked_flag != nullptr && chunked_flag[0] == '1';
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index ac185cc..e325686 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -6,6 +6,7 @@
+ #include "ops/common/bf16_vector.cuh"
+ #include "ops/linear_attention/gated_delta_net/common.cuh"
+ #include "ops/common/mma.cuh"
++#include "ops/common/l2_fill.cuh"
+ #include "ops/linear_attention/gated_delta_net/launch.h"
+ 
+ #include <cuda_bf16.h>
+@@ -375,6 +376,9 @@ struct RecordAccess {
+     const float* next_states;
+     // Optional verify-tree parents, I32 [width, batch] in DFS pre-order (see the staged kernel).
+     const std::int32_t* tree_parents;
++    // research29 (NINFER_L2_FILL): the chunked record's L2 fill, and bit 2 = load (not prefetch) next_states.
++    ops::L2Fill fill{};
++    std::int32_t fill_flags = 0;
+ 
+     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
+         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+@@ -1074,6 +1078,12 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+         if (pack < kBlockDv / 8) { store_vec(&value_raw[token][pack * 8], make_uint4(0, 0, 0, 0)); }
+         if (pack == 0) { gate_raw[token] = make_uint2(0U, 0U); }
+     }
++    // research29: the next GEMM's weight lines, queued behind this CTA's own copies.
++    ops::detail::L2FillLoads<2> l2_fill;
++    l2_fill.issue(access.fill,
++                  (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * kThreads + thread,
++                  gridDim.x * gridDim.y * gridDim.z * kThreads);
++    std::uint32_t next_state_word = 0U;
+     cp_wait<0>();
+     __syncthreads();
+ 
+@@ -1111,9 +1121,14 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+                 static_cast<std::int64_t>(access.initial_slots[coord.batch]) *
+                     access.state_slot_stride +
+                 static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+-            prefetch_l2(next_tile +
+-                        static_cast<std::int64_t>(tile_dv + thread / kLinesPerRow) * kStateDim +
+-                        thread % kLinesPerRow * (128 / sizeof(float)));
++            const float* line = next_tile +
++                                static_cast<std::int64_t>(tile_dv + thread / kLinesPerRow) * kStateDim +
++                                thread % kLinesPerRow * (128 / sizeof(float));
++            if (access.fill_flags & 2) {
++                next_state_word = ops::detail::l2_fill_line_load(line);
++            } else {
++                prefetch_l2(line);
++            }
+         }
+     }
+ 
+@@ -1287,6 +1302,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+         access.output_ptr(coord, i)[tile_dv + row] = __float2bfloat16(acc * access.scale);
+     }
+     zero_output_suffix(access, coord, valid, access.width);
++    l2_fill.consume(access.fill, next_state_word);
+ }
+ 
+ template <class Geometry>
+-- 
+2.34.1
+

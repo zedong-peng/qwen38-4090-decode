@@ -1,0 +1,84 @@
+From 8aa46931cfeaf70c859844b53af3e7ed78f7ccbc Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 23:29:16 +0800
+Subject: [PATCH 21/49] Q4 drafter dynamic-grouped-conv projections: Ada
+ small-T route at verify widths
+
+---
+ .../q4/q4_dynamic_grouped_conv_add.cu         | 46 +++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
+index 20df88c..5cccb54 100644
+--- a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
++++ b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
+@@ -4,6 +4,9 @@
+ #include "ops/dynamic_grouped_conv/dynamic_grouped_conv_add_finish.h"
+ #include "ops/linear/q4/q4_ksplit_mma.cuh"
+ #include "ops/linear/q4/q4_mma_launch.cuh"
++#include "ops/linear/ada_small_t_mma.cuh"
++
++#include <cuda_bf16.h>
+ 
+ #include <algorithm>
+ #include <array>
+@@ -92,6 +95,37 @@ constexpr std::array<Launch, 4> kKSplit{
+     &ksplit_projection<InputRows, 8>, &ksplit_projection<InputRows, 16>,
+     &ksplit_projection<InputRows, 24>, &ksplit_projection<InputRows, 32>};
+ 
++// Verify widths (W*B <= 16) of a row-split weight run on the Ada small-T kernel: 40-row CTAs read
++// every weight byte once (LS8 scales when present) into the BF16 projection.
++struct AdaStoreEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* out;
++
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        out[static_cast<std::int64_t>(token) * kRows + row] = __float2bfloat16_rn(value);
++    }
++};
++
++template <int K>
++void ada_projection(const Tensor& x, const Weight& w, __nv_bfloat16* projected, int columns,
++                    cudaStream_t stream) {
++    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
++    const auto* code = static_cast<const std::uint8_t*>(w.qdata);
++    const AdaStoreEpilogue epilogue{projected};
++    if (columns <= 8) {
++        using S = Q4AdaSmallTSchedule<5, 8, 1, 8, 2>;
++        static_assert(kRows % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, K>(xp, K, code, nullptr, ada_scales(w), kRows, columns, epilogue,
++                                     stream, ada_super(w));
++    } else {
++        using S = Q4AdaSmallTSchedule<5, 8, 2, 8, 2>;
++        ada_small_t_mma_launch<S, K>(xp, K, code, nullptr, ada_scales(w), kRows, columns, epilogue,
++                                     stream, ada_super(w));
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ using MmaR32C32 = Q4RowSplitMmaGemmSchedule<32, 32, 64, 16, 16, 3, 2, Q4FragmentPipeline::Serial,
+                                             Cache::cg, Cache::cg, Q4ScaleLoad::Pair32>;
+ using MmaR32C64 = Q4RowSplitMmaGemmSchedule<32, 64, 64, 16, 32, 3, 2, Q4FragmentPipeline::Serial,
+@@ -138,6 +172,18 @@ void q4_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight&
+     const DeviceSpan storage = workspace.alloc_bytes(plan.workspace_bytes);
+     const int tokens         = x.ne[1] * x.ne[2];
+     const Tensor flat        = x.view({x.ne[0], tokens});
++    if (tokens <= kSplitKColumns && weight.layout == QuantLayout::RowSplit) {
++        auto* projected = static_cast<__nv_bfloat16*>(storage.data);
++        if (x.ne[0] == 4096) {
++            ada_projection<4096>(flat, weight, projected, tokens, stream);
++        } else {
++            ada_projection<17408>(flat, weight, projected, tokens, stream);
++        }
++        Tensor out(storage.data, DType::BF16, {kRows, tokens});
++        dynamic_grouped_conv_add_finish_launch(out, base_kernel, finish_delta, residual, x.ne[1],
++                                               tokens, stream);
++        return;
++    }
+     if (plan.route == Route::SplitK) {
+         auto* partials        = static_cast<float*>(storage.data);
+         const auto& launchers = x.ne[0] == 4096 ? kSplitK<4096> : kSplitK<17408>;
+-- 
+2.34.1
+

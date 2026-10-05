@@ -1,0 +1,359 @@
+From 1392d8ffd8ccdce9f2e5cf903223949bed4174d8 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 00:33:33 +0800
+Subject: [PATCH 23/49] Q3 shadow: half-grid planes (AdaWeightFormat::Q3Odd,
+ odd codes 2c + 1); NINFER_Q3_EXACT=1 for the Q4 summation order
+
+---
+ include/ninfer/ops/q3_shadow.h                | 10 +++--
+ src/core/weight.h                             |  1 +
+ src/models/qwen3_5/execution/parameters.cpp   | 12 ++++--
+ src/ops/linear/ada_small_t_mma.cuh            | 37 +++++++++++++++----
+ src/ops/linear/q3_shadow.cu                   | 26 ++++++++-----
+ src/ops/linear_add/q4/q4_linear_add.cu        | 25 +++++++++----
+ .../q4/q4_linear_swiglu_ada_small_t.cu        | 20 +++++++++-
+ 7 files changed, 96 insertions(+), 35 deletions(-)
+
+diff --git a/include/ninfer/ops/q3_shadow.h b/include/ninfer/ops/q3_shadow.h
+index dbe7aab..9fd862a 100644
+--- a/include/ninfer/ops/q3_shadow.h
++++ b/include/ninfer/ops/q3_shadow.h
+@@ -8,12 +8,14 @@
+ 
+ namespace ninfer::ops {
+ 
+-// Research (NINFER_Q3_SHADOW): whether every code of the row-split Q4 G64 weight w lies in [-4, 3].
+-bool q3_codes_fit(const Weight& w, cudaStream_t stream);
++// Research (NINFER_Q3_SHADOW): 1 when every code of the row-split Q4 G64 weight w lies in [-4, 3],
++// else 2 when every code is odd (the half grid, 2c + 1), else 0.
++int q3_codes_kind(const Weight& w, cudaStream_t stream);
+ // Bytes of w's Q3 low plane (16 per 64-weight group) and high plane (8 per group).
+ std::size_t q3_low_bytes(const Weight& w);
+ std::size_t q3_high_bytes(const Weight& w);
+-// Repack w's Q4 codes (all in [-4, 3]) into the pair-split Q3 planes of ada_small_t_mma.cuh.
+-void q3_transcode(const Weight& w, void* low, void* high, cudaStream_t stream);
++// Repack w's Q4 codes into the pair-split Q3 planes of ada_small_t_mma.cuh: u = c + 4 for codes in
++// [-4, 3], or u = (d + 7) / 2 for odd codes d (odd = true).
++void q3_transcode(const Weight& w, void* low, void* high, bool odd, cudaStream_t stream);
+ 
+ } // namespace ninfer::ops
+diff --git a/src/core/weight.h b/src/core/weight.h
+index a8d1264..bbf7842 100644
+--- a/src/core/weight.h
++++ b/src/core/weight.h
+@@ -53,6 +53,7 @@ struct Weight {
+     // Q4 weight whose codes all lie in [-4, 3]. The Ada small-T routes read these instead of qdata.
+     const void* q3_low         = nullptr;
+     const void* q3_high        = nullptr;
++    bool q3_odd                = false; // the planes hold odd codes 2c + 1 (half grid), u = (d + 7) / 2
+     float input_scale_divisor  = 0.0F;
+ };
+ 
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index a1bc627..5688065 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -306,21 +306,25 @@ struct Q3ShadowPass {
+     std::size_t bytes = 0;
+     int weights       = 0;
+     int checked       = 0;
++    int odd           = 0;
+     void operator()(Weight& w) {
+         if (w.qtype != QType::Q4_G64_FP16 || w.layout != QuantLayout::RowSplit || w.qdata == nullptr ||
+             w.k % 64 != 0 || w.padded_shape[1] != w.k) {
+             return;
+         }
+         ++checked;
+-        if (!ops::q3_codes_fit(w, nullptr)) { return; }
++        const int kind = ops::q3_codes_kind(w, nullptr);
++        if (kind == 0) { return; }
+         const std::size_t low  = ops::q3_low_bytes(w);
+         const std::size_t high = ops::q3_high_bytes(w);
+         void* memory           = nullptr;
+         CUDA_CHECK(cudaMalloc(&memory, low + high));
+         void* high_plane = static_cast<std::uint8_t*>(memory) + low;
+-        ops::q3_transcode(w, memory, high_plane, nullptr);
++        ops::q3_transcode(w, memory, high_plane, kind == 2, nullptr);
+         w.q3_low  = memory;
+         w.q3_high = high_plane;
++        w.q3_odd  = kind == 2;
++        odd += kind == 2;
+         bytes += low + high;
+         ++weights;
+     }
+@@ -406,8 +410,8 @@ Parameters::Parameters(const Model& source) : model(source) {
+             }
+         }
+         CUDA_CHECK(cudaDeviceSynchronize());
+-        std::fprintf(stderr, "Q3 shadow: %d of %d MLP weights, %.1f MiB of Q3 planes\n", pass.weights,
+-                     pass.checked, static_cast<double>(pass.bytes) / (1 << 20));
++        std::fprintf(stderr, "Q3 shadow: %d of %d MLP weights (%d half grid), %.1f MiB of Q3 planes\n",
++                     pass.weights, pass.checked, pass.odd, static_cast<double>(pass.bytes) / (1 << 20));
+     }
+     if (w.proposal) {
+         proposal =
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index 7ee6e37..96ed989 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -36,7 +36,7 @@ inline const float* ada_super(const Weight& w) { return w.scales_ls8 != nullptr
+ // {2q, 2q+1} to weights 16q + 4s + {0,1} and slots {2q+8, 2q+9} to 16q + 4s + {2,3}; x is read with
+ // the same permutation, so the dot product is unchanged. Codes decode to exact bf16 integers and
+ // the fp16 group scale is applied in fp32 after the group's four MMAs.
+-enum class AdaWeightFormat { Q4, Q5, Q3 };
++enum class AdaWeightFormat { Q4, Q5, Q3, Q3Odd };
+ 
+ template <AdaWeightFormat Format, int RowTiles, int Warps, int TokenTiles, int GroupsPerStage,
+           int Stages, bool EvictFirst = true>
+@@ -45,8 +45,10 @@ struct AdaSmallTSchedule {
+     // Weight fills carry an L2 evict-first hint: each weight byte is read once per call.
+     static constexpr bool kEvictFirst        = EvictFirst;
+     static constexpr bool kHasHigh           = Format != AdaWeightFormat::Q4;
+-    // Low-plane bytes per 64-weight group: 4-bit codes (Q4, Q5) or 2-bit codes (Q3).
+-    static constexpr int kLowBytes           = Format == AdaWeightFormat::Q3 ? 16 : 32;
++    // Q3 planes: 2-bit low codes plus a high-bit plane; Q3Odd holds odd codes 2c + 1 (the half grid).
++    static constexpr bool kQ3                = Format == AdaWeightFormat::Q3 || Format == AdaWeightFormat::Q3Odd;
++    // Low-plane bytes per 64-weight group: 4-bit codes (Q4, Q5) or 2-bit codes (Q3, Q3Odd).
++    static constexpr int kLowBytes           = kQ3 ? 16 : 32;
+     static constexpr int kRowTiles           = RowTiles;
+     static constexpr int kWarps              = Warps;
+     static constexpr int kTokenTiles         = TokenTiles;
+@@ -82,6 +84,9 @@ template <int RowTiles, int Warps, int TokenTiles, int GroupsPerStage, int Stage
+ using Q3AdaSmallTSchedule =
+     AdaSmallTSchedule<AdaWeightFormat::Q3, RowTiles, Warps, TokenTiles, GroupsPerStage, Stages>;
+ template <int RowTiles, int Warps, int TokenTiles, int GroupsPerStage, int Stages>
++using Q3OddAdaSmallTSchedule =
++    AdaSmallTSchedule<AdaWeightFormat::Q3Odd, RowTiles, Warps, TokenTiles, GroupsPerStage, Stages>;
++template <int RowTiles, int Warps, int TokenTiles, int GroupsPerStage, int Stages>
+ using Q4AdaSmallTSchedule =
+     AdaSmallTSchedule<AdaWeightFormat::Q4, RowTiles, Warps, TokenTiles, GroupsPerStage, Stages>;
+ 
+@@ -124,6 +129,16 @@ __device__ __forceinline__ unsigned q3_ada_decode_pair(unsigned low, unsigned hi
+     return *reinterpret_cast<const unsigned*>(&value);
+ }
+ 
++// One Q3Odd pair -> exact bf16x2 odd integers: `low` carries the pair's two low bits at bits 1-2 and
++// 17-18, `high` its high bits at bits 3 and 19, and (128 + 2u) - 135 = 2u - 7 is the odd code.
++__device__ __forceinline__ unsigned q3_odd_ada_decode_pair(unsigned low, unsigned high) {
++    const unsigned bits = 0x43004300u | (low & 0x00060006u) | (high & 0x00080008u);
++    const unsigned bias = 0x43074307u;
++    const __nv_bfloat162 value = __hsub2(*reinterpret_cast<const __nv_bfloat162*>(&bits),
++                                         *reinterpret_cast<const __nv_bfloat162*>(&bias));
++    return *reinterpret_cast<const unsigned*>(&value);
++}
++
+ // Two signed Q4 codes of one byte -> exact bf16x2 integers: flipping the sign bit gives the offset
+ // value u = code + 8, and (128 + u) - 136 is the two's-complement code.
+ __device__ __forceinline__ unsigned q4_ada_decode_pair(unsigned byte) {
+@@ -274,7 +289,7 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+             for (int r = 0; r < R; ++r) {
+                 const int row = 8 * r + group_id;
+                 uint2 word{0u, 0u};
+-                if constexpr (S::kFormat == AdaWeightFormat::Q3) {
++                if constexpr (S::kQ3) {
+                     word.x = *reinterpret_cast<const unsigned*>(code_s + row * S::kCodeStride +
+                                                                 gi * 16 + 4 * q);
+                 } else {
+@@ -282,11 +297,13 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+                                                            8 * q);
+                 }
+                 unsigned inv = 0;
+-                if constexpr (S::kFormat == AdaWeightFormat::Q3) {
+-                    // The chunk's high bits: pair firsts at bits 2-9, pair seconds at bits 18-25.
++                if constexpr (S::kQ3) {
++                    // The chunk's high bits: pair firsts at bits 2-9, pair seconds at bits 18-25 (one
++                    // higher for Q3Odd).
+                     const unsigned hw = *reinterpret_cast<const unsigned short*>(
+                         high_s + row * S::kHighStride + gi * 8 + 2 * q);
+-                    inv = ((hw & 0xffu) | ((hw & 0xff00u) << 8)) << 2;
++                    inv = ((hw & 0xffu) | ((hw & 0xff00u) << 8))
++                          << (S::kFormat == AdaWeightFormat::Q3Odd ? 3 : 2);
+                 } else if constexpr (S::kHasHigh) {
+                     const unsigned hw = *reinterpret_cast<const unsigned*>(
+                         high_s + row * S::kHighStride + gi * 8 + 4 * (q >> 1));
+@@ -299,7 +316,11 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+                     const unsigned shift = 16u * static_cast<unsigned>(s & 1);
+                     unsigned b0;
+                     unsigned b1;
+-                    if constexpr (S::kFormat == AdaWeightFormat::Q3) {
++                    if constexpr (S::kFormat == AdaWeightFormat::Q3Odd) {
++                        b0 = q3_odd_ada_decode_pair(s == 0 ? word.x << 1 : word.x >> (4 * s - 1),
++                                                    inv >> (2 * s));
++                        b1 = q3_odd_ada_decode_pair(word.x >> (4 * s + 1), inv >> (2 * s + 1));
++                    } else if constexpr (S::kFormat == AdaWeightFormat::Q3) {
+                         b0 = q3_ada_decode_pair(word.x >> (4 * s), inv >> (2 * s));
+                         b1 = q3_ada_decode_pair(word.x >> (4 * s + 2), inv >> (2 * s + 1));
+                     } else if constexpr (S::kHasHigh) {
+diff --git a/src/ops/linear/q3_shadow.cu b/src/ops/linear/q3_shadow.cu
+index a709654..9ffcfde 100644
+--- a/src/ops/linear/q3_shadow.cu
++++ b/src/ops/linear/q3_shadow.cu
+@@ -19,22 +19,29 @@ void require_q4(const Weight& w) {
+ 
+ std::int64_t groups(const Weight& w) { return static_cast<std::int64_t>(w.n) * (w.k / 64); }
+ 
+-// A nibble holds a code in [-4, 3] (0-3 or 12-15) exactly when its bits 3 and 2 agree.
++// A nibble holds a code in [-4, 3] (0-3 or 12-15) exactly when its bits 3 and 2 agree, and an odd code
++// when its bit 0 is set. misfit bit 0: some code outside [-4, 3]; bit 1: some even code.
+ __global__ void q3_fit_kernel(const uint4* __restrict__ codes, std::int64_t vectors,
+                               int* __restrict__ misfit) {
+     bool fits = true;
++    bool odd  = true;
+     for (std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+          i < vectors; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+         const uint4 v = codes[i];
+         fits &= ((((v.x >> 1) ^ v.x) | ((v.y >> 1) ^ v.y) | ((v.z >> 1) ^ v.z) | ((v.w >> 1) ^ v.w)) &
+                  0x44444444u) == 0;
++        odd &= (v.x & v.y & v.z & v.w & 0x11111111u) == 0x11111111u;
++    }
++    const bool all_fit = __syncthreads_and(fits);
++    const bool all_odd = __syncthreads_and(odd);
++    if (threadIdx.x == 0 && !(all_fit && all_odd)) {
++        atomicOr(misfit, (all_fit ? 0 : 1) | (all_odd ? 0 : 2));
+     }
+-    if (!__syncthreads_and(fits) && threadIdx.x == 0) { atomicOr(misfit, 1); }
+ }
+ 
+ // One thread per group: the 64 Q4 codes (weight i at bits 4 (i % 8) of word i / 8) as u = c + 4, chunk j
+ // (weights 16j + t, pair p = t / 2) in low word j (bits 2p and 16 + 2p) and high half j (bits p and 8 + p).
+-__global__ void q3_transcode_kernel(const uint4* __restrict__ codes, std::int64_t count,
++__global__ void q3_transcode_kernel(const uint4* __restrict__ codes, std::int64_t count, bool odd,
+                                     uint4* __restrict__ low, uint2* __restrict__ high) {
+     const std::int64_t g = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+     if (g >= count) { return; }
+@@ -44,7 +51,8 @@ __global__ void q3_transcode_kernel(const uint4* __restrict__ codes, std::int64_
+     unsigned hi[2] = {0u, 0u};
+ #pragma unroll
+     for (int i = 0; i < 64; ++i) {
+-        const unsigned u = (((words[i >> 3] >> (4 * (i & 7))) & 0xfu) + 4u) & 0xfu;
++        const unsigned n = (words[i >> 3] >> (4 * (i & 7))) & 0xfu;
++        const unsigned u = odd ? ((n + 7u) & 0xfu) >> 1 : (n + 4u) & 0xfu;
+         const int j = i >> 4, t = i & 15, p = t >> 1, second = t & 1;
+         lo[j] |= (u & 3u) << (16 * second + 2 * p);
+         hi[j >> 1] |= ((u >> 2) & 1u) << (16 * (j & 1) + 8 * second + p);
+@@ -55,29 +63,29 @@ __global__ void q3_transcode_kernel(const uint4* __restrict__ codes, std::int64_
+ 
+ } // namespace
+ 
+-bool q3_codes_fit(const Weight& w, cudaStream_t stream) {
++int q3_codes_kind(const Weight& w, cudaStream_t stream) {
+     require_q4(w);
+     int* misfit = nullptr;
+     CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&misfit), sizeof(int), stream));
+     CUDA_CHECK(cudaMemsetAsync(misfit, 0, sizeof(int), stream));
+     q3_fit_kernel<<<1024, 256, 0, stream>>>(static_cast<const uint4*>(w.qdata), groups(w) * 2, misfit);
+     CUDA_CHECK(cudaGetLastError());
+-    int host = 1;
++    int host = 3;
+     CUDA_CHECK(cudaMemcpyAsync(&host, misfit, sizeof(int), cudaMemcpyDeviceToHost, stream));
+     CUDA_CHECK(cudaFreeAsync(misfit, stream));
+     CUDA_CHECK(cudaStreamSynchronize(stream));
+-    return host == 0;
++    return (host & 1) == 0 ? 1 : (host & 2) == 0 ? 2 : 0;
+ }
+ 
+ std::size_t q3_low_bytes(const Weight& w) { return static_cast<std::size_t>(groups(w)) * 16; }
+ 
+ std::size_t q3_high_bytes(const Weight& w) { return static_cast<std::size_t>(groups(w)) * 8; }
+ 
+-void q3_transcode(const Weight& w, void* low, void* high, cudaStream_t stream) {
++void q3_transcode(const Weight& w, void* low, void* high, bool odd, cudaStream_t stream) {
+     require_q4(w);
+     const std::int64_t count = groups(w);
+     q3_transcode_kernel<<<static_cast<unsigned>((count + 255) / 256), 256, 0, stream>>>(
+-        static_cast<const uint4*>(w.qdata), count, static_cast<uint4*>(low), static_cast<uint2*>(high));
++        static_cast<const uint4*>(w.qdata), count, odd, static_cast<uint4*>(low), static_cast<uint2*>(high));
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index 59f051a..b1416e7 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -85,6 +85,17 @@ void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStrea
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++template <class S, int K, class Epilogue>
++void launch_ada_q3(const Tensor& x, const Weight& w, const Epilogue& epilogue, cudaStream_t stream) {
++    static_assert(5120 % S::kRowsPerCta == 0);
++    ada_small_t_mma_launch<S, K>(static_cast<const __nv_bfloat16*>(x.data),
++                                 static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)),
++                                 static_cast<const std::uint8_t*>(w.q3_low),
++                                 static_cast<const std::uint8_t*>(w.q3_high), ada_scales(w), 5120,
++                                 x.ne[1], epilogue, stream, ada_super(w));
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ template <int K, int TokenTiles>
+ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+     // K = 6144 (GDN / attention output): 16 rows per CTA (320 CTAs) beat 40 (128 CTAs) by 2.9% in
+@@ -100,14 +111,12 @@ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t
+     if (w.q3_low != nullptr) {
+         // Q3 shadow planes (NINFER_Q3_SHADOW): 16 groups per stage, 42.1 us at K = 17408, T = 16
+         // against 50.1 us for the Q4 codes (kernels/q3/bench_q3_sweep.cu); the same bits.
+-        using S3 = Q3AdaSmallTSchedule<5, 8, TokenTiles, K == 17408 ? 16 : 8, 2>;
+-        static_assert(5120 % S3::kRowsPerCta == 0);
+-        ada_small_t_mma_launch<S3, K>(static_cast<const __nv_bfloat16*>(x.data),
+-                                      static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)),
+-                                      static_cast<const std::uint8_t*>(w.q3_low),
+-                                      static_cast<const std::uint8_t*>(w.q3_high), ada_scales(w), 5120,
+-                                      x.ne[1], epilogue, stream, ada_super(w));
+-        CUDA_CHECK(cudaGetLastError());
++        constexpr int kG = K == 17408 ? 16 : 8;
++        if (w.q3_odd) {
++            launch_ada_q3<Q3OddAdaSmallTSchedule<5, 8, TokenTiles, kG, 2>, K>(x, w, epilogue, stream);
++        } else {
++            launch_ada_q3<Q3AdaSmallTSchedule<5, 8, TokenTiles, kG, 2>, K>(x, w, epilogue, stream);
++        }
+         return;
+     }
+     ada_small_t_mma_launch<S, K>(static_cast<const __nv_bfloat16*>(x.data),
+diff --git a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+index 40700c8..56b9b39 100644
+--- a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
++++ b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+@@ -8,6 +8,7 @@
+ #include <cuda_bf16.h>
+ 
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::ops::detail {
+@@ -34,7 +35,7 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream)
+                                   static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16))};
+     const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+     const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+-    constexpr bool kQ3 = Format == AdaWeightFormat::Q3;
++    constexpr bool kQ3 = Format == AdaWeightFormat::Q3 || Format == AdaWeightFormat::Q3Odd;
+     const auto* code = static_cast<const std::uint8_t*>(kQ3 ? w.q3_low : w.qdata);
+     const auto* hi   = kQ3 ? static_cast<const std::uint8_t*>(w.q3_high) : nullptr;
+     const auto* sc   = ada_scales(w);
+@@ -67,7 +68,22 @@ void q4_linear_swiglu_ada_small_t_launch(const Tensor& x, const Weight& w, Tenso
+     // Q3 shadow planes (NINFER_Q3_SHADOW): 32-row CTAs of four warps, 80.7 us at T=16 against 97.7 us
+     // for the Q4 codes (kernels/q3/bench_q3_sweep.cu); the same codes, so the same bits.
+     if (w.q3_low != nullptr) {
+-        launch<AdaWeightFormat::Q3, 4, 4, 8, 2>(x, w, out, stream);
++        // NINFER_Q3_EXACT=1: eight warps, the Q4 schedule's summation order (bit-identical to the Q4 codes).
++        static const bool exact = [] {
++            const char* e = std::getenv("NINFER_Q3_EXACT");
++            return e != nullptr && std::atoi(e) == 1;
++        }();
++        if (exact) {
++            if (w.q3_odd) {
++                launch<AdaWeightFormat::Q3Odd, 4, 8, 8, 2>(x, w, out, stream);
++            } else {
++                launch<AdaWeightFormat::Q3, 4, 8, 8, 2>(x, w, out, stream);
++            }
++        } else if (w.q3_odd) {
++            launch<AdaWeightFormat::Q3Odd, 4, 4, 8, 2>(x, w, out, stream);
++        } else {
++            launch<AdaWeightFormat::Q3, 4, 4, 8, 2>(x, w, out, stream);
++        }
+         return;
+     }
+     // Two stages over 16-row CTAs: 103 us at T=16 vs 109 us for <4, 8, 8, 3> (same bits).
+-- 
+2.34.1
+

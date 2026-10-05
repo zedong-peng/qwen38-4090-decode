@@ -1,0 +1,28 @@
+From eae0e480d5255a0d7e9095e96451b2f0cadc7b9f Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 19:50:16 +0800
+Subject: [PATCH 18/49] q4 linear_add: 16-row CTAs for the K=6144 output
+ projections (bit-identical, -2.9% in the sweep)
+
+---
+ src/ops/linear_add/q4/q4_linear_add.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index 6fcc87b..d57ce5e 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -87,7 +87,9 @@ void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStrea
+ 
+ template <int K, int TokenTiles>
+ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+-    using S = Q4AdaSmallTSchedule<5, 8, TokenTiles, 8, 2>;
++    // K = 6144 (GDN / attention output): 16 rows per CTA (320 CTAs) beat 40 (128 CTAs) by 2.9% in
++    // kernels/mma/bench_sweep2.cu; the warp split is unchanged, so the result is bit-identical.
++    using S = Q4AdaSmallTSchedule<K == 6144 ? 2 : 5, 8, TokenTiles, 8, 2>;
+     static_assert(5120 % S::kRowsPerCta == 0);
+     if (w.padded_shape[1] != K) {
+         throw std::invalid_argument("q4 linear_add ada small-T: padded K differs");
+-- 
+2.34.1
+

@@ -1,0 +1,317 @@
+From e24209bb5e5db5ed73dd716c285da4ae41f43fcc Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 37/49] research29b: conv / gated-norm / norm-control /
+ post-norm fill hosts
+
+---
+ src/models/qwen3_5/execution/text.cpp         | 35 ++++++++++++++++---
+ .../bf16/bf16_gdn_norm_gating_proj_27.cu      | 17 +++++++--
+ src/ops/gdn_input_proj/gdn_projected_conv.cu  | 11 ++++--
+ src/ops/kernel/rmsnorm.cuh                    | 16 +++++++--
+ src/ops/launcher/rmsnorm.cu                   |  6 ++--
+ 5 files changed, 71 insertions(+), 14 deletions(-)
+
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index cc365cd..266b251 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -1090,12 +1090,30 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                                    active_sequence_batch_ > 0
+                                ? gdn_overlap_q4_level(p, active_sequence_batch_, active_sequence_width_)
+                                : 0;
++    // research29b (NINFER_L2_FILL): the latency-bound kernels of a verify record block warm the
++    // value/z input projection (bit 16) and the output projection (bits 4, 1, 8, in this order) into L2.
++    const int l2_fill  = ph == Phase::Verify && gdn_state_action_ == GdnStateAction::RecordForReplay &&
++                                 !overlapped && overlap_q4 == 0
++                             ? ops::l2_fill_mask()
++                             : 0;
++    const auto* l2_pair = std::get_if<ops::PairedProjectionWeights>(&p.projection);
++    std::uint64_t l2_out_offset = 0;
++    const auto l2_out_fill = [&](int bit, const char* name, std::uint64_t fallback) {
++        if (!(l2_fill & bit)) { return; }
++        const std::uint64_t bytes = ops::l2_fill_bytes(name, fallback);
++        ops::l2_fill_set(ops::l2_fill_for_weight(p.output.weight, l2_out_offset, bytes));
++        l2_out_offset += bytes;
++    };
++    if ((l2_fill & 16) && l2_pair != nullptr) {
++        ops::l2_fill_set(ops::l2_fill_for_weight(l2_pair->second, 0, ops::l2_fill_bytes("NORM", 3u << 20)));
++    }
+     if (overlap_q4 >= 2) {
+         gdn_norm_control_overlapped_q4(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, ctx_);
+     } else if (!overlapped) {
+         gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+                          ctx_.execution_view());
+     }
++    (void)ops::l2_fill_take();
+ 
+     const auto projection = workspace::gdn_projection(work_, config_, T);
+     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
+@@ -1148,10 +1166,12 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                                                     records.conv, query_output, key_output, value_output,
+                                                     gate_output, ctx_);
+             } else {
++                l2_out_fill(4, "CONV", 2560u << 10);
+                 gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+                                       *active_linear_state_source_slots_, tree_parents,
+                                       records.conv, query_output, key_output, value_output,
+                                       gate_output, work_, s);
++                (void)ops::l2_fill_take();
+             }
+         } else {
+             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
+@@ -1211,11 +1231,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+             // The overlapped route queues the recurrence on the concurrent stream beside z.
+             const cudaStream_t record_stream =
+                 overlapped || overlap_q4 > 0 ? ctx_.concurrent.stream : s;
+-            // research29 (NINFER_L2_FILL bit 1): the record warms the output projection's first rows.
+-            if (ops::l2_fill_mask() & 1) {
+-                ops::l2_fill_set(ops::l2_fill_for_weight(p.output.weight, 0,
+-                                                         ops::l2_fill_bytes("RECORD", 4u << 20)));
+-            }
++            // research29 (NINFER_L2_FILL bit 1): the record warms the output projection's next rows.
++            l2_out_fill(1, "RECORD", 4u << 20);
+             ops::gated_delta_net_replay_record(
+                 q_batch, k_batch, v_batch, g_batch, beta_batch,
+                 static_cast<float>(
+@@ -1252,7 +1269,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+                            dimension(config_.gdn->linear_num_value_heads), T});
+     // The overlapped route ran the recurrence on the concurrent stream.
+     if (overlapped || overlap_q4 > 0) { gdn_join_concurrent(ctx_, kGdnRecurrenceReady, s); }
++    (void)ops::l2_fill_take();
++    l2_out_fill(8, "GATED", 1u << 20);
+     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
++    (void)ops::l2_fill_take();
+ 
+     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
+                     p.output.policy, work_, s);
+@@ -1267,9 +1287,14 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
+ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
+                            const ops::SparseMoeHints& hints) {
+     if (const auto* dense = std::get_if<DenseParameters>(&weights.ffn)) {
++        // research29b (NINFER_L2_FILL bit 32): the post-attention norm warms the gate/up projection.
++        if ((ops::l2_fill_mask() & 32) && x.ne[1] > 1 && x.ne[1] <= 16) {
++            ops::l2_fill_set(ops::l2_fill_for_weight(dense->gate_up.weight, 0, ops::l2_fill_bytes("POST", 1u << 20)));
++        }
+         ops::rmsnorm_swiglu_ffn(x, weights.post_attention_norm, config_.rms_norm_eps, true,
+                                 dense->gate_up.weight, dense->gate_up.policy, dense->down.weight,
+                                 dense->down.policy, work_, ctx_.stream);
++        (void)ops::l2_fill_take();
+         return;
+     }
+     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+diff --git a/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu b/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
+index 55996f4..c17b297 100644
+--- a/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
++++ b/src/ops/gdn_gating_proj/bf16/bf16_gdn_norm_gating_proj_27.cu
+@@ -9,6 +9,8 @@
+ #include "ops/common/memory.cuh"
+ #include "ops/common/warp.cuh"
+ #include "ops/linear/fp8/fp8_a8_quantize.cuh"
++#include "ops/common/l2_fill.cuh"
++#include "ninfer/ops/l2_fill.h"
+ 
+ #include <cuda_bf16.h>
+ 
+@@ -30,8 +32,12 @@ template <int Tile, int Threads, int HeadGroups = 1, int TileGroups = 1>
+ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_gating_27_simt(
+     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
+     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
+-    float* beta, int tokens, float eps) {
++    float* beta, int tokens, float eps, ops::L2Fill fill = {}) {
+     constexpr int D = 5120, H = 48, Warps = Threads / 32, Groups = HeadGroups * TileGroups;
++    // research29b (NINFER_L2_FILL bit 16): the input projection's first weight lines, consumed at the end.
++    L2FillLoads<2> l2_fill;
++    l2_fill.issue(fill, (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x,
++                  gridDim.x * gridDim.y * blockDim.x);
+     const int group = threadIdx.x / Threads, tid = threadIdx.x % Threads, lane = tid & 31,
+               warp = tid >> 5, head = blockIdx.x * HeadGroups + group % HeadGroups,
+               first = (blockIdx.y * TileGroups + group / HeadGroups) * Tile;
+@@ -97,7 +103,10 @@ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_ga
+         }
+     }
+     __syncthreads();
+-    if (h == nullptr) { return; }
++    if (h == nullptr) {
++        l2_fill.consume(fill);
++        return;
++    }
+     // Disjoint, pair-aligned h slices across the 48 heads avoid a separate norm kernel.
+     constexpr int PairsPerHead = (D / 2 + H - 1) / H;
+     const int pair             = head * PairsPerHead + tid;
+@@ -112,6 +121,7 @@ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_ga
+                     v.x * inverse[group][t] * (1 + n.x), v.y * inverse[group][t] * (1 + n.y));
+             }
+     }
++    l2_fill.consume(fill);
+ }
+ 
+ // The hidden output of gdn_norm_gating_27_simt<*, Threads> for one token per CTA, quantized as
+@@ -287,6 +297,7 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
+                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
+                                          const Tensor& alog, const Tensor& bias, Tensor& g,
+                                          Tensor& beta, cudaStream_t stream) {
++    const ops::L2Fill fill = ops::l2_fill_take();
+     const auto launch = [&]<int T, int Threads, int HeadGroups = 1, int TileGroups = 1>() {
+         constexpr int kTokensPerCta = T * TileGroups;
+         gdn_norm_gating_27_simt<T, Threads, HeadGroups, TileGroups>
+@@ -298,7 +309,7 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
+                 static_cast<const __nv_bfloat16*>(b_weight.qdata),
+                 static_cast<const float*>(alog.data), static_cast<const float*>(bias.data),
+                 static_cast<__nv_bfloat16*>(h.data), static_cast<float*>(g.data),
+-                static_cast<float*>(beta.data), x.ne[1], eps);
++                static_cast<float*>(beta.data), x.ne[1], eps, fill);
+     };
+     const int tokens = x.ne[1];
+     if (gdn_norm_27_threads(tokens) == 512) {
+diff --git a/src/ops/gdn_input_proj/gdn_projected_conv.cu b/src/ops/gdn_input_proj/gdn_projected_conv.cu
+index 103d96d..1fee003 100644
+--- a/src/ops/gdn_input_proj/gdn_projected_conv.cu
++++ b/src/ops/gdn_input_proj/gdn_projected_conv.cu
+@@ -5,6 +5,7 @@
+ 
+ #include "core/device.h"
+ #include "ops/gdn_input_proj/gdn_conv.cuh"
++#include "ops/common/l2_fill.cuh"
+ 
+ #include <cuda_bf16.h>
+ 
+@@ -25,12 +26,16 @@ __global__ void gdn_projected_conv_kernel(
+     const std::int32_t* __restrict__ initial_state_slots,
+     const std::int32_t* __restrict__ tree_parents, __nv_bfloat16* __restrict__ query,
+     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
+-    Publish publish) {
++    Publish publish, ops::L2Fill fill) {
+     static_assert(Channels == QueryRows + KeyRows + ValueRows);
+     static_assert(!Tree || MaxWidth > 0);
+     __shared__ float staged[Tree ? MaxWidth : 1][Threads];
+     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+     if (row >= Channels) { return; }
++    // research29b (NINFER_L2_FILL bit 4): the next GEMM's first weight lines, consumed at the end.
++    L2FillLoads<4> l2_fill;
++    l2_fill.issue(fill, (blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x + threadIdx.x,
++                  gridDim.x * gridDim.y * blockDim.x);
+     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
+ 
+     std::int32_t valid                 = valid_columns == nullptr ? width : valid_columns[batch];
+@@ -118,6 +123,7 @@ __global__ void gdn_projected_conv_kernel(
+             step(token, token < valid ? input(token) : 0.0F);
+         }
+     }
++    l2_fill.consume(fill);
+ }
+ 
+ template <int Channels, int QueryRows, int KeyRows, int ValueRows, class Publish>
+@@ -127,6 +133,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
+             cudaStream_t stream) {
+     const std::int32_t width = projected.ne[1];
+     const std::int32_t batch = projected.ne[2];
++    const ops::L2Fill fill   = ops::l2_fill_take();
+     const auto run           = [&]<int MaxWidth, int Threads, bool Tree>() {
+         const dim3 grid((Channels + Threads - 1) / Threads, static_cast<unsigned>(batch));
+         gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, MaxWidth, Threads, Tree>
+@@ -140,7 +147,7 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
+                 static_cast<const std::int32_t*>(initial_state_slots.data),
+                 static_cast<const std::int32_t*>(tree_parents.data),
+                 static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+-                static_cast<__nv_bfloat16*>(value.data), width, publish);
++                static_cast<__nv_bfloat16*>(value.data), width, publish, fill);
+     };
+     // Short speculative widths use narrow CTAs so a single row of work spreads over the SMs.
+     if (tree_parents.data != nullptr) {
+diff --git a/src/ops/kernel/rmsnorm.cuh b/src/ops/kernel/rmsnorm.cuh
+index bc09fa3..f598346 100644
+--- a/src/ops/kernel/rmsnorm.cuh
++++ b/src/ops/kernel/rmsnorm.cuh
+@@ -11,6 +11,8 @@
+ #include <cuda_bf16.h>
+ 
+ #include <cstdint>
++
++#include "ops/common/l2_fill.cuh"
+ #include <type_traits>
+ 
+ namespace ninfer::ops {
+@@ -43,7 +45,8 @@ template <RmsEpilogue Epilogue, int Block, bool Prefetch, int FixedD = 0>
+ __launch_bounds__(Block) __global__
+     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                     const __nv_bfloat162* z, __nv_bfloat162* out,
+-                                    std::int32_t input_d, std::int64_t rows, float eps) {
++                                    std::int32_t input_d, std::int64_t rows, float eps,
++                                    ops::L2Fill fill = {}) {
+     const int d = FixedD ? FixedD : input_d;
+     static_assert(Block % kWarpSize == 0);
+     constexpr int kWarpsPerBlock   = Block / kWarpSize;
+@@ -52,6 +55,9 @@ __launch_bounds__(Block) __global__
+     const int warp                 = static_cast<int>(threadIdx.x) / kWarpSize;
+     const std::int64_t row         = static_cast<std::int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+     if (row >= rows) { return; }
++    // research29b (NINFER_L2_FILL): the next GEMM's first weight lines, consumed at the end.
++    detail::L2FillLoads<2> l2_fill;
++    l2_fill.issue(fill, blockIdx.x * Block + threadIdx.x, gridDim.x * Block);
+ 
+     const int pairs             = d / 2;
+     const std::int64_t row_base = row * static_cast<std::int64_t>(pairs);
+@@ -100,6 +106,7 @@ __launch_bounds__(Block) __global__
+                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+         }
+     }
++    l2_fill.consume(fill);
+ }
+ 
+ // Implements: include/ninfer/ops/rmsnorm.h
+@@ -172,7 +179,11 @@ template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch,
+ __launch_bounds__(Block) __global__
+     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
+                                    const __nv_bfloat162* z, std::type_identity_t<Output> out,
+-                                   std::int32_t input_d, std::int64_t rows, float eps) {
++                                   std::int32_t input_d, std::int64_t rows, float eps,
++                                   ops::L2Fill fill = {}) {
++    // research29b (NINFER_L2_FILL): the next GEMM's first weight lines, consumed at the end.
++    detail::L2FillLoads<4> l2_fill;
++    l2_fill.issue(fill, blockIdx.x * Block + threadIdx.x, gridDim.x * Block);
+     const int d = FixedD ? FixedD : input_d;
+     static_assert(Block % kWarpSize == 0);
+     constexpr int kSlices = Output::kRowSlices;
+@@ -238,6 +249,7 @@ __launch_bounds__(Block) __global__
+         }
+     }
+     if constexpr (requires { out.finish_row(row); }) { out.finish_row(row); }
++    l2_fill.consume(fill);
+ }
+ 
+ // Implements: include/ninfer/ops/rmsnorm.h
+diff --git a/src/ops/launcher/rmsnorm.cu b/src/ops/launcher/rmsnorm.cu
+index 6c16f8a..6af1ea7 100644
+--- a/src/ops/launcher/rmsnorm.cu
++++ b/src/ops/launcher/rmsnorm.cu
+@@ -25,6 +25,8 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
+                     cudaStream_t stream) {
+     const auto* x_bf16 = static_cast<const __nv_bfloat16*>(x.data);
+     const auto* w_bf16 = static_cast<const __nv_bfloat16*>(weight.data);
++    // research29b (NINFER_L2_FILL): a fill for the D5120 CTA route and the gated warp route.
++    const ops::L2Fill fill = ops::l2_fill_take();
+     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
+     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
+ 
+@@ -42,7 +44,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
+                 <<<static_cast<unsigned>(rows), 256, 0, stream>>>(
+                     reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+                     reinterpret_cast<const __nv_bfloat162*>(w_bf16), nullptr,
+-                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
++                    reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps, fill);
+             return;
+         }
+     }
+@@ -87,7 +89,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
+             reinterpret_cast<const __nv_bfloat162*>(x_bf16),
+             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
+             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
+-            reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
++            reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps, fill);
+     } else if (aligned2 && d == 2048 && Epilogue == RmsEpilogue::Plain) {
+         // The 512-thread CTA is faster than 128/256-thread alternatives at every measured DFlash
+         // extent and reaches the same-topology payload floor at the prefill endpoint.
+-- 
+2.34.1
+

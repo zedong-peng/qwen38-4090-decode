@@ -64,6 +64,11 @@ Idempotent source patchers (`python3 patch_x.py REPO`), all default off:
 - `patch_hidden_dump.py`: `NINFER_HIDDEN_DUMP=FILE` writes the prompt ids and the accepted path's head inputs of every
   verify round. Run it with `--no-cuda-graph`.
 
+## engine-series/: the engine commits
+
+49 `git format-patch` commits: the Ada port fixes and research knobs 1–35, each default off, with its measured
+effect in the commit message. engine-series/README.md describes the base to apply them on.
+
 ## License
 
 Apache-2.0 (see LICENSE). The engine patches modify Apache-2.0 code from NInfer and Cinference; see NOTICE.

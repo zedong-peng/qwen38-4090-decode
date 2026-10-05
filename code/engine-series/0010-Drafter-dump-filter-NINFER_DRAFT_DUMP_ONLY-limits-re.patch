@@ -1,0 +1,29 @@
+From 6fedd34f689618576f98ec8f62e21417fd710a00 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 13:37:46 +0800
+Subject: [PATCH 10/49] Drafter dump filter: NINFER_DRAFT_DUMP_ONLY limits
+ research dumps to the listed tensors (fc for fine-tune features)
+
+---
+ src/models/qwen3_5/execution/draft.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/models/qwen3_5/execution/draft.cpp b/src/models/qwen3_5/execution/draft.cpp
+index 841c9da..9986f2e 100644
+--- a/src/models/qwen3_5/execution/draft.cpp
++++ b/src/models/qwen3_5/execution/draft.cpp
+@@ -54,6 +54,11 @@ namespace {
+ void research_dump(const std::string& name, const Tensor& x, cudaStream_t stream) {
+     static const char* dir = std::getenv("NINFER_DRAFT_DUMP");
+     if (dir == nullptr || *dir == 0) { return; }
++    static const char* only = std::getenv("NINFER_DRAFT_DUMP_ONLY");
++    if (only != nullptr && *only != 0) {
++        const std::string list = std::string(",") + only + ",";
++        if (list.find("," + name + ",") == std::string::npos) { return; }
++    }
+     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+     if (capture != cudaStreamCaptureStatusNone) {
+-- 
+2.34.1
+

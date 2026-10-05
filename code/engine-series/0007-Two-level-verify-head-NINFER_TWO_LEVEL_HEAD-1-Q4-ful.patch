@@ -1,0 +1,519 @@
+From ae9fad024dbb669d35670a743d51fc743026c1b9 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 05:15:38 +0800
+Subject: [PATCH 07/49] Two-level verify head (NINFER_TWO_LEVEL_HEAD=1): Q4
+ full-vocab top-16 + exact Q8 rescoring, raw-greedy accept
+
+---
+ include/ninfer/ops/linear_topk.h              |  11 ++
+ src/models/qwen3_5/execution/text.cpp         |  81 +++++++++-
+ src/models/qwen3_5/execution/text.h           |   3 +
+ .../speculative/target_verification.cpp       |   4 +-
+ src/ops/linear_topk/linear_topk.cpp           |  14 ++
+ src/ops/linear_topk/linear_topk_launch.h      |   2 +
+ src/ops/linear_topk/q4.cu                     |  64 ++++++++
+ src/ops/linear_topk/sources.cmake             |   1 +
+ src/ops/linear_topk/two_level_head.cu         | 153 ++++++++++++++++++
+ 9 files changed, 328 insertions(+), 5 deletions(-)
+ create mode 100644 src/ops/linear_topk/two_level_head.cu
+
+diff --git a/include/ninfer/ops/linear_topk.h b/include/ninfer/ops/linear_topk.h
+index 1f8f767..9ae3c4c 100644
+--- a/include/ninfer/ops/linear_topk.h
++++ b/include/ninfer/ops/linear_topk.h
+@@ -62,4 +62,15 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
+                  Tensor& candidate_ids, Tensor& candidate_scores, WorkspaceArena& workspace,
+                  cudaStream_t stream);
+ 
++/**
++ * Two-level verify head (research): writes a Q4_G64_FP16 row-split copy of a Q8_G32_FP16
++ * [248320,5120] head (codes [248320,2560] bytes, scales [248320,80] FP16) requantized from its
++ * Q8 values, and rescoring of linear_topk candidates with exact Q8 logits: tokens[t] is the
++ * candidate with the largest BF16-rounded Q8 logit, the lowest id on ties.
++ */
++void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_scales,
++                               cudaStream_t stream);
++void two_level_head_rescore(const Tensor& hidden, const Weight& q8_head,
++                            const Tensor& candidate_ids, Tensor& tokens, cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 68be786..12aa5b9 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -15,6 +15,11 @@
+ #include "models/qwen3_5/execution/vision.h"
+ #include "models/qwen3_5/program/vision_control.h"
+ #include "ninfer/ops/argmax.h"
++#include "ninfer/ops/linear_topk.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <memory>
+ #include "ninfer/ops/attn_input_proj.h"
+ #include "ninfer/ops/causal_conv1d_silu.h"
+ #include "ninfer/ops/embedding.h"
+@@ -267,8 +272,74 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
+             &p.head, p.token_ids ? static_cast<const std::int32_t*>(p.token_ids->data) : nullptr,
+             dimension(p.rows));
+     }
++    (void)two_level_head_enabled();
++}
++
++namespace {
++
++// NINFER_TWO_LEVEL_HEAD=1: see ops::two_level_head_rescore. Built once, outside graph capture.
++struct TwoLevelHead {
++    DeviceBuffer codes;
++    DeviceBuffer scales;
++    Weight q4;
++    std::unique_ptr<DeviceArena> work;
++
++    void verify(const Tensor& hidden, const Weight& q8, Tensor& tokens, cudaStream_t stream) {
++        work->reset();
++        const std::int32_t columns = hidden.ne[1];
++        Tensor ids    = work->alloc(DType::I32, {16, columns});
++        Tensor scores = work->alloc(DType::FP32, {16, columns});
++        ops::linear_topk(hidden, q4, 248077, ids, scores, *work, stream);
++        ops::two_level_head_rescore(hidden, q8, ids, tokens, stream);
++    }
++};
++
++TwoLevelHead* two_level_head(const Weight& q8) {
++    static const bool enabled = [] {
++        const char* value = std::getenv("NINFER_TWO_LEVEL_HEAD");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (!enabled || q8.qtype != QType::Q8_G32_FP16 || q8.n != 248320 || q8.k != 5120) {
++        return nullptr;
++    }
++    static std::unique_ptr<TwoLevelHead> head = [&] {
++        auto h    = std::make_unique<TwoLevelHead>();
++        h->codes  = DeviceBuffer(static_cast<std::size_t>(q8.n) * q8.k / 2);
++        h->scales = DeviceBuffer(static_cast<std::size_t>(q8.n) * (q8.k / 64) * 2);
++        ops::two_level_head_requantize(q8, h->codes.p, h->scales.p, nullptr);
++        CUDA_CHECK(cudaDeviceSynchronize());
++        Weight& w          = h->q4;
++        w.qtype            = QType::Q4_G64_FP16;
++        w.layout           = QuantLayout::RowSplit;
++        w.scale_dtype      = DType::FP16;
++        w.group_size       = 64;
++        w.group            = 64;
++        w.ndim             = 2;
++        w.n                = q8.n;
++        w.k                = q8.k;
++        w.shape[0]         = q8.n;
++        w.shape[1]         = q8.k;
++        w.padded_shape[0]  = q8.n;
++        w.padded_shape[1]  = q8.k;
++        w.qdata            = h->codes.p;
++        w.scales           = h->scales.p;
++        w.payload          = h->codes.p;
++        w.payload_bytes    = h->codes.bytes;
++        h->work = std::make_unique<DeviceArena>(
++            ops::linear_topk_workspace_capacity_bytes(QType::Q4_G64_FP16, q8.n, q8.k, 1, 16) +
++            (1u << 20));
++        std::fprintf(stderr, "two-level verify head: Q4 copy %.2f GiB, workspace %.1f MiB\n",
++                     static_cast<double>(h->codes.bytes + h->scales.bytes) / (1u << 30),
++                     static_cast<double>(h->work->capacity()) / (1u << 20));
++        return h;
++    }();
++    return head.get();
+ }
+ 
++} // namespace
++
++bool TextContext::two_level_head_enabled() const { return two_level_head(lm_head_->weight) != nullptr; }
++
+ TextContext::~TextContext() = default;
+ 
+ void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot) {
+@@ -768,9 +839,13 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
+         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
+         Tensor flat_tokens = target_tokens.view({columns});
+         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
+-        project(flat_hidden, *lm_head_, flat_logits, work_, stream);
+-        ops::argmax(flat_logits, flat_tokens,
+-                    dimension(parameters_.model.resources().public_token_count), stream);
++        if (TwoLevelHead* head = two_level_head(lm_head_->weight)) {
++            head->verify(flat_hidden, lm_head_->weight, flat_tokens, stream);
++        } else {
++            project(flat_hidden, *lm_head_, flat_logits, work_, stream);
++            ops::argmax(flat_logits, flat_tokens,
++                        dimension(parameters_.model.resources().public_token_count), stream);
++        }
+     }
+     work_.reset();
+ }
+diff --git a/src/models/qwen3_5/execution/text.h b/src/models/qwen3_5/execution/text.h
+index 3d122db..beb3f0b 100644
+--- a/src/models/qwen3_5/execution/text.h
++++ b/src/models/qwen3_5/execution/text.h
+@@ -91,6 +91,9 @@ public:
+ 
+     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+ 
++    // NINFER_TWO_LEVEL_HEAD: verification produces target tokens only (no dense logits).
++    bool two_level_head_enabled() const;
++
+     void set_prefill_split_frontier(std::int64_t position) noexcept {
+         prefill_split_frontier_ = position;
+     }
+diff --git a/src/models/qwen3_5/program/speculative/target_verification.cpp b/src/models/qwen3_5/program/speculative/target_verification.cpp
+index 6ecddf5..278ae0c 100644
+--- a/src/models/qwen3_5/program/speculative/target_verification.cpp
++++ b/src/models/qwen3_5/program/speculative/target_verification.cpp
+@@ -35,7 +35,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
+             frame.current_extents, frame.frontiers, frame.anchors, frame.licensed_tokens,
+             frame.licensed_counts, frame.accepted_drafts, frame.accepted_columns,
+             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+-            {false}, execution.work, execution.device.stream);
++            {card.two_level_head_enabled()}, execution.work, execution.device.stream);
+         // Later readers (the continuation hidden below, a partial commit's correction) index the
+         // accepted path by its chain position.
+         ops::speculative_compact_columns(frame.target_hidden, Tensor{}, frame.accepted_columns,
+@@ -46,7 +46,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
+             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
+             frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
+             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+-            {false}, execution.work, execution.device.stream);
++            {card.two_level_head_enabled()}, execution.work, execution.device.stream);
+     } else {
+         ops::speculative_accept_greedy_drafts(
+             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
+diff --git a/src/ops/linear_topk/linear_topk.cpp b/src/ops/linear_topk/linear_topk.cpp
+index c18a7dd..13af026 100644
+--- a/src/ops/linear_topk/linear_topk.cpp
++++ b/src/ops/linear_topk/linear_topk.cpp
+@@ -18,6 +18,7 @@ enum class HeadProfile : std::uint8_t {
+     Q8Full,
+     Fp8Full,
+     Q4Optimized,
++    Q4Full,
+ };
+ 
+ bool aligned_to(const void* pointer, std::uintptr_t alignment) {
+@@ -48,6 +49,9 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
+     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4_G64_FP16) {
+         return HeadProfile::Q4Optimized;
+     }
++    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::Q4_G64_FP16) {
++        return HeadProfile::Q4Full;
++    }
+     throw std::invalid_argument("linear_topk: unsupported head profile");
+ }
+ 
+@@ -58,6 +62,7 @@ struct Plan {
+ };
+ 
+ Plan plan_for(HeadProfile profile, int columns) {
++    if (profile == HeadProfile::Q4Full) return {16, 0};
+     if (profile == HeadProfile::Q4Optimized) {
+         if (columns <= 16) return {16, 0};
+         if (columns <= 32) return {64, 32};
+@@ -198,6 +203,9 @@ void execute(const Tensor& hidden, const Weight& head, const Tensor* id_map, Ten
+         if (profile == HeadProfile::Q8Full)
+             detail::linear_topk_q8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
+                                           stream);
++        else if (profile == HeadProfile::Q4Full)
++            detail::linear_topk_q4_full_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
++                                               stream);
+         else if (profile == HeadProfile::Fp8Full)
+             detail::linear_topk_fp8_launch(x, head, detail::kLinearTopKFullValidRows, scratch,
+                                            stream);
+@@ -248,6 +256,12 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
+     }
+     if (profile == HeadProfile::Q8Full) {
+         require_q8(head);
++    } else if (profile == HeadProfile::Q4Full) {
++        if (head.layout != QuantLayout::RowSplit || head.scale_dtype != DType::FP16 ||
++            head.group != 64 || head.qhigh != nullptr || !aligned_to(head.qdata, 16) ||
++            !aligned_to(head.scales, 16) || head.padded_shape[1] != head.k) {
++            throw std::invalid_argument("linear_topk: invalid Q4 full head");
++        }
+     } else {
+         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
+     }
+diff --git a/src/ops/linear_topk/linear_topk_launch.h b/src/ops/linear_topk/linear_topk_launch.h
+index e36e787..137dd7f 100644
+--- a/src/ops/linear_topk/linear_topk_launch.h
++++ b/src/ops/linear_topk/linear_topk_launch.h
+@@ -22,6 +22,8 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
+ void linear_topk_q4_m64_launch(const Tensor& hidden, const Weight& head,
+                                const Tensor& row_to_global_ids,
+                                const LinearTopKWorkspace& workspace, cudaStream_t stream);
++void linear_topk_q4_full_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
++                                const LinearTopKWorkspace& workspace, cudaStream_t stream);
+ void linear_topk_merge_launch(const LinearTopKWorkspace& workspace, Tensor& candidate_ids,
+                               Tensor& candidate_scores, cudaStream_t stream);
+ 
+diff --git a/src/ops/linear_topk/q4.cu b/src/ops/linear_topk/q4.cu
+index c9a2ae4..4ba59f8 100644
+--- a/src/ops/linear_topk/q4.cu
++++ b/src/ops/linear_topk/q4.cu
+@@ -9,8 +9,10 @@
+ #include "ops/common/score_id_order.cuh"
+ #include "ops/linear/q4/q4_ksplit_mma.cuh"
+ 
++#include <climits>
+ #include <cstdint>
+ #include <array>
++#include <stdexcept>
+ #include <utility>
+ 
+ namespace ninfer::ops::detail {
+@@ -42,6 +44,34 @@ struct Q4KSplitTopKOutput {
+     }
+ };
+ 
++// Full-vocabulary rows are their own token ids; physical rows [valid_rows, 248320) never
++// participate (the INT_MAX id encodes the lowest key).
++struct Q4KSplitTopKFullOutput {
++    std::uint64_t* partial_keys;
++    std::int32_t valid_rows;
++    std::int32_t producer_groups;
++    std::int32_t columns;
++
++    template <int Capacity>
++    __device__ __forceinline__ void store(std::int32_t row0, std::int32_t column0,
++                                          float4 values) const {
++        const std::int32_t group = row0 / kLinearTopK;
++        const std::int32_t rank0 = row0 % kLinearTopK;
++        const auto put           = [&](std::int32_t row, std::int32_t rank, std::int32_t column,
++                             float value) {
++            if (column >= columns) { return; }
++            const std::int64_t offset =
++                (static_cast<std::int64_t>(column) * producer_groups + group) * kLinearTopK + rank;
++            store_u64_evict_last(partial_keys + offset,
++                                 score_id_order_key(value, row < valid_rows ? row : INT_MAX));
++        };
++        put(row0, rank0, column0, values.x);
++        put(row0, rank0, column0 + 1, values.y);
++        put(row0 + 8, rank0 + 8, column0, values.z);
++        put(row0 + 8, rank0 + 8, column0 + 1, values.w);
++    }
++};
++
+ // Four 16-row tiles per CTA share each staged activation slice, so the 131072-row head stages the
+ // verify block's activations once per 64 rows instead of once per 16.
+ constexpr int kRowTiles = 4;
+@@ -68,6 +98,31 @@ void launch_ksplit(const Tensor& hidden, const Weight& head, const Tensor& row_t
+ using Launch = void (*)(const Tensor&, const Weight&, const Tensor&, const LinearTopKWorkspace&,
+                         cudaStream_t);
+ 
++template <int Capacity>
++void launch_full_ksplit(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
++                        const LinearTopKWorkspace& workspace, cudaStream_t stream) {
++    using Geometry             = Q4LinearGeometry<kLinearTopKFullRows, kLinearTopKHidden>;
++    using Schedule             = Q4KSplitMmaSchedule;
++    constexpr int kTileColumns = ((Capacity + 7) / 8) * 8;
++    constexpr int kBlocks      = Geometry::kOutputRows / (Schedule::kRowsPerCta * kRowTiles);
++    static_assert(Geometry::kOutputRows % (Schedule::kRowsPerCta * kRowTiles) == 0);
++    const Q4KSplitTopKFullOutput output{static_cast<std::uint64_t*>(workspace.partial_keys.data),
++                                        valid_rows, workspace.producer_groups, hidden.ne[1]};
++    q4_ksplit_mma_kernel<Geometry, kTileColumns, Capacity, Q4KSplitTopKFullOutput,
++                         Q4KSplitIdentityRows, true, kRowTiles>
++        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
++            static_cast<const __nv_bfloat16*>(hidden.data),
++            static_cast<const std::uint8_t*>(head.qdata),
++            static_cast<const std::uint8_t*>(head.scales), nullptr, output,
++            Q4KSplitIdentityRows{}, hidden.ne[1]);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++using FullLaunch = void (*)(const Tensor&, const Weight&, std::int32_t,
++                            const LinearTopKWorkspace&, cudaStream_t);
++constexpr std::array<FullLaunch, 2> full_launchers{&launch_full_ksplit<8>,
++                                                   &launch_full_ksplit<16>};
++
+ template <std::size_t... I>
+ constexpr auto make_launchers(std::index_sequence<I...>) {
+     return std::array<Launch, sizeof...(I)>{&launch_ksplit<8 * (1 + I)>...};
+@@ -77,6 +132,15 @@ constexpr auto launchers = make_launchers(std::make_index_sequence<2>{});
+ 
+ } // namespace
+ 
++void linear_topk_q4_full_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
++                                const LinearTopKWorkspace& workspace, cudaStream_t stream) {
++    if (workspace.rows_per_producer != kLinearTopKDirectRows || hidden.ne[1] < 1 ||
++        hidden.ne[1] > 16) {
++        throw std::invalid_argument("linear_topk Q4 full head: T must be in [1,16]");
++    }
++    full_launchers[(hidden.ne[1] - 1) / 8](hidden, head, valid_rows, workspace, stream);
++}
++
+ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
+                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
+                            cudaStream_t stream) {
+diff --git a/src/ops/linear_topk/sources.cmake b/src/ops/linear_topk/sources.cmake
+index 7a61ea4..989130a 100644
+--- a/src/ops/linear_topk/sources.cmake
++++ b/src/ops/linear_topk/sources.cmake
+@@ -7,4 +7,5 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q4.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4_m64.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/merge.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/two_level_head.cu"
+ )
+diff --git a/src/ops/linear_topk/two_level_head.cu b/src/ops/linear_topk/two_level_head.cu
+new file mode 100644
+index 0000000..c92c22c
+--- /dev/null
++++ b/src/ops/linear_topk/two_level_head.cu
+@@ -0,0 +1,153 @@
++// Two-level verify head: Q4 copy of the Q8 vocabulary head and exact Q8 rescoring of candidates.
++
++#include "core/weight.h"
++#include "ninfer/ops/linear_topk.h"
++
++#include "core/device.h"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops {
++namespace {
++
++constexpr int kHidden   = 5120;
++constexpr int kQ8Groups = kHidden / 32;
++constexpr int kQ4Groups = kHidden / 64;
++constexpr int kTop      = 16;
++
++// One thread per (row, Q4 group): the two Q8 groups' values, the canonical absmax/7 FP16 scale,
++// round-to-nearest codes clamped to [-8,7], two's-complement nibbles packed low nibble first.
++__global__ void requant_q8_to_q4_kernel(const std::int8_t* __restrict__ q8_codes,
++                                        const __half* __restrict__ q8_scales,
++                                        std::uint8_t* __restrict__ q4_codes,
++                                        __half* __restrict__ q4_scales, std::int32_t rows) {
++    const std::int64_t index =
++        static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= static_cast<std::int64_t>(rows) * kQ4Groups) { return; }
++    const std::int64_t row = index / kQ4Groups;
++    const int group        = static_cast<int>(index % kQ4Groups);
++    const std::int8_t* src = q8_codes + row * kHidden + group * 64;
++    const float s0         = __half2float(q8_scales[row * kQ8Groups + 2 * group]);
++    const float s1         = __half2float(q8_scales[row * kQ8Groups + 2 * group + 1]);
++    float absmax           = 0.0f;
++    for (int i = 0; i < 64; ++i) {
++        absmax = fmaxf(absmax, fabsf(static_cast<float>(src[i]) * (i < 32 ? s0 : s1)));
++    }
++    __half scale = __float2half_rn(absmax / 7.0f);
++    if (__half2float(scale) == 0.0f && absmax > 0.0f) { scale = __ushort_as_half(1); }
++    const float s       = __half2float(scale);
++    const float inverse = s > 0.0f ? 1.0f / s : 0.0f;
++    std::uint8_t* dst   = q4_codes + row * (kHidden / 2) + group * 32;
++    for (int i = 0; i < 32; ++i) {
++        const float v0 = static_cast<float>(src[2 * i]) * (2 * i < 32 ? s0 : s1);
++        const float v1 = static_cast<float>(src[2 * i + 1]) * (2 * i + 1 < 32 ? s0 : s1);
++        const int c0   = max(-8, min(7, __float2int_rn(v0 * inverse)));
++        const int c1   = max(-8, min(7, __float2int_rn(v1 * inverse)));
++        dst[i]         = static_cast<std::uint8_t>((c0 & 15) | ((c1 & 15) << 4));
++    }
++    q4_scales[row * kQ4Groups + group] = scale;
++}
++
++// One CTA per column, one warp per candidate.
++__global__ void rescore_argmax_kernel(const __nv_bfloat16* __restrict__ hidden,
++                                      std::int64_t hidden_ld,
++                                      const std::int8_t* __restrict__ q8_codes,
++                                      const __half* __restrict__ q8_scales,
++                                      const std::int32_t* __restrict__ candidate_ids,
++                                      std::int32_t* __restrict__ tokens) {
++    __shared__ float score[kTop];
++    __shared__ int ids[kTop];
++    const int column = static_cast<int>(blockIdx.x);
++    const int warp   = static_cast<int>(threadIdx.x) >> 5;
++    const int lane   = static_cast<int>(threadIdx.x) & 31;
++    const int id     = candidate_ids[column * kTop + warp];
++    const std::int8_t* row      = q8_codes + static_cast<std::int64_t>(id) * kHidden;
++    const __half* row_scales    = q8_scales + static_cast<std::int64_t>(id) * kQ8Groups;
++    const __nv_bfloat16* x      = hidden + column * hidden_ld;
++    float acc                   = 0.0f;
++    for (int g = lane; g < kQ8Groups; g += 32) {
++        const int4* codes = reinterpret_cast<const int4*>(row + g * 32);
++        const int4* acts  = reinterpret_cast<const int4*>(x + g * 32);
++        float part        = 0.0f;
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const int4 c          = codes[h];
++            const std::int8_t* cb = reinterpret_cast<const std::int8_t*>(&c);
++#pragma unroll
++            for (int q = 0; q < 2; ++q) {
++                const int4 a              = acts[2 * h + q];
++                const __nv_bfloat16* ab   = reinterpret_cast<const __nv_bfloat16*>(&a);
++#pragma unroll
++                for (int e = 0; e < 8; ++e) {
++                    part = fmaf(static_cast<float>(cb[8 * q + e]), __bfloat162float(ab[e]), part);
++                }
++            }
++        }
++        acc = fmaf(part, __half2float(row_scales[g]), acc);
++    }
++#pragma unroll
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        acc += __shfl_xor_sync(0xffffffffu, acc, offset);
++    }
++    if (lane == 0) {
++        score[warp] = __bfloat162float(__float2bfloat16(acc));
++        ids[warp]   = id;
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float best  = score[0];
++        int best_id = ids[0];
++        for (int i = 1; i < kTop; ++i) {
++            if (score[i] > best || (score[i] == best && ids[i] < best_id)) {
++                best    = score[i];
++                best_id = ids[i];
++            }
++        }
++        tokens[column] = best_id;
++    }
++}
++
++void require_q8_head(const Weight& head) {
++    if (head.qtype != QType::Q8_G32_FP16 || head.layout != QuantLayout::RowSplit ||
++        head.n != 248320 || head.k != kHidden || head.padded_shape[1] != kHidden ||
++        head.qdata == nullptr || head.scales == nullptr) {
++        throw std::invalid_argument("two-level head: requires the Q8 [248320,5120] row-split head");
++    }
++}
++
++} // namespace
++
++void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_scales,
++                               cudaStream_t stream) {
++    require_q8_head(q8_head);
++    const std::int64_t threads = static_cast<std::int64_t>(q8_head.n) * kQ4Groups;
++    requant_q8_to_q4_kernel<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
++        static_cast<const std::int8_t*>(q8_head.qdata),
++        static_cast<const __half*>(q8_head.scales), static_cast<std::uint8_t*>(q4_codes),
++        static_cast<__half*>(q4_scales), q8_head.n);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void two_level_head_rescore(const Tensor& hidden, const Weight& q8_head,
++                            const Tensor& candidate_ids, Tensor& tokens, cudaStream_t stream) {
++    require_q8_head(q8_head);
++    const std::int32_t columns = hidden.ne[1];
++    if (hidden.dtype != DType::BF16 || hidden.ne[0] != kHidden || candidate_ids.ne[0] != kTop ||
++        candidate_ids.ne[1] != columns || tokens.ne[0] != columns) {
++        throw std::invalid_argument("two-level head rescore: invalid tensors");
++    }
++    rescore_argmax_kernel<<<columns, 32 * kTop, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(hidden.data),
++        static_cast<std::int64_t>(hidden.nb[1] / sizeof(__nv_bfloat16)),
++        static_cast<const std::int8_t*>(q8_head.qdata),
++        static_cast<const __half*>(q8_head.scales),
++        static_cast<const std::int32_t*>(candidate_ids.data),
++        static_cast<std::int32_t*>(tokens.data));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+-- 
+2.34.1
+

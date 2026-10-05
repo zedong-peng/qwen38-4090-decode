@@ -1,0 +1,1105 @@
+From a27474e3cffff655d46b7236587f707f03235edb Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 08:18:23 +0800
+Subject: [PATCH 09/49] Research hooks: drafter fake-quant and dumps, Q5
+ drafter routes, LS8 group scales
+
+- NINFER_DRAFT_FAKEQ=B: requantize the Q8 drafter projections in place onto a B-bit G64 grid
+  (q8_fake_requantize_inplace), to measure drafter precision before writing kernels.
+- NINFER_DRAFT_DUMP=DIR: append the BF16 inputs of each drafter projection (eager mode only) for
+  drafter GPTQ calibration.
+- Q5 G64 Ada small-T routes for the drafter MLP gate/up (paired SwiGLU) and the down / attention
+  output projections (dynamic grouped conv add, T <= 16).
+- NINFER_LS8=1: per-row FP32 super-scale plus one byte per group (scale = super * 2^(-j/32)) for the
+  row-split Q4/Q5 small-T routes; the container format is unchanged.
+---
+ include/ninfer/ops/linear_topk.h              |  4 +
+ include/ninfer/ops/ls8_scales.h               | 16 ++++
+ src/core/weight.h                             |  3 +
+ src/models/qwen3_5/execution/draft.cpp        | 44 +++++++++
+ src/models/qwen3_5/execution/parameters.cpp   | 89 +++++++++++++++++++
+ .../q4_q5/q4_q5_attn_input_small_t.cu         | 11 +--
+ .../q5/q5_dynamic_grouped_conv_add.cu         | 89 +++++++++++++++++++
+ .../q5/q5_dynamic_grouped_conv_add.h          | 25 ++++++
+ src/ops/dynamic_grouped_conv/sources.cmake    |  1 +
+ .../q4_q5/q4_q5_gdn_input_independent.cu      | 14 +--
+ src/ops/linear/ada_small_t_mma.cuh            | 69 +++++++++++---
+ src/ops/linear/ls8_scales.cu                  | 54 +++++++++++
+ src/ops/linear/sources.cmake                  |  1 +
+ src/ops/linear_add/q4/q4_linear_add.cu        |  3 +-
+ .../q5/q5_linear_add_ada_small_t.cu           |  7 +-
+ .../q4/q4_linear_swiglu_ada_small_t.cu        |  7 +-
+ .../q5/q5_linear_swiglu_ada_small_t.cu        | 69 ++++++++++++++
+ .../q5/q5_linear_swiglu_kernels.h             | 14 +++
+ src/ops/linear_swiglu/sources.cmake           |  1 +
+ src/ops/linear_topk/two_level_head.cu         | 48 ++++++++++
+ src/ops/wrapper/dynamic_grouped_conv.cpp      | 20 ++++-
+ src/ops/wrapper/linear_swiglu.cpp             | 14 +++
+ 22 files changed, 566 insertions(+), 37 deletions(-)
+ create mode 100644 include/ninfer/ops/ls8_scales.h
+ create mode 100644 src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.cu
+ create mode 100644 src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.h
+ create mode 100644 src/ops/linear/ls8_scales.cu
+ create mode 100644 src/ops/linear_swiglu/q5/q5_linear_swiglu_ada_small_t.cu
+ create mode 100644 src/ops/linear_swiglu/q5/q5_linear_swiglu_kernels.h
+
+diff --git a/include/ninfer/ops/linear_topk.h b/include/ninfer/ops/linear_topk.h
+index 9ae3c4c..a70b2ba 100644
+--- a/include/ninfer/ops/linear_topk.h
++++ b/include/ninfer/ops/linear_topk.h
+@@ -68,6 +68,10 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
+  * Q8 values, and rescoring of linear_topk candidates with exact Q8 logits: tokens[t] is the
+  * candidate with the largest BF16-rounded Q8 logit, the lowest id on ties.
+  */
++// Research: requantize a Q8 G32 row-split weight in place onto a BITS-bit G64 grid (see
++// NINFER_DRAFT_FAKEQ). The weight keeps its Q8 storage; every value becomes c*s with |c| <= 2^(BITS-1)-1.
++void q8_fake_requantize_inplace(const Weight& q8, int bits, cudaStream_t stream);
++
+ void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_scales,
+                                cudaStream_t stream);
+ void two_level_head_rescore(const Tensor& hidden, const Weight& q8_head,
+diff --git a/include/ninfer/ops/ls8_scales.h b/include/ninfer/ops/ls8_scales.h
+new file mode 100644
+index 0000000..d5cbdfe
+--- /dev/null
++++ b/include/ninfer/ops/ls8_scales.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "core/weight.h"
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++
++namespace ninfer::ops {
++
++// Research (NINFER_LS8): bytes of the LS8 scale plane of w (one per 64-weight group).
++std::size_t ls8_bytes(const Weight& w);
++// Fill `bytes` (ls8_bytes(w)) and `super` (w.n floats) from w's FP16 group scales.
++void ls8_transcode(const Weight& w, void* bytes, float* super, cudaStream_t stream);
++
++} // namespace ninfer::ops
+diff --git a/src/core/weight.h b/src/core/weight.h
+index 9d68447..4424b49 100644
+--- a/src/core/weight.h
++++ b/src/core/weight.h
+@@ -46,6 +46,9 @@ struct Weight {
+     std::int32_t scale_ne[4]   = {1, 1, 1, 1};
+     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
+     float weight_scale_divisor = 0.0F;
++    // Research (NINFER_LS8): optional 8-bit log group scales for the Ada small-T routes.
++    const void* scales_ls8     = nullptr;
++    const float* scale_super   = nullptr;
+     float input_scale_divisor  = 0.0F;
+ };
+ 
+diff --git a/src/models/qwen3_5/execution/draft.cpp b/src/models/qwen3_5/execution/draft.cpp
+index 7fc7759..841c9da 100644
+--- a/src/models/qwen3_5/execution/draft.cpp
++++ b/src/models/qwen3_5/execution/draft.cpp
+@@ -9,6 +9,7 @@
+ #include "models/qwen3_5/program/context.h"
+ #include "models/qwen3_5/execution/workspace.h"
+ 
++#include "core/device.h"
+ #include "core/nvtx.h"
+ #include "ninfer/ops/argmax.h"
+ #include "ninfer/ops/dynamic_grouped_conv.h"
+@@ -36,6 +37,11 @@
+ 
+ #include <cuda_runtime.h>
+ 
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++#include <vector>
++
+ #include <array>
+ #include <cstddef>
+ #include <stdexcept>
+@@ -44,6 +50,33 @@
+ namespace ninfer::models::qwen3_5::execution {
+ namespace {
+ 
++// Research: NINFER_DRAFT_DUMP=DIR appends a BF16 [K, columns] input (K contiguous) to DIR/NAME.bf16.
++void research_dump(const std::string& name, const Tensor& x, cudaStream_t stream) {
++    static const char* dir = std::getenv("NINFER_DRAFT_DUMP");
++    if (dir == nullptr || *dir == 0) { return; }
++    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
++    if (capture != cudaStreamCaptureStatusNone) {
++        throw std::runtime_error("NINFER_DRAFT_DUMP requires --no-cuda-graph");
++    }
++    const std::int64_t k = x.ne[0];
++    std::int64_t columns = x.ne[1];
++    if (x.dtype != DType::BF16 || x.nb[0] != 2) { throw std::runtime_error("draft dump: BF16 only"); }
++    if (x.ne[2] > 1) {
++        if (x.nb[2] != x.nb[1] * x.ne[1]) { throw std::runtime_error("draft dump: strided batch"); }
++        columns *= x.ne[2];
++    }
++    std::vector<std::uint16_t> host(static_cast<std::size_t>(k * columns));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy2D(host.data(), k * 2, x.data, x.nb[1], k * 2, columns,
++                            cudaMemcpyDeviceToHost));
++    std::FILE* f = std::fopen((std::string(dir) + "/" + name + ".bf16").c_str(), "ab");
++    if (f == nullptr) { throw std::runtime_error("draft dump: cannot open " + name); }
++    std::fwrite(host.data(), 2, host.size(), f);
++    std::fclose(f);
++}
++
++
+ inline constexpr std::size_t kVerifyTreeMaxAttentionLayers = 16;
+ 
+ using detail::DFlashPersistentState;
+@@ -153,6 +186,11 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
+                                                               projected_width * batch);
+         Tensor projected          = roots.projected;
+         Tensor context            = roots.normalized;
++        research_dump("fc",
++                      input.view({dimension(target.hidden_size *
++                                            std::uint64_t(config.target_layer_ids.size())),
++                                  projected_width * batch}),
++                      state.execution.device.stream);
+         project(input.view(
+                     {dimension(target.hidden_size * std::uint64_t(config.target_layer_ids.size())),
+                      projected_width * batch}),
+@@ -333,6 +371,9 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
+                     static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
+                     state.dflash.local_layer(static_cast<std::uint32_t>(layer_index)),
+                     envelopes.local, work, attention, stream);
++                research_dump("L" + std::to_string(layer_index) + ".o",
++                              attention.view({dimension(config.attention.query_width()), columns}),
++                              stream);
+                 finish_dynamic_branch(
+                     state.execution,
+                     attention.view({dimension(config.attention.query_width()), width, batch}),
+@@ -347,8 +388,11 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
+                     work.alloc(DType::BF16, {dimension(config.intermediate_size), width, batch});
+                 Tensor intermediate_flat =
+                     intermediate.view({dimension(config.intermediate_size), columns});
++                research_dump("L" + std::to_string(layer_index) + ".mlp",
++                              branch.prepared.view({dimension(target.hidden_size), columns}), stream);
+                 project_swiglu(branch.prepared.view({dimension(target.hidden_size), columns}),
+                                layer.mlp.gate_up, intermediate_flat, work, stream);
++                research_dump("L" + std::to_string(layer_index) + ".down", intermediate_flat, stream);
+                 finish_dynamic_branch(state.execution, intermediate, layer.mlp.down,
+                                       *layer.mlp_conv, branch.finish_delta, residual);
+             }
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index c718ca8..3146114 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -1,6 +1,12 @@
+ #include "models/qwen3_5/execution/parameters.h"
+ 
+ #include "core/weight_view.h"
++#include "core/device.h"
++#include "ninfer/ops/linear_topk.h"
++#include "ninfer/ops/ls8_scales.h"
++
++#include <cstdio>
++#include <cstdlib>
+ 
+ #include <limits>
+ #include <stdexcept>
+@@ -257,6 +263,43 @@ private:
+ 
+ } // namespace
+ 
++namespace {
++
++// Research: NINFER_LS8=1 attaches LS8 scale planes (ops::ls8_transcode) to row-split Q4/Q5 G64
++// weights. Device memory lives for the process.
++struct Ls8Pass {
++    std::size_t bytes = 0;
++    int weights       = 0;
++    void operator()(Weight& w) {
++        if ((w.qtype != QType::Q4_G64_FP16 && w.qtype != QType::Q5_G64_FP16) ||
++            w.layout != QuantLayout::RowSplit || w.scale_dtype != DType::FP16 || w.scales == nullptr ||
++            w.k % 64 != 0) {
++            return;
++        }
++        const std::size_t plane = ops::ls8_bytes(w);
++        void* memory            = nullptr;
++        CUDA_CHECK(cudaMalloc(&memory, plane + sizeof(float) * static_cast<std::size_t>(w.n) + 256));
++        auto* super = reinterpret_cast<float*>(
++            (reinterpret_cast<std::uintptr_t>(memory) + plane + 255) & ~std::uintptr_t(255));
++        ops::ls8_transcode(w, memory, super, nullptr);
++        w.scales_ls8  = memory;
++        w.scale_super = super;
++        bytes += plane + sizeof(float) * static_cast<std::size_t>(w.n);
++        ++weights;
++    }
++    void operator()(ops::ProjectionWeights& p) {
++        if (auto* single = std::get_if<ops::SingleProjectionWeight>(&p)) {
++            (*this)(single->weight);
++        } else {
++            auto& paired = std::get<ops::PairedProjectionWeights>(p);
++            (*this)(paired.first);
++            (*this)(paired.second);
++        }
++    }
++};
++
++} // namespace
++
+ Parameters::Parameters(const Model& source) : model(source) {
+     const Prepare prepare(model);
+     const auto& w        = model.weights();
+@@ -277,6 +320,52 @@ Parameters::Parameters(const Model& source) : model(source) {
+     if (w.draft) {
+         draft = with_context(std::string(model.options().speculative_component()),
+                              [&] { return prepare.draft(*w.draft); });
++        // Research: NINFER_DRAFT_FAKEQ=B puts the drafter's Q8 projections on a B-bit G64 grid.
++        if (const char* fake = std::getenv("NINFER_DRAFT_FAKEQ"); fake != nullptr && *fake) {
++            const int bits = std::atoi(fake);
++            int count      = 0;
++            const auto apply = [&](const LinearParameters& p) {
++                if (p.weight.qtype == QType::Q8_G32_FP16) {
++                    ops::q8_fake_requantize_inplace(p.weight, bits, nullptr);
++                    ++count;
++                }
++            };
++            apply(draft->feature_projection);
++            for (const auto& layer : draft->layers) {
++                apply(layer.output);
++                apply(layer.mlp.gate_up);
++                apply(layer.mlp.down);
++            }
++            CUDA_CHECK(cudaDeviceSynchronize());
++            std::fprintf(stderr, "drafter fake-quant: %d Q8 projections on a %d-bit G64 grid\n", count,
++                         bits);
++        }
++    }
++    if (const char* ls8 = std::getenv("NINFER_LS8"); ls8 != nullptr && std::atoi(ls8) == 1) {
++        Ls8Pass pass;
++        for (auto& block : text.layers) {
++            if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
++                pass(attention->projection);
++                pass(attention->output.weight);
++            } else {
++                auto& gdn = std::get<GdnParameters>(block.mixer);
++                pass(gdn.projection);
++                pass(gdn.output.weight);
++            }
++            if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
++                pass(dense->gate_up.weight);
++                pass(dense->down.weight);
++            }
++        }
++        if (draft) {
++            for (auto& layer : draft->layers) {
++                pass(layer.mlp.gate_up.weight);
++                pass(layer.mlp.down.weight);
++            }
++        }
++        CUDA_CHECK(cudaDeviceSynchronize());
++        std::fprintf(stderr, "LS8 scales: %d weights, %.1f MiB of scale planes\n", pass.weights,
++                     static_cast<double>(pass.bytes) / (1 << 20));
+     }
+     if (w.proposal) {
+         proposal =
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+index 4c39d24..297bc4a 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+@@ -207,17 +207,18 @@ void launch_q5_ada(const Tensor& x, const Weight& weight, Tensor& gate, Tensor&
+     const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+     const auto* code = static_cast<const std::uint8_t*>(weight.qdata);
+     const auto* hi   = static_cast<const std::uint8_t*>(weight.qhigh);
+-    const auto* sc   = static_cast<const std::uint8_t*>(weight.scales);
++    const auto* sc   = ada_scales(weight);
++    const float* sup = ada_super(weight);
+     if (x.ne[1] <= 8) {
+         using S = Q5AdaSmallTSchedule<RowTiles, Warps, 1, G, Stages>;
+         static_assert(kParentRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden>(xp, x_ld, code, hi, sc, kParentRows, x.ne[1],
+-                                              epilogue, stream);
++                                              epilogue, stream, sup);
+     } else {
+         using S = Q5AdaSmallTSchedule<RowTiles, Warps, 2, G, Stages>;
+         static_assert(kParentRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden>(xp, x_ld, code, hi, sc, kParentRows, x.ne[1],
+-                                              epilogue, stream);
++                                              epilogue, stream, sup);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+@@ -286,11 +287,11 @@ void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
+         AdaSmallTOperand<AttnGateValueEpilogue>{
+             static_cast<const std::uint8_t*>(gate_value_weight.qdata),
+             GateQ4 ? nullptr : static_cast<const std::uint8_t*>(gate_value_weight.qhigh),
+-            static_cast<const std::uint8_t*>(gate_value_weight.scales), gate_value_epilogue},
++            ada_scales(gate_value_weight), gate_value_epilogue, ada_super(gate_value_weight)},
+         kParentRows,
+         AdaSmallTOperand<AttnQueryKeyEpilogue>{
+             static_cast<const std::uint8_t*>(query_key_weight.qdata), nullptr,
+-            static_cast<const std::uint8_t*>(query_key_weight.scales), query_key_epilogue},
++            ada_scales(query_key_weight), query_key_epilogue, ada_super(query_key_weight)},
+         kParentRows, stream);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.cu b/src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.cu
+new file mode 100644
+index 0000000..6bfad4c
+--- /dev/null
++++ b/src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.cu
+@@ -0,0 +1,89 @@
++#include "ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.h"
++
++#include "core/device.h"
++#include "ops/dynamic_grouped_conv/dynamic_grouped_conv_add_finish.h"
++#include "ops/linear/ada_small_t_mma.cuh"
++
++#include <cuda_bf16.h>
++
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++
++constexpr int kRows       = 5120;
++constexpr int kMaxColumns = 16;
++
++struct StoreEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* out;
++
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        out[static_cast<std::int64_t>(token) * kRows + row] = __float2bfloat16_rn(value);
++    }
++};
++
++template <int K>
++void project(const Tensor& x, const Weight& w, __nv_bfloat16* projected, int columns,
++             cudaStream_t stream) {
++    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
++    const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
++    const auto* code = static_cast<const std::uint8_t*>(w.qdata);
++    const auto* hi   = static_cast<const std::uint8_t*>(w.qhigh);
++    const auto* sc   = ada_scales(w);
++    const float* sup = ada_super(w);
++    const StoreEpilogue epilogue{projected};
++    if (columns <= 8) {
++        using S = Q5AdaSmallTSchedule<5, 8, 1, 8, 2>;
++        static_assert(kRows % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, K>(xp, x_ld, code, hi, sc, kRows, columns, epilogue, stream, sup);
++    } else {
++        using S = Q5AdaSmallTSchedule<5, 8, 2, 8, 2>;
++        ada_small_t_mma_launch<S, K>(xp, x_ld, code, hi, sc, kRows, columns, epilogue, stream, sup);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void check_profile(std::int32_t input_rows, std::int32_t columns) {
++    if (input_rows != 4096 && input_rows != 17408) {
++        throw std::invalid_argument("q5 linear dynamic grouped conv add: C must be 4096 or 17408");
++    }
++    if (columns < 1 || columns > kMaxColumns) {
++        throw std::invalid_argument("q5 linear dynamic grouped conv add: W*B must be <= 16");
++    }
++}
++
++} // namespace
++
++std::size_t q5_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
++    std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
++    std::int32_t min_batch, std::int32_t max_batch) {
++    if (min_width < 2 || min_width > max_width || min_batch < 1 || min_batch > max_batch) {
++        throw std::invalid_argument("q5 linear dynamic grouped conv add workspace: invalid W/B");
++    }
++    check_profile(input_rows, max_width * max_batch);
++    return static_cast<std::size_t>(kRows) * max_width * max_batch * sizeof(__nv_bfloat16);
++}
++
++void q5_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& weight,
++                                                 const Tensor& base_kernel,
++                                                 const Tensor& finish_delta, Tensor& residual,
++                                                 WorkspaceArena& workspace, cudaStream_t stream) {
++    const int tokens = x.ne[1] * x.ne[2];
++    check_profile(x.ne[0], tokens);
++    auto scope               = workspace.scope();
++    const DeviceSpan storage = workspace.alloc_bytes(static_cast<std::size_t>(kRows) * tokens *
++                                                     sizeof(__nv_bfloat16));
++    auto* projected = static_cast<__nv_bfloat16*>(storage.data);
++    if (x.ne[0] == 4096) {
++        project<4096>(x, weight, projected, tokens, stream);
++    } else {
++        project<17408>(x, weight, projected, tokens, stream);
++    }
++    Tensor out(storage.data, DType::BF16, {kRows, tokens});
++    dynamic_grouped_conv_add_finish_launch(out, base_kernel, finish_delta, residual, x.ne[1],
++                                           tokens, stream);
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.h b/src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.h
+new file mode 100644
+index 0000000..ae40dab
+--- /dev/null
++++ b/src/ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include "core/arena.h"
++#include "core/tensor.h"
++#include "core/weight.h"
++
++#include <cuda_runtime.h>
++
++#include <cstddef>
++#include <cstdint>
++
++namespace ninfer::ops::detail {
++
++// Q5 G64 projection [5120, C] (C = 4096 or 17408) for W*B <= 16 columns: Ada small-T into a BF16
++// projection, then the shared two-tap finish.
++std::size_t q5_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
++    std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
++    std::int32_t min_batch_size, std::int32_t max_batch_size);
++
++void q5_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& projection_weight,
++                                                 const Tensor& base_kernel,
++                                                 const Tensor& finish_delta, Tensor& residual,
++                                                 WorkspaceArena& workspace, cudaStream_t stream);
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/dynamic_grouped_conv/sources.cmake b/src/ops/dynamic_grouped_conv/sources.cmake
+index 6993516..1780cb5 100644
+--- a/src/ops/dynamic_grouped_conv/sources.cmake
++++ b/src/ops/dynamic_grouped_conv/sources.cmake
+@@ -7,6 +7,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv_add_finish.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_dynamic_grouped_conv_add.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/q5/q5_dynamic_grouped_conv_add.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dynamic_grouped_conv_add_materialized.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dynamic_grouped_conv_add_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/dynamic_grouped_conv.cpp"
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+index c23dec8..d66894a 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+@@ -155,17 +155,18 @@ void launch_q5_ada(const Tensor& x, const Weight& weight, Tensor& value, Tensor&
+     const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+     const auto* code = static_cast<const std::uint8_t*>(weight.qdata);
+     const auto* hi   = static_cast<const std::uint8_t*>(weight.qhigh);
+-    const auto* sc   = static_cast<const std::uint8_t*>(weight.scales);
++    const auto* sc   = ada_scales(weight);
++    const float* sup = ada_super(weight);
+     if (x.ne[1] <= 8) {
+         using S = Q5AdaSmallTSchedule<RowTiles, Warps, 1, G, Stages>;
+         static_assert(kValueZRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden>(xp, x_ld, code, hi, sc, kValueZRows, x.ne[1],
+-                                              epilogue, stream);
++                                              epilogue, stream, sup);
+     } else {
+         using S = Q5AdaSmallTSchedule<RowTiles, Warps, 2, G, Stages>;
+         static_assert(kValueZRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden>(xp, x_ld, code, hi, sc, kValueZRows, x.ne[1],
+-                                              epilogue, stream);
++                                              epilogue, stream, sup);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+@@ -280,12 +281,11 @@ void launch_dual_ada(const Tensor& x, const Weight& qk_weight, const Weight& val
+                                             ValueQ4 ? nullptr
+                                                     : static_cast<const std::uint8_t*>(
+                                                           value_z_weight.qhigh),
+-                                            static_cast<const std::uint8_t*>(value_z_weight.scales),
+-                                            value_z_epilogue},
++                                            ada_scales(value_z_weight), value_z_epilogue,
++                                            ada_super(value_z_weight)},
+         kValueZRows,
+         AdaSmallTOperand<GdnQkEpilogue>{static_cast<const std::uint8_t*>(qk_weight.qdata), nullptr,
+-                                        static_cast<const std::uint8_t*>(qk_weight.scales),
+-                                        qk_epilogue},
++                                        ada_scales(qk_weight), qk_epilogue, ada_super(qk_weight)},
+         kQkRows, stream);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index 4418742..5147b62 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "core/device.h"
++#include "core/weight.h"
+ #include "ops/common/memory.cuh"
+ #include "ops/common/mma.cuh"
+ 
+@@ -12,6 +13,13 @@
+ 
+ namespace ninfer::ops::detail {
+ 
++// The scale plane an Ada small-T launch should read for w: LS8 bytes when present, else FP16.
++inline const std::uint8_t* ada_scales(const Weight& w) {
++    return static_cast<const std::uint8_t*>(w.scales_ls8 != nullptr ? w.scales_ls8 : w.scales);
++}
++inline const float* ada_super(const Weight& w) { return w.scales_ls8 != nullptr ? w.scale_super : nullptr; }
++
++
+ // Single-pass small-T groupwise GEMM for Ada: out^T[T x N] = x^T[T x K] * W^T[K x N] on
+ // mma.m16n8k16 with tokens as M (zero-padded to 16) and eight weight rows as N, for the row-split
+ // Q4_G64_FP16 and Q5_G64_FP16 layouts (32 code bytes per 64-weight group, weight k in byte k / 2,
+@@ -115,11 +123,14 @@ __device__ __forceinline__ unsigned q4_ada_decode_pair(unsigned byte) {
+ // Epilogue::kPairedHalves == false: epilogue(weight_row, token, dot) for every CTA row and live
+ // token. true: epilogue(output_row, token, gate_dot, up_dot) for the CTA's AdaPairedHalfRows pairs.
+ // One CTA's work; `block` is the CTA index within this problem's grid.
++// super != nullptr (LS8): `scales` holds one byte j per group, the group scale is 2^(-j/32) and the
++// row's FP32 super-scale multiplies the reduced dot product.
+ template <class S, int K, class RowMap, class Epilogue>
+ __device__ __forceinline__ void ada_small_t_mma_cta(
+     const __nv_bfloat16* __restrict__ x, std::int32_t x_ld, const std::uint8_t* __restrict__ codes,
+     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+-    std::int32_t tokens, const Epilogue& epilogue, int block) {
++    std::int32_t tokens, const Epilogue& epilogue, int block,
++    const float* __restrict__ super = nullptr) {
+     constexpr int kGroupK = 64;
+     static_assert(K % (kGroupK * S::kG) == 0);
+     constexpr int kGroups     = K / kGroupK;
+@@ -172,7 +183,19 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+                        high + (src_row * kGroups + g0) * 8 + 16 * c);
+             }
+         }
+-        if constexpr (S::kG == 4) {
++        if (super != nullptr) {
++            for (int row = tid; row < kRows; row += S::kThreads) {
++                const std::int64_t src_row = RowMap::weight_row(block, row, kRows);
++                const std::uint8_t* src    = scales + src_row * kGroups + g0;
++                if constexpr (S::kG == 4) {
++                    cp_async<4>(scale_dst + row * S::kScaleStride, src);
++                } else if constexpr (S::kG == 8) {
++                    cp_async<8>(scale_dst + row * S::kScaleStride, src);
++                } else {
++                    fill16(scale_dst + row * S::kScaleStride, src);
++                }
++            }
++        } else if constexpr (S::kG == 4) {
+             for (int row = tid; row < kRows; row += S::kThreads) {
+                 const std::int64_t src_row = RowMap::weight_row(block, row, kRows);
+                 cp_async<8>(scale_dst + row * S::kScaleStride,
+@@ -261,10 +284,17 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+                              a_hi[2 * s + 1], b0, b1);
+                 }
+                 const int srow = 8 * r + 2 * q;
+-                const float s0 = __half2float(
+-                    *reinterpret_cast<const __half*>(scale_s + srow * S::kScaleStride + 2 * gi));
+-                const float s1 = __half2float(*reinterpret_cast<const __half*>(
+-                    scale_s + (srow + 1) * S::kScaleStride + 2 * gi));
++                float s0, s1;
++                if (super != nullptr) {
++                    s0 = exp2f(-0.03125f * static_cast<float>(scale_s[srow * S::kScaleStride + gi]));
++                    s1 = exp2f(-0.03125f *
++                               static_cast<float>(scale_s[(srow + 1) * S::kScaleStride + gi]));
++                } else {
++                    s0 = __half2float(
++                        *reinterpret_cast<const __half*>(scale_s + srow * S::kScaleStride + 2 * gi));
++                    s1 = __half2float(*reinterpret_cast<const __half*>(
++                        scale_s + (srow + 1) * S::kScaleStride + 2 * gi));
++                }
+                 acc[r][0] = fmaf(s0, d0, acc[r][0]);
+                 acc[r][1] = fmaf(s1, d1, acc[r][1]);
+                 acc[r][2] = fmaf(s0, d2, acc[r][2]);
+@@ -323,14 +353,22 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+             const int row   = index % kHalf;
+             const int token = index / kHalf;
+             if (token >= tokens) { continue; }
+-            epilogue(block * kHalf + row, token, reduce(row, token), reduce(row + kHalf, token));
++            float gate = reduce(row, token), up = reduce(row + kHalf, token);
++            if (super != nullptr) {
++                gate *= super[RowMap::weight_row(block, row, kRows)];
++                up *= super[RowMap::weight_row(block, row + kHalf, kRows)];
++            }
++            epilogue(block * kHalf + row, token, gate, up);
+         }
+     } else {
+         for (int index = tid; index < kRows * S::kMaxTokens; index += S::kThreads) {
+             const int row   = index % kRows;
+             const int token = index / kRows;
+             if (token >= tokens) { continue; }
+-            epilogue(RowMap::weight_row(block, row, kRows), token, reduce(row, token));
++            const int weight_row = RowMap::weight_row(block, row, kRows);
++            float value          = reduce(row, token);
++            if (super != nullptr) { value *= super[weight_row]; }
++            epilogue(weight_row, token, value);
+         }
+     }
+ }
+@@ -339,9 +377,9 @@ template <class S, int K, class RowMap, class Epilogue>
+ __launch_bounds__(S::kThreads) __global__ void ada_small_t_mma_kernel(
+     const __nv_bfloat16* __restrict__ x, std::int32_t x_ld, const std::uint8_t* __restrict__ codes,
+     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+-    std::int32_t tokens, Epilogue epilogue) {
++    std::int32_t tokens, Epilogue epilogue, const float* __restrict__ super) {
+     ada_small_t_mma_cta<S, K, RowMap>(x, x_ld, codes, high, scales, tokens, epilogue,
+-                                      static_cast<int>(blockIdx.x));
++                                      static_cast<int>(blockIdx.x), super);
+ }
+ 
+ // One weight matrix of a dual launch.
+@@ -351,6 +389,7 @@ struct AdaSmallTOperand {
+     const std::uint8_t* high;
+     const std::uint8_t* scales;
+     Epilogue epilogue;
++    const float* super = nullptr;  // LS8 (see ada_small_t_mma_cta)
+ };
+ 
+ // Two independent problems over the same x in one grid: CTAs [0, blocks_a) run A, the rest run B,
+@@ -365,10 +404,10 @@ __launch_bounds__(SA::kThreads) __global__ void ada_small_t_mma_dual_kernel(
+     const int block = static_cast<int>(blockIdx.x);
+     if (block < blocks_a) {
+         ada_small_t_mma_cta<SA, KA, MapA>(x, x_ld, a.codes, a.high, a.scales, tokens, a.epilogue,
+-                                          block);
++                                          block, a.super);
+     } else {
+         ada_small_t_mma_cta<SB, KB, MapB>(x, x_ld, b.codes, b.high, b.scales, tokens, b.epilogue,
+-                                          block - blocks_a);
++                                          block - blocks_a, b.super);
+     }
+ }
+ 
+@@ -376,7 +415,8 @@ __launch_bounds__(SA::kThreads) __global__ void ada_small_t_mma_dual_kernel(
+ template <class S, int K, class RowMap = AdaContiguousRows, class Epilogue>
+ void ada_small_t_mma_launch(const __nv_bfloat16* x, std::int32_t x_ld, const std::uint8_t* codes,
+                             const std::uint8_t* high, const std::uint8_t* scales, std::int32_t rows,
+-                            std::int32_t tokens, Epilogue epilogue, cudaStream_t stream) {
++                            std::int32_t tokens, Epilogue epilogue, cudaStream_t stream,
++                            const float* super = nullptr) {
+     static const bool configured = [] {
+         CUDA_CHECK(cudaFuncSetAttribute(ada_small_t_mma_kernel<S, K, RowMap, Epilogue>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+@@ -386,7 +426,8 @@ void ada_small_t_mma_launch(const __nv_bfloat16* x, std::int32_t x_ld, const std
+     (void)configured;
+     ada_small_t_mma_kernel<S, K, RowMap, Epilogue>
+         <<<rows / S::kRowsPerCta, S::kThreads, S::kSmemBytes, stream>>>(x, x_ld, codes, high,
+-                                                                        scales, tokens, epilogue);
++                                                                        scales, tokens, epilogue,
++                                                                        super);
+ }
+ 
+ // Dual launch of A (rows_a rows) and B (rows_b rows) over one x; see ada_small_t_mma_dual_kernel.
+diff --git a/src/ops/linear/ls8_scales.cu b/src/ops/linear/ls8_scales.cu
+new file mode 100644
+index 0000000..7053d71
+--- /dev/null
++++ b/src/ops/linear/ls8_scales.cu
+@@ -0,0 +1,54 @@
++// Research (NINFER_LS8): 8-bit log group scales derived from a row-split G64 FP16 scale plane.
++
++#include "ninfer/ops/ls8_scales.h"
++
++#include "core/device.h"
++
++#include <cuda_fp16.h>
++
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops {
++namespace {
++
++// One warp per row: super = the row's largest FP16 group scale; j = round(-32 log2(s / super)),
++// clamped to [0, 255] (a zero scale maps to 255; its codes are zero).
++__global__ void ls8_transcode_kernel(const __half* __restrict__ scales, std::int32_t rows,
++                                     std::int32_t groups, std::uint8_t* __restrict__ out,
++                                     float* __restrict__ super) {
++    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
++    const int lane         = threadIdx.x & 31;
++    if (row >= rows) { return; }
++    const __half* s = scales + row * groups;
++    float m         = 0.0f;
++    for (int g = lane; g < groups; g += 32) { m = fmaxf(m, __half2float(s[g])); }
++    for (int o = 16; o > 0; o >>= 1) { m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o)); }
++    if (m <= 0.0f) { m = 1.0f; }
++    for (int g = lane; g < groups; g += 32) {
++        const float v = __half2float(s[g]);
++        int j         = 255;
++        if (v > 0.0f) { j = min(255, max(0, __float2int_rn(-32.0f * log2f(v / m)))); }
++        out[row * groups + g] = static_cast<std::uint8_t>(j);
++    }
++    if (lane == 0) { super[row] = m; }
++}
++
++} // namespace
++
++std::size_t ls8_bytes(const Weight& w) {
++    return static_cast<std::size_t>(w.n) * (w.k / 64);
++}
++
++void ls8_transcode(const Weight& w, void* bytes, float* super, cudaStream_t stream) {
++    if ((w.qtype != QType::Q4_G64_FP16 && w.qtype != QType::Q5_G64_FP16) ||
++        w.layout != QuantLayout::RowSplit || w.scale_dtype != DType::FP16 || w.k % 64 != 0) {
++        throw std::invalid_argument("ls8 transcode: requires a row-split Q4/Q5 G64 FP16 weight");
++    }
++    constexpr int kWarps = 8;
++    ls8_transcode_kernel<<<static_cast<unsigned>((w.n + kWarps - 1) / kWarps), 32 * kWarps, 0, stream>>>(
++        static_cast<const __half*>(w.scales), w.n, w.k / 64, static_cast<std::uint8_t*>(bytes), super);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/linear/sources.cmake b/src/ops/linear/sources.cmake
+index b76ced6..a2e6606 100644
+--- a/src/ops/linear/sources.cmake
++++ b/src/ops/linear/sources.cmake
+@@ -1,4 +1,5 @@
+ target_sources(ninfer_ops PRIVATE
++  "${CMAKE_CURRENT_LIST_DIR}/ls8_scales.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/linear.cpp"
+ )
+ 
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index 81d91b6..6fcc87b 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -98,8 +98,7 @@ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t
+     ada_small_t_mma_launch<S, K>(static_cast<const __nv_bfloat16*>(x.data),
+                                  static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)),
+                                  static_cast<const std::uint8_t*>(w.qdata), nullptr,
+-                                 static_cast<const std::uint8_t*>(w.scales), 5120, x.ne[1],
+-                                 epilogue, stream);
++                                 ada_scales(w), 5120, x.ne[1], epilogue, stream, ada_super(w));
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+diff --git a/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu b/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu
+index 015b778..37e0e59 100644
+--- a/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu
++++ b/src/ops/linear_add/q5/q5_linear_add_ada_small_t.cu
+@@ -34,19 +34,20 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual_out, cudaStream_t
+     const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+     const auto* code = static_cast<const std::uint8_t*>(w.qdata);
+     const auto* hi   = static_cast<const std::uint8_t*>(w.qhigh);
+-    const auto* sc   = static_cast<const std::uint8_t*>(w.scales);
++    const auto* sc   = ada_scales(w);
++    const float* sup = ada_super(w);
+     if (x.ne[1] <= 8) {
+         using S = Q5AdaSmallTSchedule<RowTiles, Warps, 1, G, Stages>;
+         if (rows % S::kRowsPerCta != 0) {
+             throw std::invalid_argument("q5 linear_add ada small-T: rows must tile the CTA");
+         }
+-        ada_small_t_mma_launch<S, K>(xp, x_ld, code, hi, sc, rows, x.ne[1], epilogue, stream);
++        ada_small_t_mma_launch<S, K>(xp, x_ld, code, hi, sc, rows, x.ne[1], epilogue, stream, sup);
+     } else {
+         using S = Q5AdaSmallTSchedule<RowTiles, Warps, 2, G, Stages>;
+         if (rows % S::kRowsPerCta != 0) {
+             throw std::invalid_argument("q5 linear_add ada small-T: rows must tile the CTA");
+         }
+-        ada_small_t_mma_launch<S, K>(xp, x_ld, code, hi, sc, rows, x.ne[1], epilogue, stream);
++        ada_small_t_mma_launch<S, K>(xp, x_ld, code, hi, sc, rows, x.ne[1], epilogue, stream, sup);
+     }
+ }
+ 
+diff --git a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+index f60f7ad..cc63a3c 100644
+--- a/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
++++ b/src/ops/linear_swiglu/q4/q4_linear_swiglu_ada_small_t.cu
+@@ -35,18 +35,19 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream)
+     const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
+     const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
+     const auto* code = static_cast<const std::uint8_t*>(w.qdata);
+-    const auto* sc   = static_cast<const std::uint8_t*>(w.scales);
++    const auto* sc   = ada_scales(w);
++    const float* sup = ada_super(w);
+     using Rows       = AdaPairedHalfRows<kIntermediate>;
+     if (x.ne[1] <= 8) {
+         using S = Q4AdaSmallTSchedule<RowTiles, Warps, 1, G, Stages>;
+         static_assert(kGateUpRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden, Rows>(xp, x_ld, code, nullptr, sc, kGateUpRows, x.ne[1],
+-                                                 epilogue, stream);
++                                                 epilogue, stream, sup);
+     } else {
+         using S = Q4AdaSmallTSchedule<RowTiles, Warps, 2, G, Stages>;
+         static_assert(kGateUpRows % S::kRowsPerCta == 0);
+         ada_small_t_mma_launch<S, kHidden, Rows>(xp, x_ld, code, nullptr, sc, kGateUpRows, x.ne[1],
+-                                                 epilogue, stream);
++                                                 epilogue, stream, sup);
+     }
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/src/ops/linear_swiglu/q5/q5_linear_swiglu_ada_small_t.cu b/src/ops/linear_swiglu/q5/q5_linear_swiglu_ada_small_t.cu
+new file mode 100644
+index 0000000..268ace4
+--- /dev/null
++++ b/src/ops/linear_swiglu/q5/q5_linear_swiglu_ada_small_t.cu
+@@ -0,0 +1,69 @@
++#include "core/weight.h"
++#include "ops/linear_swiglu/q5/q5_linear_swiglu_kernels.h"
++
++#include "core/device.h"
++#include "ops/common/math.cuh"
++#include "ops/linear/ada_small_t_mma.cuh"
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++
++constexpr int kGateUpRows   = 34816;
++constexpr int kIntermediate = kGateUpRows / 2;
++constexpr int kHidden       = 5120;
++
++struct SwiGluEpilogue {
++    static constexpr bool kPairedHalves = true;
++
++    __nv_bfloat16* out;
++    std::int32_t out_ld;
++
++    __device__ __forceinline__ void operator()(int row, int token, float gate, float up) const {
++        out[static_cast<std::int64_t>(token) * out_ld + row] = __float2bfloat16_rn(silu(gate) * up);
++    }
++};
++
++template <int RowTiles, int Warps, int G, int Stages>
++void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
++    const SwiGluEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data),
++                                  static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16))};
++    const auto* xp   = static_cast<const __nv_bfloat16*>(x.data);
++    const auto x_ld  = static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16));
++    const auto* code = static_cast<const std::uint8_t*>(w.qdata);
++    const auto* hi   = static_cast<const std::uint8_t*>(w.qhigh);
++    const auto* sc   = ada_scales(w);
++    const float* sup = ada_super(w);
++    using Rows       = AdaPairedHalfRows<kIntermediate>;
++    if (x.ne[1] <= 8) {
++        using S = Q5AdaSmallTSchedule<RowTiles, Warps, 1, G, Stages>;
++        static_assert(kGateUpRows % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, kHidden, Rows>(xp, x_ld, code, hi, sc, kGateUpRows, x.ne[1],
++                                                 epilogue, stream, sup);
++    } else {
++        using S = Q5AdaSmallTSchedule<RowTiles, Warps, 2, G, Stages>;
++        static_assert(kGateUpRows % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, kHidden, Rows>(xp, x_ld, code, hi, sc, kGateUpRows, x.ne[1],
++                                                 epilogue, stream, sup);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace
++
++void q5_linear_swiglu_ada_small_t_launch(const Tensor& x, const Weight& w, Tensor& out,
++                                         cudaStream_t stream) {
++    if (w.n != kGateUpRows || w.k != kHidden || w.padded_shape[1] != kHidden || w.qhigh == nullptr) {
++        throw std::invalid_argument("q5 linear_swiglu ada small-T requires weight [34816,5120]");
++    }
++    if (x.ne[1] < 1 || x.ne[1] > 16) {
++        throw std::invalid_argument("q5 linear_swiglu: only T in [1,16] (drafter verify width)");
++    }
++    launch<2, 8, 8, 2>(x, w, out, stream);
++}
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_swiglu/q5/q5_linear_swiglu_kernels.h b/src/ops/linear_swiglu/q5/q5_linear_swiglu_kernels.h
+new file mode 100644
+index 0000000..dfd199f
+--- /dev/null
++++ b/src/ops/linear_swiglu/q5/q5_linear_swiglu_kernels.h
+@@ -0,0 +1,14 @@
++#pragma once
++
++#include "core/tensor.h"
++#include "core/weight.h"
++
++#include <cuda_runtime.h>
++
++namespace ninfer::ops::detail {
++
++// Q5 G64 gate/up [34816, 5120] at T in [1, 16] (Ada small-T, paired-half SwiGLU epilogue).
++void q5_linear_swiglu_ada_small_t_launch(const Tensor& x, const Weight& w, Tensor& out,
++                                         cudaStream_t stream);
++
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear_swiglu/sources.cmake b/src/ops/linear_swiglu/sources.cmake
+index ef15222..9d87259 100644
+--- a/src/ops/linear_swiglu/sources.cmake
++++ b/src/ops/linear_swiglu/sources.cmake
+@@ -3,6 +3,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemm_mma.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemv.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_plan.cpp"
++  "${CMAKE_CURRENT_LIST_DIR}/q5/q5_linear_swiglu_ada_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
+diff --git a/src/ops/linear_topk/two_level_head.cu b/src/ops/linear_topk/two_level_head.cu
+index c92c22c..ac27827 100644
+--- a/src/ops/linear_topk/two_level_head.cu
++++ b/src/ops/linear_topk/two_level_head.cu
+@@ -52,6 +52,42 @@ __global__ void requant_q8_to_q4_kernel(const std::int8_t* __restrict__ q8_codes
+     q4_scales[row * kQ4Groups + group] = scale;
+ }
+ 
++// One thread per (row, 64-wide group) of a Q8 G32 weight: absmax over the 64 dequantized values,
++// canonical FP16 scale absmax/qmax, round-to-nearest codes clamped to [-qmax, qmax], stored back as
++// Q8 codes c*m with both G32 scales s/m (m = 2^(8-bits); exact while s/m stays normal).
++__global__ void q8_fake_requant_kernel(std::int8_t* __restrict__ codes, __half* __restrict__ scales,
++                                       std::int64_t rows, int k, int bits) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const int groups         = k / 64;
++    if (index >= rows * groups) { return; }
++    const std::int64_t row = index / groups;
++    const int group        = static_cast<int>(index % groups);
++    std::int8_t* c         = codes + row * k + group * 64;
++    __half* sc             = scales + row * (k / 32) + 2 * group;
++    const float s0 = __half2float(sc[0]), s1 = __half2float(sc[1]);
++    float v[64];
++    float absmax = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 64; ++i) {
++        v[i]   = static_cast<float>(c[i]) * (i < 32 ? s0 : s1);
++        absmax = fmaxf(absmax, fabsf(v[i]));
++    }
++    const int qmax = (1 << (bits - 1)) - 1;
++    const int m    = 1 << (8 - bits);
++    __half scale   = __float2half_rn(absmax / static_cast<float>(qmax));
++    if (__half2float(scale) == 0.0f && absmax > 0.0f) { scale = __ushort_as_half(1); }
++    const float s       = __half2float(scale);
++    const float inverse = s > 0.0f ? 1.0f / s : 0.0f;
++#pragma unroll
++    for (int i = 0; i < 64; ++i) {
++        const int q = max(-qmax, min(qmax, __float2int_rn(v[i] * inverse)));
++        c[i]        = static_cast<std::int8_t>(q * m);
++    }
++    const __half stored = __float2half_rn(s / static_cast<float>(m));
++    sc[0] = stored;
++    sc[1] = stored;
++}
++
+ // One CTA per column, one warp per candidate.
+ __global__ void rescore_argmax_kernel(const __nv_bfloat16* __restrict__ hidden,
+                                       std::int64_t hidden_ld,
+@@ -121,6 +157,18 @@ void require_q8_head(const Weight& head) {
+ 
+ } // namespace
+ 
++void q8_fake_requantize_inplace(const Weight& q8, int bits, cudaStream_t stream) {
++    if (q8.qtype != QType::Q8_G32_FP16 || q8.layout != QuantLayout::RowSplit || q8.k % 64 != 0 ||
++        bits < 2 || bits > 7) {
++        throw std::invalid_argument("q8 fake requantize: requires a row-split Q8 G32 weight");
++    }
++    const std::int64_t threads = static_cast<std::int64_t>(q8.n) * (q8.k / 64);
++    q8_fake_requant_kernel<<<static_cast<unsigned>((threads + 127) / 128), 128, 0, stream>>>(
++        static_cast<std::int8_t*>(const_cast<void*>(q8.qdata)),
++        static_cast<__half*>(const_cast<void*>(q8.scales)), q8.n, q8.k, bits);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_scales,
+                                cudaStream_t stream) {
+     require_q8_head(q8_head);
+diff --git a/src/ops/wrapper/dynamic_grouped_conv.cpp b/src/ops/wrapper/dynamic_grouped_conv.cpp
+index d0ce565..72deafc 100644
+--- a/src/ops/wrapper/dynamic_grouped_conv.cpp
++++ b/src/ops/wrapper/dynamic_grouped_conv.cpp
+@@ -5,6 +5,7 @@
+ #include "ninfer/ops/dynamic_grouped_conv.h"
+ 
+ #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
++#include "ops/dynamic_grouped_conv/q5/q5_dynamic_grouped_conv_add.h"
+ #include "ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.h"
+ #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
+ 
+@@ -64,7 +65,7 @@ struct ProjectionPlanes {
+ ProjectionPlanes projection_planes(QType qtype, std::int32_t input_rows) {
+     const std::uint64_t rows    = kHidden;
+     const std::uint64_t columns = static_cast<std::uint64_t>(input_rows);
+-    if (qtype == QType::Q4_G64_FP16)
++    if (qtype == QType::Q4_G64_FP16 || qtype == QType::Q5_G64_FP16)
+         return {rows * columns / 2U, rows * (columns / 64U) * sizeof(std::uint16_t)};
+     return {rows * columns, rows * (columns / 32U) * sizeof(std::uint16_t)};
+ }
+@@ -74,13 +75,18 @@ void require_finish_projection_weight(const Weight& weight, std::int32_t input_r
+                     weight.group == 32;
+     const bool q4 = weight.qtype == QType::Q4_G64_FP16 && weight.group_size == 64 &&
+                     weight.group == 64;
++    const bool q5 = weight.qtype == QType::Q5_G64_FP16 && weight.group_size == 64 &&
++                    weight.group == 64 && weight.qhigh != nullptr &&
++                    weight.high_plane_bytes ==
++                        static_cast<std::uint64_t>(kHidden) * (input_rows / 64) * 8U;
+     const ProjectionPlanes planes = projection_planes(weight.qtype, input_rows);
+-    if ((!q8 && !q4) || weight.layout != QuantLayout::RowSplit ||
++    if ((!q8 && !q4 && !q5) || weight.layout != QuantLayout::RowSplit ||
+         weight.scale_dtype != DType::FP16 || weight.ndim != 2 || weight.n != kHidden ||
+         weight.k != input_rows || weight.shape[0] != kHidden || weight.shape[1] != input_rows ||
+         weight.shape[2] != 1 || weight.shape[3] != 1 || weight.padded_shape[0] != kHidden ||
+         weight.padded_shape[1] != input_rows || weight.padded_shape[2] != 1 ||
+-        weight.padded_shape[3] != 1 || weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
++        weight.padded_shape[3] != 1 ||
++        (!q5 && (weight.qhigh != nullptr || weight.high_plane_bytes != 0)) ||
+         weight.payload_bytes < planes.code_bytes + planes.scale_bytes ||
+         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+         throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
+@@ -222,6 +228,9 @@ std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+     case QType::Q4_G64_FP16:
+         return detail::q4_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+             input_rows, min_width, max_width, min_batch_size, max_batch_size);
++    case QType::Q5_G64_FP16:
++        return detail::q5_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
++            input_rows, min_width, max_width, min_batch_size, max_batch_size);
+     default:
+         throw std::invalid_argument(
+             "linear dynamic grouped conv add workspace: projection must be Q8 or Q4");
+@@ -251,6 +260,11 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
+     require_finish_projection_weight(projection_weight, input_rows);
+     require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
+ 
++    if (projection_weight.qtype == QType::Q5_G64_FP16) {
++        detail::q5_linear_dynamic_grouped_conv_add_dispatch(
++            x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
++        return;
++    }
+     if (projection_weight.qtype == QType::Q4_G64_FP16) {
+         detail::q4_linear_dynamic_grouped_conv_add_dispatch(
+             x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
+diff --git a/src/ops/wrapper/linear_swiglu.cpp b/src/ops/wrapper/linear_swiglu.cpp
+index 17206a1..373156e 100644
+--- a/src/ops/wrapper/linear_swiglu.cpp
++++ b/src/ops/wrapper/linear_swiglu.cpp
+@@ -6,6 +6,7 @@
+ #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+ #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
+ #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
++#include "ops/linear_swiglu/q5/q5_linear_swiglu_kernels.h"
+ #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
+ 
+ #include <cstdint>
+@@ -49,6 +50,12 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
+         return detail::q4_linear_swiglu_capacity_workspace_bytes(
+             gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens, max_tokens);
+     }
++    if (qtype == QType::Q5_G64_FP16 && gate_up_rows == 34816 && input_rows == 5120) {
++        if (max_tokens > 16) {
++            throw std::invalid_argument("linear_swiglu workspace: Q5 admits T in [1,16] only");
++        }
++        return 0;
++    }
+     if (qtype == QType::NVFP4 && gate_up_rows == 34816 && input_rows == 5120) {
+         return detail::nvfp4_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+     }
+@@ -102,8 +109,15 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
+         (q8_shape || large_shape) && gate_up_weight.qtype == QType::Q8_G32_FP16 &&
+         gate_up_weight.group_size == 32 && gate_up_weight.group == 32 &&
+         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
++    const bool q5_weight = large_shape && gate_up_weight.qtype == QType::Q5_G64_FP16 &&
++                           gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
++                           gate_up_weight.qhigh != nullptr && common_row_split;
+     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
+     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
++    if (q5_weight) {
++        detail::q5_linear_swiglu_ada_small_t_launch(x, gate_up_weight, out, stream);
++        return;
++    }
+     if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
+         throw std::invalid_argument("linear_swiglu: unsupported weight");
+     }
+-- 
+2.34.1
+

@@ -1,0 +1,66 @@
+From df9e11661507c397fe3c0dc774e2e7d85f2a0e51 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 20:09:05 +0800
+Subject: [PATCH 31/49] NINFER_Q3_TILED also packs drafter MLP Q3 shadows;
+ packed R5 G8 S3 route in the dynamic-conv add op (research22)
+
+---
+ src/models/qwen3_5/execution/parameters.cpp      | 14 +++++++++++++-
+ .../q4/q4_dynamic_grouped_conv_add.cu            | 16 ++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 5880ce0..496ef28 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -529,7 +529,19 @@ Parameters::Parameters(const Model& source) : model(source) {
+                     }
+                 }
+             }
+-            std::fprintf(stderr, "Q3 tiled: %d target MLP weights packed per CTA stage\n", packed);
++            const int target_packed = packed;
++            if (draft) {
++                for (auto& layer : draft->layers) {
++                    if (layer.mlp.gate_up.weight.n == 34816 && layer.mlp.gate_up.weight.k == 5120) {
++                        pack(layer.mlp.gate_up.weight, 1, 32, 8, 17408);
++                    }
++                    if (layer.mlp.down.weight.n == 5120 && layer.mlp.down.weight.k == 17408) {
++                        pack(layer.mlp.down.weight, 2, 40, 8, 0);
++                    }
++                }
++            }
++            std::fprintf(stderr, "Q3 tiled: %d target + %d drafter MLP weights packed per CTA stage\n", target_packed,
++                         packed - target_packed);
+         }
+     }
+     if (w.proposal) {
+diff --git a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
+index 8e86c8e..11b4549 100644
+--- a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
++++ b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_add.cu
+@@ -131,6 +131,22 @@ void ada_projection(const Tensor& x, const Weight& w, __nv_bfloat16* projected,
+     const auto* code = static_cast<const std::uint8_t*>(w.qdata);
+     const AdaStoreEpilogue epilogue{projected};
+     if constexpr (K == 17408) {
++        // NINFER_Q3_TILED: the drafter down's planes packed per (40-row CTA, 8-group stage) tile; same bits.
++        if (w.q3_tile != 0) {
++            if (w.q3_tile != 2 || ada_super(w) == nullptr) {
++                throw std::invalid_argument("q4 dynamic grouped conv add: Q3 tiles packed for another route");
++            }
++            if (w.q3_odd) {
++                ada_projection_q3<AdaSmallTSchedule<AdaWeightFormat::Q3Odd, 5, 8, 1, 8, 3, true, true>,
++                                  AdaSmallTSchedule<AdaWeightFormat::Q3Odd, 5, 8, 2, 8, 3, true, true>, K>(
++                    xp, w, epilogue, columns, stream);
++            } else {
++                ada_projection_q3<AdaSmallTSchedule<AdaWeightFormat::Q3, 5, 8, 1, 8, 3, true, true>,
++                                  AdaSmallTSchedule<AdaWeightFormat::Q3, 5, 8, 2, 8, 3, true, true>, K>(
++                    xp, w, epilogue, columns, stream);
++            }
++            return;
++        }
+         if (w.q3_low != nullptr) {
+             if (w.q3_odd) {
+                 ada_projection_q3<Q3OddAdaSmallTSchedule<5, 8, 1, 16, 2>,
+-- 
+2.34.1
+

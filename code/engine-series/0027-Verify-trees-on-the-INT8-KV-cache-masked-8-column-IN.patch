@@ -1,0 +1,430 @@
+From dfebb6c046ba37bde06136ab7f3fe9110c8d051c Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 05:53:23 +0800
+Subject: [PATCH 27/49] Verify trees on the INT8 KV cache (masked 8-column INT8
+ small-T chunks, INT8 accepted-path compaction)
+
+---
+ .../qwen3_5/program/planning/startup.cpp      |  6 +-
+ src/ops/kernel/speculative_round.cuh          | 77 +++++++++++++++++++
+ src/ops/launcher/speculative_round.cu         |  7 +-
+ .../causal_cache/causal_softmax_attention.cpp | 29 ++++++-
+ .../dense/causal_cache/launch.h               |  8 ++
+ .../dense/causal_cache/small_t.cu             | 60 +++++++++++++--
+ .../dense/causal_cache/small_t_i8.cuh         | 32 ++++++--
+ src/ops/wrapper/speculative_round.cpp         |  7 +-
+ 8 files changed, 206 insertions(+), 20 deletions(-)
+
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index cedb466..cccc01a 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -827,11 +827,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
+         const auto& attention = parameters.model.config().text.attention;
+         if (options.speculative.backend != SpeculativeBackend::DFlash2 ||
+             options.speculative.draft_tokens != 15 ||
+-            options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value || !attention ||
++            (options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value &&
++             options.kv_cache != KvCacheStorage::Int8Group64) ||
++            !attention ||
+             attention->head_dim != 256 || attention->num_attention_heads != 24 ||
+             attention->num_key_value_heads != 4) {
+             throw std::invalid_argument(
+-                "verify trees require DFlash2 with K=15, the k8v4 KV cache and 24x256 attention");
++                "verify trees require DFlash2 with K=15, the k8v4 or int8 KV cache and 24x256 attention");
+         }
+     }
+     if (device.compute_capability() != 89) {
+diff --git a/src/ops/kernel/speculative_round.cuh b/src/ops/kernel/speculative_round.cuh
+index 6188b1f..b7edeab 100644
+--- a/src/ops/kernel/speculative_round.cuh
++++ b/src/ops/kernel/speculative_round.cuh
+@@ -940,6 +940,83 @@ __global__ __launch_bounds__(256) void speculative_compact_k8v4_kernel(
+     }
+ }
+ 
++// INT8 (group-64) counterpart: per head and position, 256 code bytes for K and for V and four
++// FP16 group scales for each (paged layouts <256> and <4>). Same read-all-then-write steps.
++template <int KVHeads>
++__global__ __launch_bounds__(256) void speculative_compact_int8_kernel(
++    SpeculativeKVCompactLayers layers, const std::int32_t* block_tables, std::int32_t table_stride,
++    const std::int32_t* table_rows, const std::int32_t* cache_positions,
++    const std::int32_t* accepted_columns, const std::int32_t* accepted, std::int32_t width) {
++    constexpr int kCodeChunks   = 256 / 16;
++    constexpr int kItemsPerHead = 2 * kCodeChunks + 2;
++    constexpr int kItems        = kItemsPerHead * KVHeads;
++    static_assert(kItems <= 256);
++    const SpeculativeKVLayerPlanes planes = layers.layer[blockIdx.x];
++    auto* const v_scales = reinterpret_cast<std::uint16_t*>(planes.v_scales);
++    const int batch      = static_cast<int>(blockIdx.y);
++    const std::int32_t* block_table =
++        block_tables + static_cast<std::int64_t>(table_rows[batch]) * table_stride;
++    const std::int32_t* path      = accepted_columns + batch * width;
++    const std::int32_t* positions = cache_positions + batch * width;
++    const int count               = accepted[batch];
++    const int item                = threadIdx.x;
++    const int head                = item / kItemsPerHead;
++    const int part                = item - head * kItemsPerHead;
++    for (int j = 1; j <= count; ++j) {
++        const int column = path[j];
++        if (column == j) { continue; }
++        const int source = positions[column], target = positions[j];
++        const int source_page   = block_table[source >> kPagedKVPageShift];
++        const int target_page   = block_table[target >> kPagedKVPageShift];
++        const int source_offset = source & kPagedKVPageMask,
++                  target_offset = target & kPagedKVPageMask;
++        uint4 chunk{};
++        uint2 scales{};
++        if (item < kItems) {
++            if (part < kCodeChunks) {
++                chunk = *reinterpret_cast<const uint4*>(
++                    planes.k_codes + paged_kv_element_offset<256, KVHeads>(
++                                         source_page, head, source_offset, part * 16));
++            } else if (part < 2 * kCodeChunks) {
++                chunk = *reinterpret_cast<const uint4*>(
++                    planes.v_codes +
++                    paged_kv_element_offset<256, KVHeads>(source_page, head, source_offset,
++                                                          (part - kCodeChunks) * 16));
++            } else if (part == 2 * kCodeChunks) {
++                scales = *reinterpret_cast<const uint2*>(
++                    planes.k_scales +
++                    paged_kv_element_offset<4, KVHeads>(source_page, head, source_offset, 0));
++            } else {
++                scales = *reinterpret_cast<const uint2*>(
++                    v_scales +
++                    paged_kv_element_offset<4, KVHeads>(source_page, head, source_offset, 0));
++            }
++        }
++        __syncthreads();
++        if (item < kItems) {
++            if (part < kCodeChunks) {
++                *reinterpret_cast<uint4*>(planes.k_codes +
++                                          paged_kv_element_offset<256, KVHeads>(
++                                              target_page, head, target_offset, part * 16)) = chunk;
++            } else if (part < 2 * kCodeChunks) {
++                *reinterpret_cast<uint4*>(planes.v_codes +
++                                          paged_kv_element_offset<256, KVHeads>(
++                                              target_page, head, target_offset,
++                                              (part - kCodeChunks) * 16)) = chunk;
++            } else if (part == 2 * kCodeChunks) {
++                *reinterpret_cast<uint2*>(planes.k_scales +
++                                          paged_kv_element_offset<4, KVHeads>(
++                                              target_page, head, target_offset, 0)) = scales;
++            } else {
++                *reinterpret_cast<uint2*>(v_scales + paged_kv_element_offset<4, KVHeads>(
++                                                         target_page, head, target_offset, 0)) =
++                    scales;
++            }
++        }
++        __syncthreads();
++    }
++}
++
+ __global__ void speculative_select_accepted_hidden_kernel(const __nv_bfloat16* hidden,
+                                                           const std::int32_t* selectors,
+                                                           __nv_bfloat16* out, std::int32_t rows,
+diff --git a/src/ops/launcher/speculative_round.cu b/src/ops/launcher/speculative_round.cu
+index 26deb86..ed76b42 100644
+--- a/src/ops/launcher/speculative_round.cu
++++ b/src/ops/launcher/speculative_round.cu
+@@ -250,7 +250,12 @@ void speculative_compact_k8v4_launch(std::span<const PagedKVBatchLayerView> laye
+                 static_cast<const std::int32_t*>(accepted_columns.data),
+                 static_cast<const std::int32_t*>(accepted.data), width);
+         };
+-        if (view.num_kv_heads == 4) {
++        if (view.storage == KvCacheStorage::Int8Group64) {
++            if (view.num_kv_heads != 4) {
++                throw std::invalid_argument("speculative INT8 compaction: unsupported KV head count");
++            }
++            launch(speculative_compact_int8_kernel<4>);
++        } else if (view.num_kv_heads == 4) {
+             launch(speculative_compact_k8v4_kernel<4>);
+         } else if (view.num_kv_heads == 2) {
+             launch(speculative_compact_k8v4_kernel<2>);
+diff --git a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+index 4dacf98..38d2274 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
++++ b/src/ops/softmax_attention/dense/causal_cache/causal_softmax_attention.cpp
+@@ -479,7 +479,13 @@ causal_softmax_attention_tree_workspace_capacity_bytes(CausalAttentionExecutionE
+     WorkspaceLayoutBuilder layout;
+     (void)allocate_small_t_workspace(layout, KvCacheStorage::Fp8KeyNvfp4Value, 24,
+                                      kMaximumVerifyTokens, splits, batch_size);
+-    return layout.peak_bytes(1);
++    // INT8 trees run two eight-column chunks, one workspace at a time.
++    const std::int32_t int8_splits = detail::causal_attention_split_capacity(
++        24, 8, KvCacheStorage::Int8Group64, envelope, batch_size);
++    WorkspaceLayoutBuilder int8_layout;
++    (void)allocate_small_t_workspace(int8_layout, KvCacheStorage::Int8Group64, 24, 8, int8_splits,
++                                     batch_size);
++    return std::max(layout.peak_bytes(1), int8_layout.peak_bytes(1));
+ }
+ 
+ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+@@ -505,17 +511,32 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+ 
+     auto scope = workspace.scope();
+     if (tree_masks.data != nullptr) {
+-        // Verify trees run the K8V4 small-T kernel over the whole block, whatever the context.
+-        if (cache.storage != KvCacheStorage::Fp8KeyNvfp4Value || q.ne[1] != 24 ||
++        // Verify trees run the K8V4 small-T kernel over the whole block, whatever the context;
++        // INT8 runs the block as two masked eight-column chunks.
++        const bool int8_tree = cache.storage == KvCacheStorage::Int8Group64;
++        if ((cache.storage != KvCacheStorage::Fp8KeyNvfp4Value && !int8_tree) || q.ne[1] != 24 ||
+             width != kMaximumVerifyTokens || valid_columns.data == nullptr) {
+             throw std::invalid_argument(
+-                "causal_softmax_attention: verify trees need a masked K8V4 16-column H24 block");
++                "causal_softmax_attention: verify trees need a masked K8V4/INT8 16-column H24 block");
+         }
+         require_shape(tree_masks, width, batch, 1, 1, op, "tree masks");
+         require_contiguous_nonnull(tree_masks, op, "tree masks");
+         if (tree_masks.dtype != DType::I32) {
+             throw std::invalid_argument("causal_softmax_attention: tree masks must be I32");
+         }
++        if (int8_tree) {
++            for (std::int32_t begin = 0; begin < width; begin += 8) {
++                auto chunk_scope          = workspace.scope();
++                const std::int32_t splits = detail::causal_attention_split_capacity(
++                    q.ne[1], 8, cache.storage, envelope, batch);
++                SmallTWorkspace partial =
++                    allocate_small_t_workspace(workspace, cache.storage, q.ne[1], 8, splits, batch);
++                detail::causal_attention_small_t_tree_launch(
++                    q, k, v, positions, valid_columns, tree_masks, kv_table_rows, scale, cache,
++                    envelope, begin, 8, partial.acc, partial.m, partial.l, out, stream);
++            }
++            return;
++        }
+         const std::int32_t splits =
+             detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
+         SmallTWorkspace partial =
+diff --git a/src/ops/softmax_attention/dense/causal_cache/launch.h b/src/ops/softmax_attention/dense/causal_cache/launch.h
+index 1c27455..b6d9a03 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/launch.h
++++ b/src/ops/softmax_attention/dense/causal_cache/launch.h
+@@ -47,6 +47,14 @@ void causal_attention_small_t_launch(
+     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
+     Tensor& query_scales, Tensor& out, cudaStream_t stream);
+ 
++// INT8 verify trees: one masked 8-column chunk [column_begin, column_begin + width) of a 16-column block.
++void causal_attention_small_t_tree_launch(
++    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
++    const Tensor& valid_columns, const Tensor& tree_masks, const Tensor& table_rows, float scale,
++    PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
++    std::int32_t column_begin, std::int32_t width, Tensor& partial_acc, Tensor& partial_m,
++    Tensor& partial_l, Tensor& out, cudaStream_t stream);
++
+ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
+                                             const PagedKVLayerView& cache,
+                                             CausalAttentionExecutionEnvelope envelope,
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t.cu b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+index dcf9691..04accc1 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t.cu
+@@ -10,6 +10,8 @@
+ #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
+ #include "ops/softmax_attention/dense/causal_cache/small_t_bf16.cuh"
+ #include "ops/softmax_attention/dense/causal_cache/small_t_i8.cuh"
++
++#include <type_traits>
+ #include "core/device.h" // CUDA_CHECK
+ #include "ninfer/ops/softmax_attention.h"
+ 
+@@ -130,7 +132,8 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
++template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput,
++          bool Tree = false>
+ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+                           std::int32_t logical_capacity, std::int32_t implementation_window,
+@@ -148,13 +151,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos,
+             static const cudaError_t attr = cudaFuncSetAttribute(
+                 causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta,
+                                                          MinBlocksPerSm, KeyBlock, DynamicArena,
+-                                                         MultiBatch, Masked, CacheInput>,
++                                                         MultiBatch, Masked, CacheInput, Tree>,
+                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kDynamicBytes));
+             CUDA_CHECK(attr);
+         }
+         causal_attention_small_t_i8_tiled_kernel<Geometry, TokenTile, WarpsPerCta, MinBlocksPerSm,
+                                                  KeyBlock, DynamicArena, MultiBatch, Masked,
+-                                                 CacheInput>
++                                                 CacheInput, Tree>
+             <<<grid, WarpsPerCta * 32, kDynamicBytes, stream>>>(
+                 static_cast<const __nv_bfloat16*>(q.data), input,
+                 static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
+@@ -169,7 +172,10 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos,
+                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                 logical_capacity, scale, static_cast<float*>(partial_acc.data),
+-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
++                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
++                invocation.tree_masks == nullptr
++                    ? nullptr
++                    : static_cast<const std::int32_t*>(invocation.tree_masks->data));
+     };
+     if constexpr (TokenTile >= 6) {
+         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
+@@ -305,7 +311,26 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
+         }                                                                                          \
+     } while (0)
+ 
+-    switch (invocation.width) {
++    if (invocation.tree_masks != nullptr) {
++        // INT8 verify trees: masked eight-column chunks of the D256 H24/KV4 sixteen-column block.
++        if constexpr (Geometry::QHeads == 24 && std::is_same_v<CacheInput, CausalAppendInput>) {
++            if (cache.storage != KvCacheStorage::Int8Group64 || invocation.width != 8 ||
++                invocation.valid_columns == nullptr) {
++                throw std::invalid_argument("INT8 verify trees require masked 8-column chunks");
++            }
++            if (invocation.batch_size == 1) {
++                launch_tc_partial_i8<Geometry, 8, false, true, CacheInput, true>(
++                    q, input, pos, scale, cache, invocation, logical_capacity,
++                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);
++            } else {
++                launch_tc_partial_i8<Geometry, 8, true, true, CacheInput, true>(
++                    q, input, pos, scale, cache, invocation, logical_capacity,
++                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);
++            }
++        } else {
++            throw std::invalid_argument("verify trees: unsupported small-T geometry");
++        }
++    } else switch (invocation.width) {
+     case 1:
+         NINFER_CAUSAL_SMALL_T_DISPATCH(1, 2);
+         break;
+@@ -425,6 +450,31 @@ void causal_attention_small_t_launch(
+                                                           partial_l, out, stream);
+ }
+ 
++void causal_attention_small_t_tree_launch(
++    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
++    const Tensor& valid_columns, const Tensor& tree_masks, const Tensor& table_rows, float scale,
++    PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
++    std::int32_t column_begin, std::int32_t width, Tensor& partial_acc, Tensor& partial_m,
++    Tensor& partial_l, Tensor& out, cudaStream_t stream) {
++    if (cache.storage != KvCacheStorage::Int8Group64 || q.ne[1] != CausalD256H24Kv4::QHeads) {
++        throw std::invalid_argument("causal_attention_small_t_tree_launch: INT8 H24 only");
++    }
++    const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
++                                  static_cast<const __nv_bfloat16*>(v.data)};
++    const CausalSmallTInvocation invocation{
++        .valid_columns = &valid_columns,
++        .tree_masks    = &tree_masks,
++        .table_rows    = &table_rows,
++        .full_width    = q.ne[2],
++        .column_begin  = column_begin,
++        .width         = width,
++        .batch_size    = q.ne[3],
++    };
++    causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, pos, scale, cache, invocation,
++                                                          envelope, partial_acc, partial_m,
++                                                          partial_l, out, stream);
++}
++
+ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, float scale,
+                                             const PagedKVLayerView& cache,
+                                             CausalAttentionExecutionEnvelope envelope,
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_i8.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_i8.cuh
+index 97b6109..ffef4a1 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_i8.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_i8.cuh
+@@ -40,7 +40,7 @@ namespace ninfer::ops {
+ // dequantize V while producers execute QK. After both consume the code tile, the
+ // next K/V tile is prefetched into the same arena while the current PV runs.
+ template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
+-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
++          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput, bool Tree = false>
+ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     void causal_attention_small_t_i8_tiled_kernel(
+         const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
+@@ -48,7 +48,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+         const std::int32_t* block_tables, const std::int32_t* valid_columns,
+         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+         std::int32_t column_begin, std::int32_t logical_capacity, float scale, float* partial_acc,
+-        float* partial_m, float* partial_l) {
++        float* partial_m, float* partial_l, const std::int32_t* tree_masks) {
+     constexpr int Wc                   = WarpsPerCta;
+     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
+     constexpr int RowTiles             = (RowCount + 15) / 16;
+@@ -114,6 +114,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     }
+     std::int64_t column_base = column_begin;
+     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
++    // Tree: the block's columns occupy consecutive cache positions from the row's column 0.
++    std::int32_t tree_base = 0;
++    if constexpr (Tree) {
++        tree_base = pos[column_base - column_begin];
++        tree_masks += column_base;
++    }
+     q += static_cast<std::int64_t>(kCausalHeadDim) * Geometry::QHeads * column_base;
+     pos += column_base;
+     if constexpr (CacheInput::writes_cache) {
+@@ -453,6 +459,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
+             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
+             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
++            unsigned tmask0 = 0U, tmask1 = 0U;
++            if constexpr (Tree) {
++                tmask0 = row0 < RowCount ? static_cast<unsigned>(tree_masks[token0]) : 0U;
++                tmask1 = row1 < RowCount ? static_cast<unsigned>(tree_masks[token1]) : 0U;
++            }
++            const auto visible = [&](int key, int qabs, unsigned tmask) {
++                if constexpr (Tree) {
++                    return key < tree_base ||
++                           (key <= qabs && ((tmask >> (key - tree_base)) & 1U) != 0U);
++                } else {
++                    (void)tmask;
++                    return key <= qabs;
++                }
++            };
+             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+ #pragma unroll
+             for (int nt = 0; nt < QKNt; ++nt) {
+@@ -461,19 +481,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+                 const int key0 = k0 + col0;
+                 const int key1 = k0 + col1;
+                 score[nt][0] =
+-                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
++                    (row0 < RowCount && key0 >= split_start && key0 < split_end && visible(key0, qabs0, tmask0))
+                         ? score[nt][0] * scale
+                         : -CUDART_INF_F;
+                 score[nt][1] =
+-                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
++                    (row0 < RowCount && key1 >= split_start && key1 < split_end && visible(key1, qabs0, tmask0))
+                         ? score[nt][1] * scale
+                         : -CUDART_INF_F;
+                 score[nt][2] =
+-                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
++                    (row1 < RowCount && key0 >= split_start && key0 < split_end && visible(key0, qabs1, tmask1))
+                         ? score[nt][2] * scale
+                         : -CUDART_INF_F;
+                 score[nt][3] =
+-                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
++                    (row1 < RowCount && key1 >= split_start && key1 < split_end && visible(key1, qabs1, tmask1))
+                         ? score[nt][3] * scale
+                         : -CUDART_INF_F;
+                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+diff --git a/src/ops/wrapper/speculative_round.cpp b/src/ops/wrapper/speculative_round.cpp
+index 8f6c002..d742d9f 100644
+--- a/src/ops/wrapper/speculative_round.cpp
++++ b/src/ops/wrapper/speculative_round.cpp
+@@ -300,9 +300,12 @@ void speculative_compact_k8v4_kv(std::span<const PagedKVBatchLayerView> layers,
+     require_matrix(accepted_columns, DType::I32, width, batch, op, "accepted_columns");
+     require_matrix(cache_positions, DType::I32, width, batch, op, "cache_positions");
+     for (const PagedKVBatchLayerView& layer : layers) {
+-        if (layer.storage != KvCacheStorage::Fp8KeyNvfp4Value || layer.head_dim != 256 ||
++        // K8V4, or INT8 group-64 (verify trees on --kv-dtype int8); one codec for every layer.
++        if ((layer.storage != KvCacheStorage::Fp8KeyNvfp4Value &&
++             layer.storage != KvCacheStorage::Int8Group64) ||
++            layer.storage != layers.front().storage || layer.head_dim != 256 ||
+             layer.block_tables.data != layers.front().block_tables.data) {
+-            throw std::invalid_argument("speculative_compact_k8v4_kv: invalid K8V4 layer");
++            throw std::invalid_argument("speculative_compact_k8v4_kv: invalid K8V4/INT8 layer");
+         }
+     }
+     if (layers.empty()) { return; }
+-- 
+2.34.1
+

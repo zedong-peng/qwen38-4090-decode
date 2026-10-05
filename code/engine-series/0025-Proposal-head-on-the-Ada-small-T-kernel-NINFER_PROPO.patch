@@ -1,0 +1,206 @@
+From 9fcad724621950d759bc2ecb8e9bf061669c74db Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 01:04:10 +0800
+Subject: [PATCH 25/49] Proposal head on the Ada small-T kernel
+ (NINFER_PROPOSAL_ADA, Q3 shadow); converter
+ PROPOSAL_METHOD=grouped_absmax_odd3
+
+---
+ src/models/qwen3_5/execution/parameters.cpp |  7 +++
+ src/ops/linear_topk/q4.cu                   | 64 +++++++++++++++++++++
+ tools/convert/methods.py                    | 36 ++++++++++++
+ tools/convert/proposal.py                   |  6 +-
+ 4 files changed, 112 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index de41221..475f55b 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -423,6 +423,13 @@ Parameters::Parameters(const Model& source) : model(source) {
+         proposal =
+             ProposalParameters{prepare.linear(w.proposal->head), std::nullopt, w.proposal->rows};
+         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
++        if (const char* q3 = std::getenv("NINFER_Q3_SHADOW"); q3 != nullptr && std::atoi(q3) == 1) {
++            Q3ShadowPass pass;
++            pass(proposal->head.weight);
++            CUDA_CHECK(cudaDeviceSynchronize());
++            std::fprintf(stderr, "Q3 shadow: proposal head %s\n",
++                         pass.weights == 0 ? "stays Q4" : pass.odd ? "half grid" : "int grid");
++        }
+     }
+ }
+ 
+diff --git a/src/ops/linear_topk/q4.cu b/src/ops/linear_topk/q4.cu
+index 4ba59f8..e7e0cbd 100644
+--- a/src/ops/linear_topk/q4.cu
++++ b/src/ops/linear_topk/q4.cu
+@@ -7,10 +7,12 @@
+ #include "core/device.h"
+ #include "ops/common/memory.cuh"
+ #include "ops/common/score_id_order.cuh"
++#include "ops/linear/ada_small_t_mma.cuh"
+ #include "ops/linear/q4/q4_ksplit_mma.cuh"
+ 
+ #include <climits>
+ #include <cstdint>
++#include <cstdlib>
+ #include <array>
+ #include <stdexcept>
+ #include <utility>
+@@ -118,6 +120,56 @@ void launch_full_ksplit(const Tensor& hidden, const Weight& head, std::int32_t v
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// Research (NINFER_PROPOSAL_ADA / Q3 shadow): the optimized head through the Ada small-T GEMM. Scores leave as the
++// K-split kernel's keyed partials (producer group = row / 16, rank = row % 16), so the merge is unchanged.
++struct AdaTopKEpilogue {
++    static constexpr bool kPairedHalves = false;
++    std::uint64_t* partial_keys;
++    const std::int32_t* row_to_global_ids;
++    std::int32_t producer_groups;
++
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        const std::int64_t offset =
++            (static_cast<std::int64_t>(token) * producer_groups + row / kLinearTopK) * kLinearTopK +
++            row % kLinearTopK;
++        store_u64_evict_last(partial_keys + offset, score_id_order_key(value, row_to_global_ids[row]));
++    }
++};
++
++template <AdaWeightFormat Format, int RowTiles, int Warps>
++void launch_ada(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
++                const LinearTopKWorkspace& workspace, cudaStream_t stream) {
++    constexpr int kRows = 131072;
++    constexpr bool kQ3  = Format == AdaWeightFormat::Q3 || Format == AdaWeightFormat::Q3Odd;
++    const AdaTopKEpilogue epilogue{static_cast<std::uint64_t*>(workspace.partial_keys.data),
++                                   static_cast<const std::int32_t*>(row_to_global_ids.data),
++                                   workspace.producer_groups};
++    const auto* xp   = static_cast<const __nv_bfloat16*>(hidden.data);
++    const auto x_ld  = static_cast<std::int32_t>(hidden.nb[1] / sizeof(__nv_bfloat16));
++    const auto* code = static_cast<const std::uint8_t*>(kQ3 ? head.q3_low : head.qdata);
++    const auto* high = kQ3 ? static_cast<const std::uint8_t*>(head.q3_high) : nullptr;
++    if (hidden.ne[1] <= 8) {
++        using S = AdaSmallTSchedule<Format, RowTiles, Warps, 1, 8, 2>;
++        static_assert(kRows % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, kLinearTopKHidden>(xp, x_ld, code, high, ada_scales(head), kRows,
++                                                     hidden.ne[1], epilogue, stream, ada_super(head));
++    } else {
++        using S = AdaSmallTSchedule<Format, RowTiles, Warps, 2, 8, 2>;
++        static_assert(kRows % S::kRowsPerCta == 0);
++        ada_small_t_mma_launch<S, kLinearTopKHidden>(xp, x_ld, code, high, ada_scales(head), kRows,
++                                                     hidden.ne[1], epilogue, stream, ada_super(head));
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++bool proposal_ada() {
++    static const bool enabled = [] {
++        const char* e = std::getenv("NINFER_PROPOSAL_ADA");
++        return e != nullptr && std::atoi(e) == 1;
++    }();
++    return enabled;
++}
++
+ using FullLaunch = void (*)(const Tensor&, const Weight&, std::int32_t,
+                             const LinearTopKWorkspace&, cudaStream_t);
+ constexpr std::array<FullLaunch, 2> full_launchers{&launch_full_ksplit<8>,
+@@ -145,6 +197,18 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
+                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
+                            cudaStream_t stream) {
+     if (workspace.rows_per_producer == kLinearTopKDirectRows) {
++        if (head.q3_low != nullptr) {
++            if (head.q3_odd) {
++                launch_ada<AdaWeightFormat::Q3Odd, 4, 4>(hidden, head, row_to_global_ids, workspace, stream);
++            } else {
++                launch_ada<AdaWeightFormat::Q3, 4, 4>(hidden, head, row_to_global_ids, workspace, stream);
++            }
++            return;
++        }
++        if (proposal_ada()) {
++            launch_ada<AdaWeightFormat::Q4, 2, 8>(hidden, head, row_to_global_ids, workspace, stream);
++            return;
++        }
+         launchers[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
+     } else {
+         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);
+diff --git a/tools/convert/methods.py b/tools/convert/methods.py
+index 47d9f82..66347a0 100644
+--- a/tools/convert/methods.py
++++ b/tools/convert/methods.py
+@@ -219,6 +219,41 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
+     return request.job(produce=produce)
+ 
+ 
++def grouped_absmax_odd3(request: PrepareRequest) -> PreparedMethod:
++    """Research: the 3-bit half grid inside a Q4 G64 target, as odd codes d in [-7, 7] with an FP16 scale s
++    (levels d * s); per group the clip in {1, .95, .9, .85, .8} of s = clip * absmax / 7 with the least squared
++    error. The engine's NINFER_Q3_SHADOW repacks such a matrix into Q3 planes."""
++    if request.target.format != "q4_g64_fp16" or len(request.target.shape) != 2:
++        raise ValueError("grouped_absmax_odd3 requires a q4_g64_fp16 matrix target")
++    _preflight(request)
++    n, k = request.target.shape
++    if k % 64:
++        raise ValueError("grouped_absmax_odd3 requires K % 64 == 0")
++
++    def produce(output):
++        for begin in range(0, n, request.rows_per_chunk):
++            end = min(n, begin + request.rows_per_chunk)
++            values = request.values(begin * k, end * k).reshape(end - begin, k)
++            g = values.to(device=request.device, dtype=torch.float32).reshape(end - begin, k // 64, 64)
++            amax = g.abs().amax(-1)
++            best = None
++            for alpha in (1.0, 0.95, 0.9, 0.85, 0.8):
++                s = (amax * alpha / 7).half().float()
++                s = torch.where((s == 0) & (amax > 0), torch.full_like(s, 2.0 ** -24), s)
++                r = torch.where(s > 0, 1.0 / s, torch.zeros_like(s))
++                d = torch.clamp(2 * torch.floor(g * r[..., None] / 2) + 1, -7, 7)
++                err = ((d * s[..., None] - g) ** 2).sum(-1)
++                if best is None:
++                    best = [err, d, s]
++                else:
++                    m = err < best[0]
++                    best = [torch.where(m, err, best[0]), torch.where(m[..., None], d, best[1]),
++                            torch.where(m, s, best[2])]
++            output.write_codes(begin, best[1].to(torch.int8), best[2].half())
++
++    return request.job(produce=produce)
++
++
+ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
+     """Round inputs to BF16, then quantize to FP8 codes with BF16 row scales."""
+     if request.target.format != "fp8_e4m3fn_row_bf16" or len(request.target.shape) != 2:
+@@ -327,6 +362,7 @@ METHODS: dict[str, Method] = {
+     "import_grouped": import_grouped,
+     "cast_direct": cast_direct,
+     "grouped_absmax": grouped_absmax,
++    "grouped_absmax_odd3": grouped_absmax_odd3,
+     "fp8_row_maxabs": fp8_row_maxabs,
+     "import_encoded": import_encoded,
+ }
+diff --git a/tools/convert/proposal.py b/tools/convert/proposal.py
+index e8e378e..7af4b34 100644
+--- a/tools/convert/proposal.py
++++ b/tools/convert/proposal.py
+@@ -2,6 +2,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ from pathlib import Path
+ 
+ import numpy as np
+@@ -92,7 +94,9 @@ def add_proposal(
+     )
+     recipe.add_parameter("proposal/head")
+     recipe.add_parameter("proposal/token_ids")
+-    recipe.assign("proposal/head", format=format, method="grouped_absmax")
++    # Research: PROPOSAL_METHOD=grouped_absmax_odd3 puts the head on the 3-bit half grid (odd Q4 codes).
++    recipe.assign("proposal/head", format=format,
++                  method=os.environ.get("PROPOSAL_METHOD", "grouped_absmax"))
+ 
+ 
+ def add_official_proposal(
+-- 
+2.34.1
+

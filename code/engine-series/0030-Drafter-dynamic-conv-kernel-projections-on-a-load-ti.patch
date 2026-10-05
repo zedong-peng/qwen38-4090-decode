@@ -1,0 +1,270 @@
+From c0d80b6bc37b04dc470d0ecddc5881f7ef968f73 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 18:45:12 +0800
+Subject: [PATCH 30/49] Drafter dynamic-conv kernel projections on a load-time
+ Q4 copy, Ada small-T route (NINFER_DRAFT_CONV_Q4, research21)
+
+---
+ include/ninfer/ops/linear_topk.h              |  4 ++
+ src/models/qwen3_5/execution/parameters.cpp   | 39 ++++++++++++
+ ...f16_dynamic_grouped_conv_prepare_kernels.h |  4 ++
+ ...bf16_dynamic_grouped_conv_prepare_plan.cpp |  6 ++
+ .../q4/q4_dynamic_grouped_conv_prepare.cu     | 60 +++++++++++++++++++
+ src/ops/dynamic_grouped_conv/sources.cmake    |  1 +
+ src/ops/linear_topk/two_level_head.cu         | 34 +++++++++++
+ src/ops/wrapper/dynamic_grouped_conv.cpp      | 11 +++-
+ 8 files changed, 158 insertions(+), 1 deletion(-)
+ create mode 100644 src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_prepare.cu
+
+diff --git a/include/ninfer/ops/linear_topk.h b/include/ninfer/ops/linear_topk.h
+index 9e0ce5a..be3ab13 100644
+--- a/include/ninfer/ops/linear_topk.h
++++ b/include/ninfer/ops/linear_topk.h
+@@ -74,6 +74,10 @@ void q8_fake_requantize_inplace(const Weight& q8, int bits, cudaStream_t stream)
+ // Research: the same grid for a contiguous BF16 [n, k] weight (k % 64 == 0), stored back as BF16 c*s
+ // (see NINFER_DRAFT_FAKEQ_CONV).
+ void bf16_fake_requantize_inplace(const Weight& w, int bits, cudaStream_t stream);
++// Research (NINFER_DRAFT_CONV_Q4): a row-split Q4 G64 FP16 copy of a contiguous BF16 [n, k] weight on the grid of
++// bf16_fake_requantize_inplace(w, 4) (FP16 absmax/7 scale per 64, codes in [-7, 7]); codes n*k/2 bytes, scales
++// n*k/64 FP16.
++void bf16_to_q4_rowsplit(const Weight& w, void* codes, void* scales, cudaStream_t stream);
+ 
+ void two_level_head_requantize(const Weight& q8_head, void* q4_codes, void* q4_scales,
+                                cudaStream_t stream);
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 99f2390..5880ce0 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -400,6 +400,45 @@ Parameters::Parameters(const Model& source) : model(source) {
+             std::fprintf(stderr, "drafter fake-quant: %d qkv/context projections on a %d-bit G64 grid\n",
+                          count, bits);
+         }
++        // Research: NINFER_DRAFT_CONV_Q4=1 runs the dynamic-conv kernel projections from a row-split Q4 G64 copy
++        // (load-time RTN onto the NINFER_DRAFT_FAKEQ_CONV=4 grid) on the Ada small-T kernel.
++        if (const char* q4 = std::getenv("NINFER_DRAFT_CONV_Q4"); q4 != nullptr && std::atoi(q4) == 1) {
++            int count = 0;
++            for (auto& layer : draft->layers) {
++                for (auto* conv : {&layer.attention_conv, &layer.mlp_conv}) {
++                    if (!conv->has_value()) { continue; }
++                    Weight& w = (*conv)->kernel_projection.weight;
++                    if (w.qtype != QType::BF16 || w.k % 64 != 0) { continue; }
++                    const std::size_t code_bytes  = static_cast<std::size_t>(w.n) * w.k / 2;
++                    const std::size_t scale_bytes = static_cast<std::size_t>(w.n) * (w.k / 64) * 2;
++                    void* memory                  = nullptr;
++                    CUDA_CHECK(cudaMalloc(&memory, code_bytes + scale_bytes));
++                    void* scales = static_cast<std::uint8_t*>(memory) + code_bytes;
++                    ops::bf16_to_q4_rowsplit(w, memory, scales, nullptr);
++                    Weight q;
++                    q.qtype           = QType::Q4_G64_FP16;
++                    q.layout          = QuantLayout::RowSplit;
++                    q.scale_dtype     = DType::FP16;
++                    q.group_size      = 64;
++                    q.group           = 64;
++                    q.ndim            = 2;
++                    q.n               = w.n;
++                    q.k               = w.k;
++                    q.shape[0]        = w.n;
++                    q.shape[1]        = w.k;
++                    q.padded_shape[0] = w.n;
++                    q.padded_shape[1] = w.k;
++                    q.qdata           = memory;
++                    q.scales          = scales;
++                    q.payload         = memory;
++                    q.payload_bytes   = code_bytes;
++                    w                 = q;
++                    ++count;
++                }
++            }
++            CUDA_CHECK(cudaDeviceSynchronize());
++            std::fprintf(stderr, "drafter conv kernel projections on Q4: %d\n", count);
++        }
+         if (const char* fake = std::getenv("NINFER_DRAFT_FAKEQ_CONV"); fake != nullptr && *fake) {
+             const int bits = std::atoi(fake);
+             int count      = 0;
+diff --git a/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h b/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h
+index 8d24f0e..258bf8b 100644
+--- a/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h
++++ b/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h
+@@ -13,6 +13,10 @@ struct DynamicConvPrepareRoute {
+ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute route,
+                                                       const Tensor& input, const Weight& weight,
+                                                       float* partial, cudaStream_t stream);
++// Research (NINFER_DRAFT_CONV_Q4): the projection of a row-split Q4 G64 [1280, 5120] weight into the reduce kernel's
++// FP32 partial plane with one split (partial[token * 1280 + row]).
++void q4_dynamic_grouped_conv_prepare_partial_launch(const Tensor& input, const Weight& weight, float* partial,
++                                                    cudaStream_t stream);
+ void bf16_dynamic_grouped_conv_prepare_reduce_launch(DynamicConvPrepareRoute route,
+                                                      const Tensor& base, const float* partial,
+                                                      Tensor& prepared, Tensor& finish,
+diff --git a/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp b/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
+index a6feaac..e2dc6ab 100644
+--- a/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
++++ b/src/ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp
+@@ -25,6 +25,12 @@ void execute(DynamicConvPrepareRoute route, const Tensor& residual, const Tensor
+     const int tokens = residual.ne[1] * residual.ne[2];
+     float* partial   = static_cast<float*>(workspace.alloc_bytes(capacity(route, tokens)).data);
+     rmsnorm(residual, norm, eps, false, prepared, stream);
++    if (weight.qtype == QType::Q4_G64_FP16) {  // research: NINFER_DRAFT_CONV_Q4, one split
++        q4_dynamic_grouped_conv_prepare_partial_launch(prepared, weight, partial, stream);
++        bf16_dynamic_grouped_conv_prepare_reduce_launch({route.rows, route.columns, 1}, base, partial, prepared,
++                                                        finish, stream);
++        return;
++    }
+     bf16_dynamic_grouped_conv_prepare_partial_launch(route, prepared, weight, partial, stream);
+     bf16_dynamic_grouped_conv_prepare_reduce_launch(route, base, partial, prepared, finish, stream);
+ }
+diff --git a/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_prepare.cu b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_prepare.cu
+new file mode 100644
+index 0000000..3f14ed0
+--- /dev/null
++++ b/src/ops/dynamic_grouped_conv/q4/q4_dynamic_grouped_conv_prepare.cu
+@@ -0,0 +1,60 @@
++// Research (NINFER_DRAFT_CONV_Q4): Q4 dynamic-conv kernel projection on the Ada small-T kernel.
++
++#include "core/weight.h"
++#include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
++
++#include "core/device.h"
++#include "ops/linear/ada_small_t_mma.cuh"
++
++#include <cuda_bf16.h>
++
++#include <cstdint>
++#include <stdexcept>
++
++namespace ninfer::ops::detail {
++namespace {
++constexpr int kHidden = 5120, kCoefficientRows = 1280;
++
++struct PartialEpilogue {
++    static constexpr bool kPairedHalves = false;
++    float* partial;
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        partial[static_cast<std::int64_t>(token) * kCoefficientRows + row] = value;
++    }
++};
++
++template <int TokenTiles>
++void launch(const __nv_bfloat16* x, int tokens, const Weight& w, float* partial, cudaStream_t stream) {
++    // 8-row CTAs: 160 CTAs for 1280 rows (a 3.3 MB weight cannot fill 128 SMs with larger tiles).
++    using S = Q4AdaSmallTSchedule<1, 8, TokenTiles, 8, 2>;
++    static_assert(kCoefficientRows % S::kRowsPerCta == 0);
++    ada_small_t_mma_launch<S, kHidden>(x, kHidden, static_cast<const std::uint8_t*>(w.qdata), nullptr, ada_scales(w),
++                                       kCoefficientRows, tokens, PartialEpilogue{partial}, stream, ada_super(w));
++    CUDA_CHECK(cudaGetLastError());
++}
++} // namespace
++
++void q4_dynamic_grouped_conv_prepare_partial_launch(const Tensor& input, const Weight& weight, float* partial,
++                                                    cudaStream_t stream) {
++    if (weight.qtype != QType::Q4_G64_FP16 || weight.layout != QuantLayout::RowSplit || weight.n != kCoefficientRows ||
++        weight.k != kHidden || weight.qdata == nullptr || weight.scales == nullptr) {
++        throw std::invalid_argument("q4 dynamic grouped conv prepare: requires a row-split Q4 G64 [1280,5120] weight");
++    }
++    const int tokens = input.ne[1] * input.ne[2];
++    if (tokens < 1 || !input.is_contiguous()) {
++        throw std::invalid_argument("q4 dynamic grouped conv prepare: requires contiguous [5120, W, B] columns");
++    }
++    // The small-T kernel takes up to 16 columns per launch; wider batches run in column chunks.
++    const auto* x = static_cast<const __nv_bfloat16*>(input.data);
++    for (int c0 = 0; c0 < tokens; c0 += 16) {
++        const int n = tokens - c0 < 16 ? tokens - c0 : 16;
++        const auto* xc = x + static_cast<std::int64_t>(c0) * kHidden;
++        float* pc      = partial + static_cast<std::int64_t>(c0) * kCoefficientRows;
++        if (n <= 8) {
++            launch<1>(xc, n, weight, pc, stream);
++        } else {
++            launch<2>(xc, n, weight, pc, stream);
++        }
++    }
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/dynamic_grouped_conv/sources.cmake b/src/ops/dynamic_grouped_conv/sources.cmake
+index 1780cb5..84b6a13 100644
+--- a/src/ops/dynamic_grouped_conv/sources.cmake
++++ b/src/ops/dynamic_grouped_conv/sources.cmake
+@@ -7,6 +7,7 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_dynamic_grouped_conv_prepare_plan.cpp"
+   "${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv_add_finish.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_dynamic_grouped_conv_add.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/q4/q4_dynamic_grouped_conv_prepare.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q5/q5_dynamic_grouped_conv_add.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dynamic_grouped_conv_add_materialized.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dynamic_grouped_conv_add_plan.cpp"
+diff --git a/src/ops/linear_topk/two_level_head.cu b/src/ops/linear_topk/two_level_head.cu
+index 3ff68c1..16b17ba 100644
+--- a/src/ops/linear_topk/two_level_head.cu
++++ b/src/ops/linear_topk/two_level_head.cu
+@@ -179,6 +179,40 @@ __global__ void bf16_fake_requant_kernel(__nv_bfloat16* __restrict__ w, std::int
+ }
+ } // namespace
+ 
++namespace {
++__global__ void bf16_to_q4_kernel(const __nv_bfloat16* __restrict__ w, std::uint8_t* __restrict__ codes,
++                                  __half* __restrict__ scales, std::int64_t rows, int k) {
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    const int groups         = k / 64;
++    if (index >= rows * groups) { return; }
++    const __nv_bfloat16* p = w + (index / groups) * k + (index % groups) * 64;
++    float absmax           = 0.0f;
++    for (int i = 0; i < 64; ++i) { absmax = fmaxf(absmax, fabsf(__bfloat162float(p[i]))); }
++    __half scale = __float2half_rn(absmax / 7.0f);
++    if (__half2float(scale) == 0.0f && absmax > 0.0f) { scale = __ushort_as_half(1); }
++    const float s       = __half2float(scale);
++    const float inverse = s > 0.0f ? 1.0f / s : 0.0f;
++    std::uint8_t* c     = codes + index * 32;
++    for (int i = 0; i < 64; i += 2) {
++        const int q0 = max(-7, min(7, __float2int_rn(__bfloat162float(p[i]) * inverse)));
++        const int q1 = max(-7, min(7, __float2int_rn(__bfloat162float(p[i + 1]) * inverse)));
++        c[i / 2]     = static_cast<std::uint8_t>((q0 & 0xf) | ((q1 & 0xf) << 4));
++    }
++    scales[index] = scale;
++}
++} // namespace
++
++void bf16_to_q4_rowsplit(const Weight& w, void* codes, void* scales, cudaStream_t stream) {
++    if (w.qtype != QType::BF16 || w.k % 64 != 0 || w.qdata == nullptr) {
++        throw std::invalid_argument("bf16 to q4: requires a contiguous BF16 weight with k % 64 == 0");
++    }
++    const std::int64_t threads = static_cast<std::int64_t>(w.n) * (w.k / 64);
++    bf16_to_q4_kernel<<<static_cast<unsigned>((threads + 127) / 128), 128, 0, stream>>>(
++        static_cast<const __nv_bfloat16*>(w.qdata), static_cast<std::uint8_t*>(codes), static_cast<__half*>(scales),
++        w.n, w.k);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void bf16_fake_requantize_inplace(const Weight& w, int bits, cudaStream_t stream) {
+     if (w.qtype != QType::BF16 || w.k % 64 != 0 || w.qdata == nullptr || bits < 2 || bits > 8) {
+         throw std::invalid_argument("bf16 fake requantize: requires a contiguous BF16 weight with k % 64 == 0");
+diff --git a/src/ops/wrapper/dynamic_grouped_conv.cpp b/src/ops/wrapper/dynamic_grouped_conv.cpp
+index 72deafc..8d4b03b 100644
+--- a/src/ops/wrapper/dynamic_grouped_conv.cpp
++++ b/src/ops/wrapper/dynamic_grouped_conv.cpp
+@@ -42,6 +42,13 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t d0, std::int
+ }
+ 
+ void require_kernel_projection_weight(const Weight& weight) {
++    if (weight.qtype == QType::Q4_G64_FP16) {  // research: NINFER_DRAFT_CONV_Q4
++        if (weight.layout != QuantLayout::RowSplit || weight.n != kCoefficientRows || weight.k != kHidden ||
++            weight.qdata == nullptr || weight.scales == nullptr || !aligned_to(weight.qdata, 16)) {
++            throw std::invalid_argument("dynamic grouped conv prepare: invalid Q4 kernel_projection_weight");
++        }
++        return;
++    }
+     constexpr std::uint64_t kPayloadBytes =
+         static_cast<std::uint64_t>(kCoefficientRows) * kHidden * sizeof(std::uint16_t);
+     if (weight.qtype != QType::BF16 || weight.layout != QuantLayout::Contiguous ||
+@@ -147,7 +154,9 @@ void require_nonoverlap(const Tensor& residual, const Tensor& norm_weight,
+         {residual.data, residual.bytes(), "residual"},
+         {norm_weight.data, norm_weight.bytes(), "norm_weight"},
+         {base_kernel.data, base_kernel.bytes(), "base_kernel"},
+-        {kernel_projection_weight.qdata, kWeightBytes, "kernel_projection_weight"},
++        {kernel_projection_weight.qdata,
++         kernel_projection_weight.qtype == QType::BF16 ? kWeightBytes : kernel_projection_weight.payload_bytes,
++         "kernel_projection_weight"},
+         {prepared.data, prepared.bytes(), "prepared"},
+         {finish_delta.data, finish_delta.bytes(), "finish_delta"},
+         {workspace.base(), workspace.capacity(), "workspace"},
+-- 
+2.34.1
+

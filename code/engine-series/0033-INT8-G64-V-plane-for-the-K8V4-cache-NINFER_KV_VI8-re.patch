@@ -1,0 +1,988 @@
+From 082c83401663848fe8285b51da39aa78b413b841 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 06:44:45 +0800
+Subject: [PATCH 33/49] INT8 G64 V plane for the K8V4 cache (NINFER_KV_VI8,
+ research24)
+
+NINFER_KV_VI8=1 keeps K8V4's FP8-row K and Hadamard-rotated V but stores each rotated V row as INT8 G64 (256 code
+bytes + four FP16 scales) instead of NVFP4 G16. Append, prompt, tiled and wide small-T verify, and the accepted-path
+compaction take a VInt8 template flag chosen at launch; INT8 widens to FP16 exactly with the 0x6400 magic before the
+scale multiply; the wide verify kernel keeps 3 packed stages so its arena stays under 99 KB. Knob off is unchanged
+(e2e5 Spec-Bench-480 ids 482/482 identical to research23, fidelity identical). Engine fidelity of e2e5 with the knob:
+prose 0.02646, code 0.10164, overall 0.06179, top-1 0.9256 (NVFP4 V: 0.02767 / 0.10341 / 0.06326, 0.9242).
+---
+ src/core/paged_kv_storage.h                   |  16 ++-
+ src/ops/kernel/speculative_round.cuh          |  36 ++++--
+ src/ops/kv_cache/append/k8v4_kernel.cuh       |  16 ++-
+ src/ops/kv_cache/append/k8v4_launch.cu        |  20 +++-
+ src/ops/kv_cache/k8v4_value.cuh               |  92 +++++++++++++++
+ src/ops/launcher/speculative_round.cu         |   5 +
+ .../dense/causal_cache/prompt_k8v4.cu         |  30 +++--
+ .../dense/causal_cache/prompt_k8v4.cuh        |  65 +++++++---
+ .../dense/causal_cache/small_t_k8v4.cu        |  42 +++++--
+ .../dense/causal_cache/small_t_k8v4.cuh       | 111 ++++++++++++------
+ 10 files changed, 340 insertions(+), 93 deletions(-)
+ create mode 100644 src/ops/kv_cache/k8v4_value.cuh
+
+diff --git a/src/core/paged_kv_storage.h b/src/core/paged_kv_storage.h
+index 8e5450f..3dd395b 100644
+--- a/src/core/paged_kv_storage.h
++++ b/src/core/paged_kv_storage.h
+@@ -5,6 +5,8 @@
+ 
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer {
+@@ -55,6 +57,17 @@ struct PagedKVStorageLayout {
+     friend bool operator==(const PagedKVStorageLayout&, const PagedKVStorageLayout&) = default;
+ };
+ 
++/** Research (NINFER_KV_VI8=1): --kv-dtype k8v4 stores its rotated V rows as INT8 G64 instead of NVFP4 G16. */
++[[nodiscard]] inline bool k8v4_value_int8() {
++    static const bool on = [] {
++        const char* value = std::getenv("NINFER_KV_VI8");
++        const bool set    = value != nullptr && value[0] == '1';
++        if (set) { std::fprintf(stderr, "NINFER_KV_VI8: K8V4 V plane is INT8 G64 (rotated)\n"); }
++        return set;
++    }();
++    return on;
++}
++
+ [[nodiscard]] inline PagedKVStorageLayout paged_kv_storage_layout(KvCacheStorage storage,
+                                                                   std::int32_t head_dim) {
+     if (head_dim <= 0) { throw std::invalid_argument("KV-cache head dimension must be positive"); }
+@@ -84,7 +97,8 @@ struct PagedKVStorageLayout {
+             return {storage,
+                     head_dim,
+                     {DType::FP8_E4M3FN, 256, DType::FP16, 1},
+-                    {DType::U8, 128, DType::U8, 16}};
++                    k8v4_value_int8() ? PagedKVVectorLayout{DType::I8, 256, DType::FP16, 4}
++                                      : PagedKVVectorLayout{DType::U8, 128, DType::U8, 16}};
+         }
+         break;
+     }
+diff --git a/src/ops/kernel/speculative_round.cuh b/src/ops/kernel/speculative_round.cuh
+index 8100754..e270554 100644
+--- a/src/ops/kernel/speculative_round.cuh
++++ b/src/ops/kernel/speculative_round.cuh
+@@ -883,13 +883,15 @@ struct SpeculativeKVCompactLayers {
+ // j-th column, at positions[accepted_columns[j]], moves to positions[j]. A step reads its source
+ // rows completely before any thread writes, since a later step's source may be this step's
+ // destination.
+-template <int KVHeads>
++template <int KVHeads, bool VInt8 = false>
+ __global__ __launch_bounds__(256) void speculative_compact_k8v4_kernel(
+     SpeculativeKVCompactLayers layers, const std::int32_t* block_tables, std::int32_t table_stride,
+     const std::int32_t* table_rows, const std::int32_t* cache_positions,
+     const std::int32_t* accepted_columns, const std::int32_t* accepted, std::int32_t width) {
+     constexpr int kKChunks      = 256 / 16;
+-    constexpr int kVChunks      = 128 / 16;
++    // NINFER_KV_VI8: V rows are 256 INT8 codes and four FP16 scales instead of 128 NVFP4 bytes and 16 scales.
++    constexpr int kVBytes       = VInt8 ? 256 : 128;
++    constexpr int kVChunks      = kVBytes / 16;
+     constexpr int kItemsPerHead = kKChunks + kVChunks + 2;
+     constexpr int kItems        = kItemsPerHead * KVHeads;
+     static_assert(kItems <= 256);
+@@ -920,12 +922,19 @@ __global__ __launch_bounds__(256) void speculative_compact_k8v4_kernel(
+                                          source_page, head, source_offset, part * 16));
+             } else if (part < kKChunks + kVChunks) {
+                 chunk = *reinterpret_cast<const uint4*>(
+-                    planes.v_codes + paged_kv_element_offset<128, KVHeads>(
++                    planes.v_codes + paged_kv_element_offset<kVBytes, KVHeads>(
+                                          source_page, head, source_offset, (part - kKChunks) * 16));
+             } else if (part == kKChunks + kVChunks) {
+-                chunk = *reinterpret_cast<const uint4*>(
+-                    planes.v_scales +
+-                    paged_kv_element_offset<16, KVHeads>(source_page, head, source_offset, 0));
++                if constexpr (VInt8) {
++                    const uint2 s = *reinterpret_cast<const uint2*>(
++                        planes.v_scales +
++                        2 * paged_kv_element_offset<4, KVHeads>(source_page, head, source_offset, 0));
++                    chunk = make_uint4(s.x, s.y, 0U, 0U);
++                } else {
++                    chunk = *reinterpret_cast<const uint4*>(
++                        planes.v_scales +
++                        paged_kv_element_offset<16, KVHeads>(source_page, head, source_offset, 0));
++                }
+             } else {
+                 scale = planes.k_scales[paged_kv_element_offset<1, KVHeads>(source_page, head,
+                                                                             source_offset, 0)];
+@@ -938,13 +947,20 @@ __global__ __launch_bounds__(256) void speculative_compact_k8v4_kernel(
+                                           paged_kv_element_offset<256, KVHeads>(
+                                               target_page, head, target_offset, part * 16)) = chunk;
+             } else if (part < kKChunks + kVChunks) {
+-                *reinterpret_cast<uint4*>(planes.v_codes + paged_kv_element_offset<128, KVHeads>(
++                *reinterpret_cast<uint4*>(planes.v_codes + paged_kv_element_offset<kVBytes, KVHeads>(
+                                                                target_page, head, target_offset,
+                                                                (part - kKChunks) * 16)) = chunk;
+             } else if (part == kKChunks + kVChunks) {
+-                *reinterpret_cast<uint4*>(planes.v_scales +
+-                                          paged_kv_element_offset<16, KVHeads>(
+-                                              target_page, head, target_offset, 0)) = chunk;
++                if constexpr (VInt8) {
++                    *reinterpret_cast<uint2*>(planes.v_scales +
++                                              2 * paged_kv_element_offset<4, KVHeads>(
++                                                      target_page, head, target_offset, 0)) =
++                        make_uint2(chunk.x, chunk.y);
++                } else {
++                    *reinterpret_cast<uint4*>(planes.v_scales +
++                                              paged_kv_element_offset<16, KVHeads>(
++                                                  target_page, head, target_offset, 0)) = chunk;
++                }
+             } else {
+                 planes.k_scales[paged_kv_element_offset<1, KVHeads>(target_page, head,
+                                                                     target_offset, 0)] = scale;
+diff --git a/src/ops/kv_cache/append/k8v4_kernel.cuh b/src/ops/kv_cache/append/k8v4_kernel.cuh
+index 88e7d97..b458e70 100644
+--- a/src/ops/kv_cache/append/k8v4_kernel.cuh
++++ b/src/ops/kv_cache/append/k8v4_kernel.cuh
+@@ -9,6 +9,7 @@
+ #include "ops/kv_cache/append/geometry.cuh"
+ #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+ #include "ops/kv_cache/hadamard_d256.cuh"
++#include "ops/kv_cache/k8v4_value.cuh"
+ #include "ops/kv_cache/nvfp4_group16_codec.cuh"
+ 
+ #include <cuda_bf16.h>
+@@ -19,7 +20,7 @@
+ 
+ namespace ninfer::ops {
+ 
+-template <typename Geometry>
++template <typename Geometry, bool VInt8>
+ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
+     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+     std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
+@@ -54,6 +55,11 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
+         values[r]   = __bfloat162float(v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+     }
+     normalized_hadamard_d256_inplace(values, lane);
++    if constexpr (VInt8) {
++        k8v4_value_store_int8_row<Geometry>(values, lane, cache_v, scale_v, physical_page, kv_head,
++                                            page_offset);
++        return;
++    }
+ #pragma unroll
+     for (int r = 0; r < 8; ++r) scratch[lane + 32 * r] = values[r];
+     __syncwarp();
+@@ -67,7 +73,7 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
+     }
+ }
+ 
+-template <typename Geometry, typename Metadata>
++template <typename Geometry, typename Metadata, bool VInt8 = false>
+ __launch_bounds__(256) __global__
+     void kv_cache_append_full_k8v4_kernel(const __nv_bfloat16* __restrict__ k,
+                                           const __nv_bfloat16* __restrict__ v,
+@@ -92,12 +98,12 @@ __launch_bounds__(256) __global__
+     const std::int32_t* block_table = metadata.block_table();
+     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
+     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
+-    kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
++    kv_cache_append_full_k8v4_row<Geometry, VInt8>(k, v, cache_k, cache_v, scale_k, scale_v, token,
+                                             kv_head, physical_page, position & kPagedKVPageMask,
+                                             lane, scratch[warp]);
+ }
+ 
+-template <typename Geometry, typename Metadata>
++template <typename Geometry, typename Metadata, bool VInt8 = false>
+ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
+     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+     const std::int32_t* __restrict__ positions, Metadata metadata,
+@@ -122,7 +128,7 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
+     int physical_page  = lane == 0 ? block_table[tile_position >> kPagedKVPageShift] : 0;
+     physical_page      = __shfl_sync(FullMask, physical_page, 0);
+     const int position = base_position + token;
+-    kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
++    kv_cache_append_full_k8v4_row<Geometry, VInt8>(k, v, cache_k, cache_v, scale_k, scale_v, token,
+                                             kv_head, physical_page, position & kPagedKVPageMask,
+                                             lane, scratch[warp]);
+ }
+diff --git a/src/ops/kv_cache/append/k8v4_launch.cu b/src/ops/kv_cache/append/k8v4_launch.cu
+index f1ca4c5..6b3369d 100644
+--- a/src/ops/kv_cache/append/k8v4_launch.cu
++++ b/src/ops/kv_cache/append/k8v4_launch.cu
+@@ -2,6 +2,7 @@
+ #include "ops/kv_cache/append/launch.h"
+ 
+ #include "core/device.h"
++#include "core/paged_kv_storage.h"
+ #include "ops/common/math.h"
+ #include "ops/kv_cache/append/k8v4_kernel.cuh"
+ 
+@@ -12,7 +13,7 @@ namespace {
+ 
+ constexpr int kBlock = 256;
+ 
+-template <typename Geometry, typename CacheView, typename Metadata>
++template <typename Geometry, bool VInt8, typename CacheView, typename Metadata>
+ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
+                      Metadata metadata, cudaStream_t stream) {
+     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
+@@ -24,7 +25,7 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions,
+         constexpr int TokensPerTile = 8;
+         const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
+         const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(Geometry::KVHeads));
+-        kv_cache_append_full_k8v4_page_kernel<Geometry, Metadata><<<grid, kBlock, 0, stream>>>(
++        kv_cache_append_full_k8v4_page_kernel<Geometry, Metadata, VInt8><<<grid, kBlock, 0, stream>>>(
+             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+             static_cast<const std::int32_t*>(positions.data), metadata, cache_k, cache_v, scale_k,
+             scale_v, tokens);
+@@ -32,7 +33,7 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions,
+         constexpr int FillWarps       = kBlock / 32;
+         const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
+         const int grid = static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+-        kv_cache_append_full_k8v4_kernel<Geometry, Metadata><<<grid, kBlock, 0, stream>>>(
++        kv_cache_append_full_k8v4_kernel<Geometry, Metadata, VInt8><<<grid, kBlock, 0, stream>>>(
+             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+             static_cast<const std::int32_t*>(positions.data), metadata, cache_k, cache_v, scale_k,
+             scale_v, tokens);
+@@ -43,11 +44,20 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions,
+ template <typename CacheView, typename Metadata>
+ void dispatch_k8v4(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
+                    Metadata metadata, cudaStream_t stream) {
++    const bool v_int8 = k8v4_value_int8();
+     if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
+-        launch_k8v4_for<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
++        if (v_int8) {
++            launch_k8v4_for<KVCacheAppendD256Kv4, true>(k, v, positions, cache, metadata, stream);
++        } else {
++            launch_k8v4_for<KVCacheAppendD256Kv4, false>(k, v, positions, cache, metadata, stream);
++        }
+         return;
+     }
+-    launch_k8v4_for<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
++    if (v_int8) {
++        launch_k8v4_for<KVCacheAppendD256Kv2, true>(k, v, positions, cache, metadata, stream);
++    } else {
++        launch_k8v4_for<KVCacheAppendD256Kv2, false>(k, v, positions, cache, metadata, stream);
++    }
+ }
+ 
+ } // namespace
+diff --git a/src/ops/kv_cache/k8v4_value.cuh b/src/ops/kv_cache/k8v4_value.cuh
+new file mode 100644
+index 0000000..d659ca4
+--- /dev/null
++++ b/src/ops/kv_cache/k8v4_value.cuh
+@@ -0,0 +1,92 @@
++#pragma once
++
++// Research (NINFER_KV_VI8=1, see k8v4_value_int8() in core/paged_kv_storage.h): the V plane of --kv-dtype k8v4.
++// K8V4Value<false> is the release codec, the Hadamard-rotated row as NVFP4 G16 (128 code bytes and 16 E4M3 group
++// scales per row). K8V4Value<true> stores the same rotated row as INT8 G64 (256 code bytes and four FP16 group
++// scales per row, the INT8 storage's V plane). Both widen to FP16 for the K8V4 PV MMAs; K is FP8 rows either way.
++
++#include "ops/common/memory.cuh"
++#include "ops/common/warp.cuh"
++#include "ops/kv_cache/int8_g64_codec.cuh"
++#include "ops/kv_cache/nvfp4_group16_codec.cuh"
++
++#include <cuda_bf16.h>
++#include <cuda_fp16.h>
++
++#include <cstdint>
++
++namespace ninfer::ops {
++
++template <bool VInt8>
++struct K8V4Value {
++    // Bytes per cache row.
++    static constexpr int kCodeBytes  = VInt8 ? kKVCacheInt8HeadDim : kKVCacheNvfp4CodeBytes;
++    static constexpr int kScaleBytes = VInt8 ? kKVCacheInt8Groups * 2 : kKVCacheNvfp4Groups;
++
++    // Byte offset of the row's code bytes (dimension 0) and of its first scale byte.
++    template <typename Geometry>
++    __device__ __forceinline__ static std::int64_t code_offset(int page, int kv_head,
++                                                               int page_offset) {
++        if constexpr (VInt8) {
++            return kv_cache_int8_quant_code_index<Geometry>(page, kv_head, 0, page_offset);
++        } else {
++            return kv_cache_nvfp4_code_index<Geometry>(page, kv_head, 0, page_offset);
++        }
++    }
++    template <typename Geometry>
++    __device__ __forceinline__ static std::int64_t scale_offset(int page, int kv_head,
++                                                                int page_offset) {
++        if constexpr (VInt8) {
++            return 2 * kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, 0, page_offset);
++        } else {
++            return kv_cache_nvfp4_scale_index<Geometry>(page, kv_head, 0, page_offset);
++        }
++    }
++};
++
++// Eight INT8 codes times an FP16 scale as eight FP16 values. FP16 bits 0x6400 | u are exactly 1024 + u for u < 1024,
++// so with u = c ^ 0x80 (= c + 128) every code c is exactly (1024 + u) - 1152 before the scale multiply.
++__device__ __forceinline__ int4 k8v4_value_i8x8_to_f16x8(uint2 raw, __half scale) {
++    const __half2 scale2 = __halves2half2(scale, scale);
++    const __half2 bias   = __float2half2_rn(1152.0F);
++    const std::uint32_t words[2] = {raw.x ^ 0x80808080U, raw.y ^ 0x80808080U};
++    unsigned half_bits[4];
++#pragma unroll
++    for (int pair = 0; pair < 4; ++pair) {
++        const std::uint32_t bits =
++            __byte_perm(words[pair >> 1], 0x64646464U, (pair & 1) != 0 ? 0x5342U : 0x5140U);
++        const __half2 value =
++            __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&bits), bias), scale2);
++        half_bits[pair] = *reinterpret_cast<const unsigned*>(&value);
++    }
++    return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
++                     static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
++}
++
++// INT8 G64 quantization of one rotated D256 row held by a warp (lane l owns dimension l + 32r in values[r]; group g
++// is values[2g], values[2g + 1]). Same scale and code rules as the INT8 storage (kv_cache_int8_quant_params).
++template <typename Geometry>
++__device__ __forceinline__ void k8v4_value_store_int8_row(const float (&values)[8], int lane,
++                                                          std::uint8_t* cache_v,
++                                                          std::uint8_t* cache_v_scale, int page,
++                                                          int kv_head, int page_offset) {
++    constexpr unsigned FullMask = 0xffffffffU;
++    auto* const scales          = reinterpret_cast<__half*>(cache_v_scale);
++#pragma unroll
++    for (int group = 0; group < kKVCacheInt8Groups; ++group) {
++        const float a0     = values[2 * group];
++        const float a1     = values[2 * group + 1];
++        const auto quant   = kv_cache_int8_quant_params(warp_max(fmaxf(fabsf(a0), fabsf(a1)), FullMask));
++        const int d0       = lane + 64 * group;
++        cache_v[kv_cache_int8_quant_code_index<Geometry>(page, kv_head, d0, page_offset)] =
++            static_cast<std::uint8_t>(kv_cache_int8_quant_code(a0, quant.inverse_scale));
++        cache_v[kv_cache_int8_quant_code_index<Geometry>(page, kv_head, d0 + 32, page_offset)] =
++            static_cast<std::uint8_t>(kv_cache_int8_quant_code(a1, quant.inverse_scale));
++        if (lane == 0) {
++            scales[kv_cache_int8_quant_scale_index<Geometry>(page, kv_head, group, page_offset)] =
++                quant.scale;
++        }
++    }
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/launcher/speculative_round.cu b/src/ops/launcher/speculative_round.cu
+index 8540267..9b7c1e0 100644
+--- a/src/ops/launcher/speculative_round.cu
++++ b/src/ops/launcher/speculative_round.cu
+@@ -10,6 +10,7 @@
+ #include "ops/common/math.h"
+ #include "ops/kernel/speculative_round.cuh"
+ #include "core/device.h"
++#include "core/paged_kv_storage.h"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -359,8 +360,12 @@ void speculative_compact_k8v4_launch(std::span<const PagedKVBatchLayerView> laye
+                 throw std::invalid_argument("speculative INT8 compaction: unsupported KV head count");
+             }
+             launch(speculative_compact_int8_kernel<4>);
++        } else if (view.num_kv_heads == 4 && k8v4_value_int8()) {
++            launch(speculative_compact_k8v4_kernel<4, true>);
+         } else if (view.num_kv_heads == 4) {
+             launch(speculative_compact_k8v4_kernel<4>);
++        } else if (view.num_kv_heads == 2 && k8v4_value_int8()) {
++            launch(speculative_compact_k8v4_kernel<2, true>);
+         } else if (view.num_kv_heads == 2) {
+             launch(speculative_compact_k8v4_kernel<2>);
+         } else {
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
+index e61378a..1046873 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cu
+@@ -2,6 +2,7 @@
+ #include "ops/softmax_attention/dense/causal_cache/launch.h"
+ 
+ #include "core/device.h"
++#include "core/paged_kv_storage.h"
+ #include "ops/common/math.h"
+ #include "ops/kv_cache/append/launch.h"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_k8v4.cuh"
+@@ -11,21 +12,21 @@
+ namespace ninfer::ops::detail {
+ namespace {
+ 
+-template <typename Geometry, typename CacheView, typename Metadata>
++template <typename Geometry, bool VInt8, typename CacheView, typename Metadata>
+ void causal_attention_prompt_k8v4_attention_launch_for(const Tensor& q, const Tensor& positions,
+                                                        float scale, const CacheView& cache,
+                                                        Metadata metadata, Tensor& out,
+                                                        cudaStream_t stream) {
+     static const cudaError_t attr = cudaFuncSetAttribute(
+-        causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,
+-        cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptK8V4SmemBytes);
++        causal_attention_prompt_k8v4_kernel<Geometry, Metadata, VInt8>,
++        cudaFuncAttributeMaxDynamicSharedMemorySize, K8V4PromptSmem<VInt8>::kSmemBytes);
+     CUDA_CHECK(attr);
+ 
+     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptK8V4Br)),
+                     static_cast<unsigned>(Geometry::QHeads), 1u);
+-    causal_attention_prompt_k8v4_kernel<Geometry, Metadata>
+-        <<<grid, kCausalPromptK8V4Threads, kCausalPromptK8V4SmemBytes, stream>>>(
++    causal_attention_prompt_k8v4_kernel<Geometry, Metadata, VInt8>
++        <<<grid, kCausalPromptK8V4Threads, K8V4PromptSmem<VInt8>::kSmemBytes, stream>>>(
+             static_cast<const __nv_bfloat16*>(q.data),
+             static_cast<const std::uint8_t*>(cache.k_pages.data),
+             static_cast<const std::uint8_t*>(cache.v_pages.data),
+@@ -41,13 +42,24 @@ void causal_attention_prompt_k8v4_attention_dispatch(const Tensor& q, const Tens
+                                                      float scale, const CacheView& cache,
+                                                      Metadata metadata, Tensor& out,
+                                                      cudaStream_t stream) {
++    const bool v_int8 = k8v4_value_int8();
+     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+-        causal_attention_prompt_k8v4_attention_launch_for<CausalD256H24Kv4>(
+-            q, positions, scale, cache, metadata, out, stream);
++        if (v_int8) {
++            causal_attention_prompt_k8v4_attention_launch_for<CausalD256H24Kv4, true>(
++                q, positions, scale, cache, metadata, out, stream);
++        } else {
++            causal_attention_prompt_k8v4_attention_launch_for<CausalD256H24Kv4, false>(
++                q, positions, scale, cache, metadata, out, stream);
++        }
+         return;
+     }
+-    causal_attention_prompt_k8v4_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
+-                                                                        metadata, out, stream);
++    if (v_int8) {
++        causal_attention_prompt_k8v4_attention_launch_for<CausalD256H16Kv2, true>(
++            q, positions, scale, cache, metadata, out, stream);
++    } else {
++        causal_attention_prompt_k8v4_attention_launch_for<CausalD256H16Kv2, false>(
++            q, positions, scale, cache, metadata, out, stream);
++    }
+ }
+ 
+ } // namespace
+diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cuh b/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cuh
+index 18ccf1e..70fab36 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/prompt_k8v4.cuh
+@@ -6,6 +6,7 @@
+ 
+ #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+ #include "ops/kv_cache/hadamard_d256.cuh"
++#include "ops/kv_cache/k8v4_value.cuh"
+ #include "ops/kv_cache/nvfp4_group16_codec.cuh"
+ #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+ 
+@@ -49,7 +50,21 @@ inline constexpr int kCausalPromptK8V4SmemBytes =
+ static_assert(kCausalPromptK8V4DConsumers == 4);
+ static_assert(kCausalPromptK8V4SmemBytes == 85120);
+ 
+-template <typename Geometry, typename Metadata>
++// Shared-memory plan per V codec (NINFER_KV_VI8): only the V code stage and the V scale plane change size.
++template <bool VInt8>
++struct K8V4PromptSmem {
++    static constexpr int kVBytes     = kCausalPromptK8V4Bc * K8V4Value<VInt8>::kCodeBytes;
++    static constexpr int kScaleBytes = kCausalPromptK8V4Bc * static_cast<int>(sizeof(__half)) +
++                                       kCausalPromptK8V4Bc * K8V4Value<VInt8>::kScaleBytes;
++    static constexpr int kSmemBytes =
++        kCausalPromptK8V4QBytes + kCausalPromptK8V4QScaleBytes + kCausalPromptK8V4KBytes + kVBytes +
++        kCausalPromptK8V4VStageBytes + kCausalPromptK8V4PBytes + kScaleBytes +
++        kCausalPromptK8V4StatsBytes;
++};
++static_assert(K8V4PromptSmem<false>::kSmemBytes == kCausalPromptK8V4SmemBytes);
++static_assert(K8V4PromptSmem<true>::kSmemBytes <= 99 * 1024);
++
++template <typename Geometry, typename Metadata, bool VInt8 = false>
+ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
+     const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
+     const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
+@@ -77,14 +92,15 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
+     float* q_scale      = reinterpret_cast<float*>(q_fp8 + kCausalPromptK8V4QBytes);
+     std::uint8_t* k_fp8 = reinterpret_cast<std::uint8_t*>(
+         reinterpret_cast<unsigned char*>(q_scale) + kCausalPromptK8V4QScaleBytes);
++    using VC              = K8V4Value<VInt8>;
+     std::uint8_t* v_nvfp4 = k_fp8 + kCausalPromptK8V4KBytes;
+-    __half* v_f16         = reinterpret_cast<__half*>(v_nvfp4 + kCausalPromptK8V4VBytes);
++    __half* v_f16         = reinterpret_cast<__half*>(v_nvfp4 + K8V4PromptSmem<VInt8>::kVBytes);
+     __half* p_s           = reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(v_f16) +
+                                                       kCausalPromptK8V4VStageBytes);
+     __half* k_scale_s =
+         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kCausalPromptK8V4PBytes);
+     std::uint8_t* v_scale_s = reinterpret_cast<std::uint8_t*>(k_scale_s + Bc);
+-    float* running_m_s      = reinterpret_cast<float*>(v_scale_s + Bc * kKVCacheNvfp4Groups);
++    float* running_m_s      = reinterpret_cast<float*>(v_scale_s + Bc * VC::kScaleBytes);
+     float* running_l_s      = running_m_s + Br;
+     float* partial_m_s      = running_l_s + Br;
+     float* partial_l_s      = partial_m_s + 2 * Br;
+@@ -169,13 +185,17 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
+             if (key <= max_query_abs) {
+                 const std::int64_t k_off = kv_cache_fp8_scale_index<Geometry>(
+                     physical_page, kv_head, page_offset0 + key_l);
+-                const std::int64_t v_off = kv_cache_nvfp4_scale_index<Geometry>(
+-                    physical_page, kv_head, 0, page_offset0 + key_l);
++                const std::int64_t v_off = VC::template scale_offset<Geometry>(
++                    physical_page, kv_head, page_offset0 + key_l);
+                 k_scale_s[key_l] = cache_k_scale[k_off];
+-                cp_async<16>(v_scale_s + key_l * kKVCacheNvfp4Groups, cache_v_scale + v_off);
++                cp_async<VC::kScaleBytes>(v_scale_s + key_l * VC::kScaleBytes, cache_v_scale + v_off);
+             } else {
+                 k_scale_s[key_l] = __float2half_rn(0.0F);
+-                store_vec(v_scale_s + key_l * kKVCacheNvfp4Groups, make_int4(0, 0, 0, 0));
++                if constexpr (VInt8) {
++                    store_vec(v_scale_s + key_l * VC::kScaleBytes, make_uint2(0, 0));
++                } else {
++                    store_vec(v_scale_s + key_l * VC::kScaleBytes, make_int4(0, 0, 0, 0));
++                }
+             }
+         }
+     };
+@@ -199,15 +219,16 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
+             }
+         }
+ #pragma unroll 1
+-        for (int chunk = cooperative_tid; chunk < Bc * (D / 32); chunk += cooperative_threads) {
+-            const int key_l  = chunk / (D / 32);
+-            const int dc     = chunk - key_l * (D / 32);
+-            const int d      = dc * 32;
++        for (int chunk = cooperative_tid; chunk < Bc * (VC::kCodeBytes / 16);
++             chunk += cooperative_threads) {
++            const int key_l  = chunk / (VC::kCodeBytes / 16);
++            const int byte   = (chunk - key_l * (VC::kCodeBytes / 16)) * 16;
+             const int key    = tile_k0 + key_l;
+-            std::uint8_t* vd = &v_nvfp4[key_l * (D / 2) + d / 2];
++            std::uint8_t* vd = &v_nvfp4[key_l * VC::kCodeBytes + byte];
+             if (key <= max_query_abs) {
+-                const std::int64_t off = kv_cache_nvfp4_code_index<Geometry>(
+-                    physical_page, kv_head, d, page_offset0 + key_l);
++                const std::int64_t off =
++                    VC::template code_offset<Geometry>(physical_page, kv_head, page_offset0 + key_l) +
++                    byte;
+                 cp_async<16, Cache::cg>(vd, &cache_v[off]);
+             } else {
+                 store_vec(vd, make_int4(0, 0, 0, 0));
+@@ -369,10 +390,18 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
+                 const int key   = k0 + key_l;
+                 __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
+                 if (key <= max_query_abs) {
+-                    store_vec(dst,
+-                              kv_cache_nvfp4_dequant_f16x8(
+-                                  &v_nvfp4[key_l * (D / 2) + d / 2],
+-                                  v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]));
++                    if constexpr (VInt8) {
++                        store_vec(dst, k8v4_value_i8x8_to_f16x8(
++                                           load_vec<uint2>(&v_nvfp4[key_l * VC::kCodeBytes + d]),
++                                           reinterpret_cast<const __half*>(
++                                               v_scale_s)[key_l * kKVCacheInt8Groups +
++                                                          d / kKVCacheInt8Group]));
++                    } else {
++                        store_vec(dst, kv_cache_nvfp4_dequant_f16x8(
++                                           &v_nvfp4[key_l * (D / 2) + d / 2],
++                                           v_scale_s[key_l * kKVCacheNvfp4Groups +
++                                                     d / kKVCacheNvfp4Group]));
++                    }
+                 } else {
+                     store_vec(dst, make_int4(0, 0, 0, 0));
+                 }
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+index be794ce..45af6a1 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+@@ -5,6 +5,7 @@
+ #include "ops/softmax_attention/dense/causal_cache/launch.h"
+ 
+ #include "core/device.h"
++#include "core/paged_kv_storage.h"
+ #include "ops/common/math.h"
+ #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
+ 
+@@ -16,7 +17,7 @@
+ namespace ninfer::ops::detail {
+ namespace {
+ 
+-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree,
++template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree, bool VInt8,
+           typename CacheInput>
+ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
+                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+@@ -66,7 +67,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+     if constexpr (RowTiles > 3) {
+         // A complete wide verify block: compute warps own whole 16-row tiles for the split. The
+         // block's query tile is rotated and quantized once here instead of in every split CTA.
+-        using Schedule          = K8V4WideSchedule<Geometry, TokenTile>;
++        using Schedule          = K8V4WideSchedule<Geometry, TokenTile, VInt8>;
+         auto* const codes_ptr   = static_cast<std::uint8_t*>(query_codes.data);
+         auto* const scales_ptr  = static_cast<float*>(query_scales.data);
+         const int prepared_rows = RowCount * Geometry::KVHeads * invocation.batch_size;
+@@ -76,7 +77,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+                 codes_ptr, scales_ptr);
+         CUDA_CHECK(cudaGetLastError());
+         launch(causal_attention_small_t_k8v4_wide_kernel<Geometry, TokenTile, MultiBatch, Masked,
+-                                                         Tree, CacheInput>,
++                                                         Tree, CacheInput, VInt8>,
+                Schedule::Threads, static_cast<std::size_t>(Schedule::DynamicBytes),
+                std::make_tuple(static_cast<const std::uint8_t*>(codes_ptr),
+                                static_cast<const float*>(scales_ptr)));
+@@ -84,11 +85,11 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+         constexpr int Warps     = RowTiles == 3 ? 12 : 8;
+         constexpr int KeyBlock  = TokenTile == 1 ? 32 : 64;
+         constexpr int MinBlocks = TokenTile == 1 ? 2 : 1;
+-        constexpr std::size_t DynamicBytes =
+-            3u * KeyBlock * kCausalHeadDim / 2u + 2u * KeyBlock * kCausalHeadDim;
++        constexpr std::size_t DynamicBytes = static_cast<std::size_t>(KeyBlock) *
++                                             (3u * kCausalHeadDim + K8V4Value<VInt8>::kCodeBytes);
+         launch(causal_attention_small_t_k8v4_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
+                                                           KeyBlock, true, MultiBatch, Masked, Tree,
+-                                                          CacheInput>,
++                                                          CacheInput, VInt8>,
+                Warps * 32, DynamicBytes, std::make_tuple(q_ptr));
+     }
+ }
+@@ -120,8 +121,8 @@ void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& i
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-template <typename Geometry, typename CacheInput>
+-void causal_attention_small_t_k8v4_launch_for(
++template <typename Geometry, bool VInt8, typename CacheInput>
++void causal_attention_small_t_k8v4_launch_for_v(
+     const Tensor& q, CacheInput input, const Tensor& positions, float scale,
+     PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+     CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
+@@ -132,7 +133,7 @@ void causal_attention_small_t_k8v4_launch_for(
+         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
+ 
+     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
+-        launch_k8v4_partial<Geometry, Tokens, MultiBatch, Masked, false>(
++        launch_k8v4_partial<Geometry, Tokens, MultiBatch, Masked, false, VInt8>(
+             q, input, positions, scale, cache, invocation, logical_capacity, splits, partial_acc,
+             partial_m, partial_l, query_codes, query_scales, stream);
+     };
+@@ -143,11 +144,11 @@ void causal_attention_small_t_k8v4_launch_for(
+             if constexpr (Tokens == 16 && Geometry::QHeads == 24 &&
+                           std::is_same_v<CacheInput, CausalAppendInput>) {
+                 if (invocation.batch_size == 1) {
+-                    launch_k8v4_partial<Geometry, Tokens, false, true, true>(
++                    launch_k8v4_partial<Geometry, Tokens, false, true, true, VInt8>(
+                         q, input, positions, scale, cache, invocation, logical_capacity, splits,
+                         partial_acc, partial_m, partial_l, query_codes, query_scales, stream);
+                 } else {
+-                    launch_k8v4_partial<Geometry, Tokens, true, true, true>(
++                    launch_k8v4_partial<Geometry, Tokens, true, true, true, VInt8>(
+                         q, input, positions, scale, cache, invocation, logical_capacity, splits,
+                         partial_acc, partial_m, partial_l, query_codes, query_scales, stream);
+                 }
+@@ -259,6 +260,25 @@ void causal_attention_small_t_k8v4_launch_for(
+     }
+ }
+ 
++// NINFER_KV_VI8 picks the V codec of the K8V4 cache for every launch (core/paged_kv_storage.h).
++template <typename Geometry, typename CacheInput>
++void causal_attention_small_t_k8v4_launch_for(
++    const Tensor& q, CacheInput input, const Tensor& positions, float scale,
++    PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
++    CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
++    Tensor& partial_l, Tensor& query_codes, Tensor& query_scales, Tensor& out,
++    cudaStream_t stream) {
++    if (k8v4_value_int8()) {
++        causal_attention_small_t_k8v4_launch_for_v<Geometry, true>(
++            q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
++            partial_l, query_codes, query_scales, out, stream);
++    } else {
++        causal_attention_small_t_k8v4_launch_for_v<Geometry, false>(
++            q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
++            partial_l, query_codes, query_scales, out, stream);
++    }
++}
++
+ } // namespace
+ 
+ bool causal_attention_small_t_k8v4_prepares_query(std::int32_t q_heads, std::int32_t width) {
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+index fc7d31d..9ab51ce 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+@@ -22,6 +22,7 @@
+ #include "ops/common/mma.cuh"
+ #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+ #include "ops/kv_cache/hadamard_d256.cuh"
++#include "ops/kv_cache/k8v4_value.cuh"
+ #include "ops/kv_cache/nvfp4_group16_codec.cuh"
+ #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
+ 
+@@ -99,7 +100,7 @@ __device__ __forceinline__ K8V4SplitRange k8v4_split_range(int window, int split
+ // Appends this split's share of the new columns to the cache. One warp owns the complete D256 K
+ // row and then the complete V row; these are the same FP8-K and group-16 NVFP4-V operations as
+ // standalone K8V4 append. `page_of(position)` returns the physical page holding `position`.
+-template <typename Geometry, int Warps, typename CacheInput, typename PageOf>
++template <typename Geometry, int Warps, bool VInt8, typename CacheInput, typename PageOf>
+ __device__ __forceinline__ void
+ k8v4_append_split_columns(const CacheInput& input, const std::int32_t* positions, int valid_tokens,
+                           const K8V4SplitRange& range, PageOf page_of, int kv_head,
+@@ -142,6 +143,11 @@ k8v4_append_split_columns(const CacheInput& input, const std::int32_t* positions
+                 __bfloat162float(input.v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
+         }
+         normalized_hadamard_d256_inplace(values, lane);
++        if constexpr (VInt8) {
++            k8v4_value_store_int8_row<Geometry>(values, lane, cache_v, cache_v_scale, physical_page,
++                                                kv_head, page_offset);
++            continue;
++        }
+ #pragma unroll
+         for (int r = 0; r < 8; ++r) scratch[warp * D + lane + 32 * r] = values[r];
+         __syncwarp();
+@@ -291,7 +297,7 @@ k8v4_copy_prepared_query(const std::uint8_t* codes, const float* scales, int bat
+ // per-thread work. Split-boundary tiles take the per-key path; there, scales for eight consecutive
+ // in-split keys are one aligned 16-byte span copied asynchronously and the remaining keys are
+ // filled per key.
+-template <typename Geometry, int Bc, int Threads>
++template <typename Geometry, int Bc, int Threads, bool VInt8 = false>
+ __device__ __forceinline__ void
+ k8v4_issue_tile(int thread, std::uint8_t* k_codes, std::uint8_t* v_codes, __half* k_scale,
+                 std::uint8_t* v_scale, int tile_k0, int physical_page, const K8V4SplitRange& range,
+@@ -300,7 +306,8 @@ k8v4_issue_tile(int thread, std::uint8_t* k_codes, std::uint8_t* v_codes, __half
+     constexpr int D       = kCausalHeadDim;
+     constexpr int DB16    = D / 2;
+     constexpr int KChunks = Bc * (D / 16);
+-    constexpr int VChunks = Bc * (D / 32);
++    using VC              = K8V4Value<VInt8>;
++    constexpr int VChunks = Bc * VC::kCodeBytes / 16;
+     static_assert(kPagedKVPageSize % Bc == 0);
+     const auto k_destination = [&](int chunk) {
+         const int key_l = chunk / (D / 16);
+@@ -313,7 +320,7 @@ k8v4_issue_tile(int thread, std::uint8_t* k_codes, std::uint8_t* v_codes, __half
+         const std::uint8_t* k_source =
+             cache_k + kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, 0, offset0);
+         const std::uint8_t* v_source =
+-            cache_v + kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, 0, offset0);
++            cache_v + VC::template code_offset<Geometry>(physical_page, kv_head, offset0);
+ #pragma unroll
+         for (int i = 0; i < (KChunks + Threads - 1) / Threads; ++i) {
+             const int chunk = thread + i * Threads;
+@@ -335,9 +342,9 @@ k8v4_issue_tile(int thread, std::uint8_t* k_codes, std::uint8_t* v_codes, __half
+                              span * 8);
+         }
+         for (int key_l = thread; key_l < Bc; key_l += Threads) {
+-            cp_async<16>(&v_scale[key_l * kKVCacheNvfp4Groups],
+-                         cache_v_scale + kv_cache_nvfp4_scale_index<Geometry>(
+-                                             physical_page, kv_head, 0, offset0 + key_l));
++            cp_async<VC::kScaleBytes>(&v_scale[key_l * VC::kScaleBytes],
++                                      cache_v_scale + VC::template scale_offset<Geometry>(
++                                                          physical_page, kv_head, offset0 + key_l));
+         }
+         return;
+     }
+@@ -361,11 +368,13 @@ k8v4_issue_tile(int thread, std::uint8_t* k_codes, std::uint8_t* v_codes, __half
+     }
+     for (int key_l = thread; key_l < Bc; key_l += Threads) {
+         const int key             = tile_k0 + key_l;
+-        std::uint8_t* v_scale_dst = &v_scale[key_l * kKVCacheNvfp4Groups];
++        std::uint8_t* v_scale_dst = &v_scale[key_l * VC::kScaleBytes];
+         if (key >= range.split_start && key < range.split_end) {
+-            const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
+-                physical_page, kv_head, 0, key & kPagedKVPageMask);
+-            cp_async<16>(v_scale_dst, cache_v_scale + v_scale_offset);
++            const std::int64_t v_scale_offset = VC::template scale_offset<Geometry>(
++                physical_page, kv_head, key & kPagedKVPageMask);
++            cp_async<VC::kScaleBytes>(v_scale_dst, cache_v_scale + v_scale_offset);
++        } else if constexpr (VInt8) {
++            store_vec(v_scale_dst, make_uint2(0, 0));
+         } else {
+             store_vec(v_scale_dst, make_int4(0, 0, 0, 0));
+         }
+@@ -385,13 +394,14 @@ k8v4_issue_tile(int thread, std::uint8_t* k_codes, std::uint8_t* v_codes, __half
+     }
+ #pragma unroll 1
+     for (int chunk = thread; chunk < VChunks; chunk += Threads) {
+-        const int key_l     = chunk / (D / 32);
+-        const int d         = (chunk - key_l * (D / 32)) * 32;
++        const int key_l     = chunk / (VC::kCodeBytes / 16);
++        const int byte      = (chunk - key_l * (VC::kCodeBytes / 16)) * 16;
+         const int key       = tile_k0 + key_l;
+-        std::uint8_t* v_dst = &v_codes[key_l * (D / 2) + d / 2];
++        std::uint8_t* v_dst = &v_codes[key_l * VC::kCodeBytes + byte];
+         if (key >= range.split_start && key < range.split_end) {
+-            const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
+-                physical_page, kv_head, d, key & kPagedKVPageMask);
++            const std::int64_t code_offset =
++                VC::template code_offset<Geometry>(physical_page, kv_head, key & kPagedKVPageMask) +
++                byte;
+             cp_async<16, Cache::cg>(v_dst, &cache_v[code_offset]);
+         } else {
+             store_vec(v_dst, make_int4(0, 0, 0, 0));
+@@ -427,9 +437,40 @@ __device__ __forceinline__ int4 k8v4_widen_half_f16x8(std::uint32_t packed,
+ // ldmatrix.trans. Keys outside the split were copied as zero codes with zero scales, so they widen
+ // to zero. All codes and scales are loaded before the first conversion so their shared-memory
+ // latencies overlap.
+-template <int Bc, int Threads>
++template <int Bc, int Threads, bool VInt8 = false>
+ __device__ __forceinline__ void k8v4_widen_v_tile(int thread, const std::uint8_t* v_codes,
+                                                   const std::uint8_t* v_scale, __half* v_f16) {
++    if constexpr (VInt8) {
++        // INT8 G64 rows (NINFER_KV_VI8) at half scale: |code x scale / 2| <= absmax / 2 of the group, so the FP16
++        // 32-key partials stay finite for V groups with absmax below 4094.
++        constexpr int D         = kCausalHeadDim;
++        constexpr int Chunks    = Bc * (D / 8);
++        constexpr int PerThread = (Chunks + Threads - 1) / Threads;
++        const auto* scale_h     = reinterpret_cast<const __half*>(v_scale);
++        uint2 raw[PerThread];
++        __half scales[PerThread];
++#pragma unroll
++        for (int i = 0; i < PerThread; ++i) {
++            const int chunk = thread + i * Threads;
++            if (Chunks % Threads == 0 || chunk < Chunks) {
++                const int key_l = chunk / (D / 8);
++                const int d     = (chunk - key_l * (D / 8)) * 8;
++                raw[i]          = load_vec<uint2>(&v_codes[key_l * D + d]);
++                scales[i]       = scale_h[key_l * kKVCacheInt8Groups + d / kKVCacheInt8Group];
++            }
++        }
++#pragma unroll
++        for (int i = 0; i < PerThread; ++i) {
++            const int chunk = thread + i * Threads;
++            if (Chunks % Threads == 0 || chunk < Chunks) {
++                const int key_l = chunk / (D / 8);
++                const int d     = (chunk - key_l * (D / 8)) * 8;
++                store_vec(&v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)],
++                          k8v4_value_i8x8_to_f16x8(raw[i], __hmul(scales[i], __float2half_rn(0.5F))));
++            }
++        }
++        return;
++    }
+     constexpr int D         = kCausalHeadDim;
+     constexpr int Chunks    = Bc * (D / 8);
+     constexpr int PerThread = (Chunks + Threads - 1) / Threads;
+@@ -602,7 +643,8 @@ __device__ __forceinline__ unsigned k8v4_half2_bits(float lo, float hi) {
+ // ancestor-or-self columns of a verify tree whose columns occupy consecutive cache positions from
+ // the row's column 0; such a column sees the keys before column 0 and its ancestors' keys only.
+ template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
+-          bool DynamicArena, bool MultiBatch, bool Masked, bool Tree, typename CacheInput>
++          bool DynamicArena, bool MultiBatch, bool Masked, bool Tree, typename CacheInput,
++          bool VInt8 = false>
+ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     void causal_attention_small_t_k8v4_tiled_kernel(
+         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
+@@ -637,7 +679,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     static_assert(PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
+     static_assert(QKKs == 8);
+     constexpr int KStageBytes = Bc * D;
+-    constexpr int StageBytes  = KStageBytes + Bc * D / 2;
++    constexpr int StageBytes  = KStageBytes + Bc * K8V4Value<VInt8>::kCodeBytes;
+     constexpr int ArenaBytes  = StageBytes + Bc * D * 2;
+     static_assert(ArenaBytes >= Wc * D * static_cast<int>(sizeof(float)));
+     __shared__ __align__(16) std::uint8_t q_s[Br * D];
+@@ -652,7 +694,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     __shared__ float alpha_s[Br];
+     __shared__ float q_scale_s[Br];
+     __shared__ __align__(16) __half k_scale_s[Bc];
+-    __shared__ __align__(16) std::uint8_t v_scale_s[Bc * kKVCacheNvfp4Groups];
++    __shared__ __align__(16) std::uint8_t v_scale_s[Bc * K8V4Value<VInt8>::kScaleBytes];
+     __shared__ std::int32_t physical_pages_s[PageIds];
+     const int kv_head     = static_cast<int>(blockIdx.x);
+     const int split       = static_cast<int>(blockIdx.y);
+@@ -724,7 +766,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     };
+ 
+     if constexpr (CacheInput::writes_cache) {
+-        k8v4_append_split_columns<Geometry, Wc>(
++        k8v4_append_split_columns<Geometry, Wc, VInt8>(
+             input, positions, valid_tokens, range, page_of, kv_head, cache_k, cache_v,
+             cache_k_scale, cache_v_scale, reinterpret_cast<float*>(arena), warp, lane);
+         __syncthreads();
+@@ -780,7 +822,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+     float l0 = 0.0F;
+     float l1 = 0.0F;
+ 
+-    k8v4_issue_tile<Geometry, Bc, Threads>(tid, k_fp8, v_nvfp4, k_scale_s, v_scale_s,
++    k8v4_issue_tile<Geometry, Bc, Threads, VInt8>(tid, k_fp8, v_nvfp4, k_scale_s, v_scale_s,
+                                            range.first_tile, page_of(range.first_tile), range,
+                                            kv_head, cache_k, cache_v, cache_k_scale, cache_v_scale);
+     cp_commit();
+@@ -838,14 +880,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+                 alpha_s[row0 + 8] = alpha1;
+             }
+         } else {
+-            k8v4_widen_v_tile<Bc, VLoaderThreads>(tid - ProducerThreads, v_nvfp4, v_scale_s, v_f16);
++            k8v4_widen_v_tile<Bc, VLoaderThreads, VInt8>(tid - ProducerThreads, v_nvfp4, v_scale_s, v_f16);
+         }
+         __syncthreads();
+ 
+         // The tile consumed above is no longer read; refill it while PV runs.
+         if (kb + 1 < range.key_blocks) {
+             const int next_k0 = k0 + Bc;
+-            k8v4_issue_tile<Geometry, Bc, Threads>(tid, k_fp8, v_nvfp4, k_scale_s, v_scale_s,
++            k8v4_issue_tile<Geometry, Bc, Threads, VInt8>(tid, k_fp8, v_nvfp4, k_scale_s, v_scale_s,
+                                                    next_k0, page_of(next_k0), range, kv_head,
+                                                    cache_k, cache_v, cache_k_scale, cache_v_scale);
+             cp_commit();
+@@ -941,7 +983,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
+ // ----------------------------------------------------------------------------------------------
+ // Wide blocks: warp-specialized. Compute warps each own one 16-row tile; loader warps stream K/V.
+ 
+-template <typename Geometry, int TokenTile>
++template <typename Geometry, int TokenTile, bool VInt8 = false>
+ struct K8V4WideSchedule {
+     static constexpr int RowCount       = TokenTile * Geometry::GroupSize;
+     static constexpr int RowTiles       = (RowCount + 15) / 16;
+@@ -967,14 +1009,15 @@ struct K8V4WideSchedule {
+     static constexpr int Bc             = 32;
+     // Copies run PackedStages - 2 tiles ahead of the widening, which runs one tile ahead of the
+     // compute warps; three tiles in flight per SM keep the cache stream at DRAM bandwidth.
+-    static constexpr int PackedStages = 5;
++    // INT8 V rows (NINFER_KV_VI8) double the packed V bytes; three stages keep the arena under 99 KB.
++    static constexpr int PackedStages = VInt8 ? 3 : 5;
+     // Page ids of a split's first pages are staged in shared memory; later pages (splits longer
+     // than PageIds * 64 keys) are read from the block table directly.
+     static constexpr int PageIds          = 128;
+     static constexpr int KBytes           = Bc * kCausalHeadDim;
+-    static constexpr int VBytes           = Bc * kCausalHeadDim / 2;
++    static constexpr int VBytes           = Bc * K8V4Value<VInt8>::kCodeBytes;
+     static constexpr int KScaleBytes      = Bc * static_cast<int>(sizeof(__half));
+-    static constexpr int VScaleBytes      = Bc * kKVCacheNvfp4Groups;
++    static constexpr int VScaleBytes      = Bc * K8V4Value<VInt8>::kScaleBytes;
+     static constexpr int PackedStageBytes = KBytes + VBytes + KScaleBytes + VScaleBytes;
+     static constexpr int WideSlotBytes    = Bc * kCausalHeadDim * static_cast<int>(sizeof(__half));
+     static constexpr int PackedBytes      = PackedStages * PackedStageBytes;
+@@ -1007,8 +1050,8 @@ __device__ __forceinline__ void k8v4_bar_arrive(int id, int threads) {
+ }
+ 
+ template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree,
+-          typename CacheInput>
+-__launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
++          typename CacheInput, bool VInt8 = false>
++__launch_bounds__(K8V4WideSchedule<Geometry, TokenTile, VInt8>::Threads, 1) __global__
+     void causal_attention_small_t_k8v4_wide_kernel(
+         const std::uint8_t* query_codes, const float* query_scales, CacheInput input,
+         const std::int32_t* positions, std::uint8_t* cache_k, std::uint8_t* cache_v,
+@@ -1017,7 +1060,7 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
+         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
+         float* partial_acc, float* partial_m, float* partial_l) {
+-    using Schedule         = K8V4WideSchedule<Geometry, TokenTile>;
++    using Schedule         = K8V4WideSchedule<Geometry, TokenTile, VInt8>;
+     namespace barrier      = k8v4_wide_barrier;
+     constexpr int RowCount = Schedule::RowCount;
+     constexpr int Threads  = Schedule::Threads;
+@@ -1143,7 +1186,7 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
+     };
+ 
+     if constexpr (CacheInput::writes_cache) {
+-        k8v4_append_split_columns<Geometry, Schedule::Warps>(
++        k8v4_append_split_columns<Geometry, Schedule::Warps, VInt8>(
+             input, positions, valid_tokens, range, page_of, kv_head, cache_k, cache_v,
+             cache_k_scale, cache_v_scale, reinterpret_cast<float*>(dynamic_arena), warp, lane);
+         __syncthreads();
+@@ -1156,7 +1199,7 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
+     const auto issue     = [&](int tile) {
+         const int stage   = tile % Schedule::PackedStages;
+         const int tile_k0 = range.first_tile + tile * Bc;
+-        k8v4_issue_tile<Geometry, Bc, Schedule::LoaderThreads>(
++        k8v4_issue_tile<Geometry, Bc, Schedule::LoaderThreads, VInt8>(
+             loader, packed_k(stage), packed_v(stage), packed_k_scale(stage), packed_v_scale(stage),
+             tile_k0, page_of(tile_k0), range, kv_head, cache_k, cache_v, cache_k_scale,
+             cache_v_scale);
+@@ -1296,7 +1339,7 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
+             cp_wait<Schedule::PackedStages - 2>();
+             k8v4_bar_sync(barrier::kLoaders, Schedule::LoaderThreads);
+             const int stage = kb % Schedule::PackedStages;
+-            k8v4_widen_v_tile<Bc, Schedule::LoaderThreads>(loader, packed_v(stage),
++            k8v4_widen_v_tile<Bc, Schedule::LoaderThreads, VInt8>(loader, packed_v(stage),
+                                                            packed_v_scale(stage), v_slot(slot));
+             cta_mbarrier_arrive(&full[slot]);
+             if (assists && kb >= 1) assist(kb - 1);
+-- 
+2.34.1
+

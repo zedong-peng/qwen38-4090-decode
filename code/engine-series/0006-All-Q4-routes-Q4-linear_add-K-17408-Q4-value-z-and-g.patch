@@ -1,0 +1,489 @@
+From ea8c5cb620277eb4c823ac7b11d861cc41a15b31 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 03:26:25 +0800
+Subject: [PATCH 06/49] All-Q4 routes: Q4 linear_add K=17408, Q4 value/z and
+ gate/value parents; converter imports grouped codes
+
+---
+ .../q4_q5/q4_q5_attn_input_gemm_mma.cu        |  6 +++
+ .../q4_q5/q4_q5_attn_input_small_t.cu         | 19 +++++--
+ .../q4_q5/q4_q5_gdn_input_independent.cu      | 19 +++++--
+ src/ops/linear_add/q4/q4_linear_add.cu        | 54 +++++++++++++++++--
+ src/ops/wrapper/attn_input_proj.cpp           |  5 +-
+ src/ops/wrapper/gdn_input_proj.cpp            | 25 +++++----
+ tools/convert/methods.py                      | 31 +++++++++++
+ tools/convert/recipe.py                       |  3 +-
+ tools/convert/sources/compressed_tensors.py   |  4 ++
+ tools/convert/sources/grouped_codes.py        | 49 +++++++++++++++++
+ 10 files changed, 194 insertions(+), 21 deletions(-)
+ create mode 100644 tools/convert/sources/grouped_codes.py
+
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
+index 3e51e91..3f4bad6 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_gemm_mma.cu
+@@ -63,6 +63,12 @@ void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight&
+     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
+         full, x, make_job(query_key_weight, 0, 6144, q), make_job(query_key_weight, 6144, 1024, k),
+         stream);
++    if (gate_value_weight.qtype == QType::Q4_G64_FP16) {
++        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
++            full, x, make_job(gate_value_weight, 0, 6144, gate),
++            make_job(gate_value_weight, 6144, 1024, v), stream);
++        return;
++    }
+     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
+         full, x, make_job(gate_value_weight, 0, 6144, gate),
+         make_job(gate_value_weight, 6144, 1024, v), stream);
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+index 1c9f1eb..4c39d24 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_small_t.cu
+@@ -14,6 +14,7 @@
+ 
+ #include <cstdint>
+ #include <stdexcept>
++#include <type_traits>
+ 
+ namespace ninfer::ops::detail {
+ namespace {
+@@ -259,7 +260,7 @@ struct AttnQueryKeyEpilogue {
+ };
+ 
+ // gate/value (Q5) and q/k (Q4) in one Ada small-T grid, gate/value CTAs first.
+-template <int TokenTiles, int GateValueRowTiles, int QueryKeyGroups>
++template <int TokenTiles, int GateValueRowTiles, int QueryKeyGroups, bool GateQ4 = false>
+ void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
+                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                      Tensor& v, cudaStream_t stream) {
+@@ -267,7 +268,8 @@ void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
+         gate_value_weight.padded_shape[1] != kHidden) {
+         throw std::invalid_argument("attention Ada dual requires padded K == hidden");
+     }
+-    using SG = Q5AdaSmallTSchedule<GateValueRowTiles, 8, TokenTiles, 8, 2>;
++    using SG = std::conditional_t<GateQ4, Q4AdaSmallTSchedule<GateValueRowTiles, 8, TokenTiles, 8, 2>,
++                                  Q5AdaSmallTSchedule<GateValueRowTiles, 8, TokenTiles, 8, 2>>;
+     using SQ = Q4AdaSmallTSchedule<2, 8, TokenTiles, QueryKeyGroups, 2>;
+     static_assert(kParentRows % SG::kRowsPerCta == 0 && kParentRows % SQ::kRowsPerCta == 0);
+     const AttnGateValueEpilogue gate_value_epilogue{
+@@ -283,7 +285,7 @@ void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
+         static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
+         AdaSmallTOperand<AttnGateValueEpilogue>{
+             static_cast<const std::uint8_t*>(gate_value_weight.qdata),
+-            static_cast<const std::uint8_t*>(gate_value_weight.qhigh),
++            GateQ4 ? nullptr : static_cast<const std::uint8_t*>(gate_value_weight.qhigh),
+             static_cast<const std::uint8_t*>(gate_value_weight.scales), gate_value_epilogue},
+         kParentRows,
+         AdaSmallTOperand<AttnQueryKeyEpilogue>{
+@@ -298,6 +300,17 @@ void launch_dual_ada(const Tensor& x, const Weight& query_key_weight,
+ void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
+                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
+                                      Tensor& k, Tensor& v, cudaStream_t stream) {
++    if (gate_value_weight.qtype == QType::Q4_G64_FP16) {
++        // All-Q4 parents: the dual Ada grid at every T of the small-T band.
++        if (x.ne[1] <= 8) {
++            launch_dual_ada<1, 2, 8, true>(x, query_key_weight, gate_value_weight, q, gate, k, v,
++                                           stream);
++        } else {
++            launch_dual_ada<2, 4, 16, true>(x, query_key_weight, gate_value_weight, q, gate, k, v,
++                                            stream);
++        }
++        return;
++    }
+     // Ada, T in [7,16]: one dual grid (50 us at T=16 vs 70 us for K-split q/k + Ada gate/value).
+     if (x.ne[1] >= 7 && x.ne[1] <= 8) {
+         launch_dual_ada<1, 2, 8>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+index b72c08a..c23dec8 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_independent.cu
+@@ -14,6 +14,7 @@
+ 
+ #include <cstdint>
+ #include <stdexcept>
++#include <type_traits>
+ 
+ namespace ninfer::ops::detail {
+ namespace {
+@@ -255,13 +256,14 @@ struct GdnQkEpilogue {
+ 
+ // value/z (Q5) and qk (Q4) in one Ada small-T grid; value/z CTAs first so the shorter Q4 CTAs
+ // fill the tail.
+-template <int TokenTiles>
++template <int TokenTiles, bool ValueQ4 = false>
+ void launch_dual_ada(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                      Tensor& qk, Tensor& value, Tensor& z, cudaStream_t stream) {
+     if (qk_weight.padded_shape[1] != kHidden || value_z_weight.padded_shape[1] != kHidden) {
+         throw std::invalid_argument("Q4/Q5 GDN Ada dual requires padded K == hidden");
+     }
+-    using SV = Q5AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>;
++    using SV = std::conditional_t<ValueQ4, Q4AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>,
++                                  Q5AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>>;
+     using SQ = Q4AdaSmallTSchedule<2, 8, TokenTiles, 8, 2>;
+     static_assert(kValueZRows % SV::kRowsPerCta == 0 && kQkRows % SQ::kRowsPerCta == 0);
+     const GdnValueZEpilogue value_z_epilogue{
+@@ -275,7 +277,9 @@ void launch_dual_ada(const Tensor& x, const Weight& qk_weight, const Weight& val
+         static_cast<const __nv_bfloat16*>(x.data),
+         static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)), x.ne[1],
+         AdaSmallTOperand<GdnValueZEpilogue>{static_cast<const std::uint8_t*>(value_z_weight.qdata),
+-                                            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
++                                            ValueQ4 ? nullptr
++                                                    : static_cast<const std::uint8_t*>(
++                                                          value_z_weight.qhigh),
+                                             static_cast<const std::uint8_t*>(value_z_weight.scales),
+                                             value_z_epilogue},
+         kValueZRows,
+@@ -291,6 +295,15 @@ void launch_dual_ada(const Tensor& x, const Weight& qk_weight, const Weight& val
+ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
+                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
+                                         Tensor& z, cudaStream_t stream) {
++    if (value_z_weight.qtype == QType::Q4_G64_FP16) {
++        // All-Q4 parents: the dual Ada grid at every T of the small-T band.
++        if (x.ne[1] <= 8) {
++            launch_dual_ada<1, true>(x, qk_weight, value_z_weight, qk, value, z, stream);
++        } else {
++            launch_dual_ada<2, true>(x, qk_weight, value_z_weight, qk, value, z, stream);
++        }
++        return;
++    }
+     // Ada, T in [7,16]: one dual grid (57 us at T=16 vs 72 us for K-split qk + Ada value/z).
+     if (x.ne[1] >= 7 && x.ne[1] <= 8) {
+         launch_dual_ada<1>(x, qk_weight, value_z_weight, qk, value, z, stream);
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index 942059c..81d91b6 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -3,6 +3,7 @@
+ #include "ops/linear/q4/q4_gemv_launch.cuh"
+ #include "ops/linear/q4/q4_ksplit_mma.cuh"
+ #include "ops/linear/q4/q4_mma_launch.cuh"
++#include "ops/linear/ada_small_t_mma.cuh"
+ 
+ #include <stdexcept>
+ 
+@@ -24,6 +25,18 @@ struct GemvResidualEpilogue {
+     }
+ };
+ 
++struct AdaResidualEpilogue {
++    static constexpr bool kPairedHalves = false;
++
++    __nv_bfloat16* out;
++    std::int32_t out_ld;
++
++    __device__ __forceinline__ void operator()(int row, int token, float value) const {
++        __nv_bfloat16* slot = out + static_cast<std::int64_t>(token) * out_ld + row;
++        *slot               = __float2bfloat16(value + __bfloat162float(*slot));
++    }
++};
++
+ struct KSplitResidualEpilogue {
+     __nv_bfloat16* residual;
+     std::int32_t tokens;
+@@ -47,6 +60,11 @@ using GemvR1W8 =
+                            Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
+                            Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
+                            Cache::ca, 6144 / 64, 1>;
++using GemvR1W8K17408 =
++    Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
++                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
++                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
++                           Cache::ca, 0, 1>;
+ using MmaR32C32  = Q4RowSplitMmaGemmSchedule<32, 32, 64, 16, 16, 3, 2, Q4FragmentPipeline::Serial,
+                                              Cache::cg, Cache::cg, Q4ScaleLoad::Pair32>;
+ using MmaR32C64  = Q4RowSplitMmaGemmSchedule<32, 64, 64, 16, 32, 3, 2, Q4FragmentPipeline::Serial,
+@@ -54,9 +72,9 @@ using MmaR32C64  = Q4RowSplitMmaGemmSchedule<32, 64, 64, 16, 32, 3, 2, Q4Fragmen
+ using MmaR64C128 = Q4RowSplitMmaGemmSchedule<64, 128, 64, 64, 32, 2, 1, Q4FragmentPipeline::Serial,
+                                              Cache::cg, Cache::cg, Q4ScaleLoad::Pair32>;
+ 
+-template <int Capacity>
++template <int Capacity, int K = 6144>
+ void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
+-    using Geometry = Q4LinearGeometry<5120, 6144>;
++    using Geometry = Q4LinearGeometry<5120, K>;
+     auto* output   = static_cast<__nv_bfloat16*>(residual.data);
+     q4_ksplit_mma_kernel<Geometry, (Capacity + 7) / 8 * 8, Capacity, KSplitResidualEpilogue,
+                          Q4KSplitIdentityRows, true>
+@@ -67,13 +85,43 @@ void launch_ksplit(const Tensor& x, const Weight& w, Tensor& residual, cudaStrea
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++template <int K, int TokenTiles>
++void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t stream) {
++    using S = Q4AdaSmallTSchedule<5, 8, TokenTiles, 8, 2>;
++    static_assert(5120 % S::kRowsPerCta == 0);
++    if (w.padded_shape[1] != K) {
++        throw std::invalid_argument("q4 linear_add ada small-T: padded K differs");
++    }
++    const AdaResidualEpilogue epilogue{
++        static_cast<__nv_bfloat16*>(residual.data),
++        static_cast<std::int32_t>(residual.nb[1] / sizeof(__nv_bfloat16))};
++    ada_small_t_mma_launch<S, K>(static_cast<const __nv_bfloat16*>(x.data),
++                                 static_cast<std::int32_t>(x.nb[1] / sizeof(__nv_bfloat16)),
++                                 static_cast<const std::uint8_t*>(w.qdata), nullptr,
++                                 static_cast<const std::uint8_t*>(w.scales), 5120, x.ne[1],
++                                 epilogue, stream);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ } // namespace
+ 
+ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
+-    if (rows != 5120 || k != 6144 || tokens <= 0) {
++    if (rows != 5120 || (k != 6144 && k != 17408) || tokens <= 0) {
+         throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
+     }
++    if (k == 17408) {
++        if (tokens == 1) return launch_q4_gemv<GemvR1W8K17408, GemvResidualEpilogue>;
++        if (tokens <= 8) return launch_ada<17408, 1>;
++        if (tokens <= 16) return launch_ada<17408, 2>;
++        if (tokens <= 24) return launch_ksplit<24, 17408>;
++        if (tokens <= 32) return launch_ksplit<32, 17408>;
++        if (tokens <= 96) return launch_q4_mma<MmaR32C32, ResidualEpilogue>;
++        if (tokens <= 192) return launch_q4_mma<MmaR32C64, ResidualEpilogue>;
++        return launch_q4_mma<MmaR64C128, ResidualEpilogue>;
++    }
+     if (tokens == 1) return launch_q4_gemv<GemvR1W8, GemvResidualEpilogue>;
++    if (tokens <= 8) return launch_ada<6144, 1>;
++    if (tokens <= 16) return launch_ada<6144, 2>;
+     if (tokens <= 4) return launch_ksplit<4>;
+     if (tokens <= 8) return launch_ksplit<8>;
+     if (tokens <= 16) return launch_ksplit<16>;
+diff --git a/src/ops/wrapper/attn_input_proj.cpp b/src/ops/wrapper/attn_input_proj.cpp
+index 98eedab..c102266 100644
+--- a/src/ops/wrapper/attn_input_proj.cpp
++++ b/src/ops/wrapper/attn_input_proj.cpp
+@@ -221,7 +221,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
+     require_matrix(k, kKvRows, cols, "k");
+     require_matrix(v, kKvRows, cols, "v");
+     require_rowsplit(query_key_weight, QType::Q4_G64_FP16, kQRows + kKvRows, "query/key weight");
+-    require_rowsplit(gate_value_weight, QType::Q5_G64_FP16, kQRows + kKvRows, "gate/value weight");
++    require_rowsplit(gate_value_weight,
++                     gate_value_weight.qtype == QType::Q4_G64_FP16 ? QType::Q4_G64_FP16
++                                                                   : QType::Q5_G64_FP16,
++                     kQRows + kKvRows, "gate/value weight");
+ 
+     detail::q4_q5_attn_input_dispatch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                       stream);
+diff --git a/src/ops/wrapper/gdn_input_proj.cpp b/src/ops/wrapper/gdn_input_proj.cpp
+index 6bba3be..60ac30a 100644
+--- a/src/ops/wrapper/gdn_input_proj.cpp
++++ b/src/ops/wrapper/gdn_input_proj.cpp
+@@ -270,6 +270,10 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, cons
+     }
+ }
+ 
++QType value_z_qtype(const Weight& weight) {
++    return weight.qtype == QType::Q4_G64_FP16 ? QType::Q4_G64_FP16 : QType::Q5_G64_FP16;
++}
++
+ void require_q8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
+     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
+         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
+@@ -723,7 +727,8 @@ void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& valu
+     require_matrix(qkv, kQkvRows, cols, "qkv");
+     require_matrix(z, kZRows, cols, "z");
+     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQkRows, "qk weight");
+-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
++    require_rowsplit(value_z_weight, value_z_qtype(value_z_weight), kParentRows,
++                     "value/z weight");
+ 
+     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
+ }
+@@ -796,11 +801,7 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+     if (q4_q5) {
+         (void)resolve_q4_q5_conv_plan(min_width, 1);
+         (void)resolve_q4_q5_conv_plan(max_width, 1);
+-        if (max_width >= 7) {
+-            largest_materialized_width = max_width;
+-        } else if (min_width <= 4 && max_width >= 4) {
+-            largest_materialized_width = 4;
+-        }
++        largest_materialized_width = max_width;
+     } else {
+         (void)resolve_q8_conv_plan(min_width, 1);
+         (void)resolve_q8_conv_plan(max_width, 1);
+@@ -909,7 +910,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+     constexpr std::int32_t kParentRows = kValueRows + kZRows;
+     const ConvGeometry geometry        = require_snapshot_input(x, kHidden);
+     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQueryRows + kKeyRows, "qk weight");
+-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
++    require_rowsplit(value_z_weight, value_z_qtype(value_z_weight), kParentRows,
++                     "value/z weight");
+     require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                               snapshot_base_slots, kChannels, geometry);
+     require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch,
+@@ -933,7 +935,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
+ 
+     const detail::Q4Q5GdnInputConvPlan plan =
+         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+-    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
++    if (plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused &&
++        value_z_weight.qtype == QType::Q5_G64_FP16) {
+         detail::q4_q5_gdn_input_conv_snapshot_launch(
+             x, qk_weight, value_z_weight, conv_weight, conv_states, valid_columns,
+             initial_state_slots, snapshot_base_slots, query, key, value, z, stream);
+@@ -974,7 +977,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+     constexpr std::int32_t kParentRows = kValueRows + kZRows;
+     const ConvGeometry geometry        = require_record_input(x, kHidden);
+     require_rowsplit(qk_weight, QType::Q4_G64_FP16, kQueryRows + kKeyRows, "qk weight");
+-    require_rowsplit(value_z_weight, QType::Q5_G64_FP16, kParentRows, "value/z weight");
++    require_rowsplit(value_z_weight, value_z_qtype(value_z_weight), kParentRows,
++                     "value/z weight");
+     require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
+                             geometry);
+     require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch,
+@@ -998,7 +1002,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
+     }
+     const detail::Q4Q5GdnInputConvPlan plan =
+         resolve_q4_q5_conv_plan(geometry.width, geometry.batch);
+-    if (!tree && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused) {
++    if (!tree && plan.schedule == detail::Q4Q5GdnInputConvScheduleId::ProjectionEpilogueFused &&
++        value_z_weight.qtype == QType::Q5_G64_FP16) {
+         detail::q4_q5_gdn_input_conv_record_launch(x, qk_weight, value_z_weight, conv_weight,
+                                                    conv_states, valid_columns, initial_state_slots,
+                                                    conv_record, query, key, value, z, stream);
+diff --git a/tools/convert/methods.py b/tools/convert/methods.py
+index 02c07d1..47d9f82 100644
+--- a/tools/convert/methods.py
++++ b/tools/convert/methods.py
+@@ -293,7 +293,38 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
+     return request.job(produce=produce, auxiliaries=auxiliaries)
+ 
+ 
++def import_grouped(request: PrepareRequest) -> PreparedMethod:
++    """Write source-provided grouped-integer codes and FP16 scales unchanged."""
++    spec = get_format(request.target.format)
++    if not isinstance(spec, QuantFormat) or len(request.target.shape) != 2:
++        raise ValueError("import_grouped requires a grouped-integer matrix target")
++    _preflight(request, values=False)
++    n, k = request.target.shape
++    group = spec.group_size
++
++    def produce(output):
++        for begin in range(0, n, request.rows_per_chunk):
++            end = min(n, begin + request.rows_per_chunk)
++            words = request.encoded_rows(begin, end)
++            if words.format != request.target.format:
++                raise ValueError(
++                    f"{request.target.id}: source {words.format} differs from target"
++                )
++            codes = words.codes.reshape(end - begin, k // group, group)
++            if codes.dtype != torch.int8 or bool(
++                (codes < spec.qmin).any() or (codes > spec.qmax).any()
++            ):
++                raise ValueError(f"{request.target.id}: codes exceed the target range")
++            scales = words.scales.reshape(end - begin, k // group)
++            if scales.dtype != torch.float16 or not bool((scales > 0).all()):
++                raise ValueError(f"{request.target.id}: scales must be positive FP16")
++            output.write_codes(begin, codes.contiguous(), scales.contiguous())
++
++    return request.job(produce=produce)
++
++
+ METHODS: dict[str, Method] = {
++    "import_grouped": import_grouped,
+     "cast_direct": cast_direct,
+     "grouped_absmax": grouped_absmax,
+     "fp8_row_maxabs": fp8_row_maxabs,
+diff --git a/tools/convert/recipe.py b/tools/convert/recipe.py
+index 4618145..85e9a9c 100644
+--- a/tools/convert/recipe.py
++++ b/tools/convert/recipe.py
+@@ -21,6 +21,7 @@ from .methods import (
+     grouped_absmax,
+     fp8_row_maxabs,
+     import_encoded,
++    import_grouped,
+ )
+ from .model import Model
+ from .sources.logical import LogicalSource, select_rows
+@@ -379,7 +380,7 @@ class Recipe:
+                 )
+             emit([(name, self.selections[name][0]) for name in names], chosen)
+             used.update(names)
+-        standard = (cast_direct, grouped_absmax, fp8_row_maxabs, import_encoded)
++        standard = (cast_direct, grouped_absmax, fp8_row_maxabs, import_encoded, import_grouped)
+         for names in self.model.packing_groups:
+             if any(
+                 name in used or name in self.aliases or name in self.separate_parameters
+diff --git a/tools/convert/sources/compressed_tensors.py b/tools/convert/sources/compressed_tensors.py
+index 78ea445..6d5bb01 100644
+--- a/tools/convert/sources/compressed_tensors.py
++++ b/tools/convert/sources/compressed_tensors.py
+@@ -14,6 +14,7 @@ import torch
+ from tools.artifact.codecs.fp8_row import validate_fp8_row_words
+ from tools.artifact.formats import valid_positive_fp32_word
+ from .logical import EncodedRows, LogicalSource
++from .grouped_codes import grouped_codes_source, has_grouped_codes
+ from .safetensors import SafetensorsSource, tensor_source
+ 
+ 
+@@ -151,6 +152,9 @@ def matrix_source(
+                 actual = "nvfp4"
+             if actual is None and store.describe(name).dtype == "F8_E4M3":
+                 actual = "fp8_e4m3fn_row_bf16"
++            if actual is not None and has_grouped_codes(store, prefix):
++                resolved = grouped_codes_source(store, prefix, shape, actual)
++                return resolved
+             resolved = (
+                 tensor_source(store, name, shape)
+                 if actual is None
+diff --git a/tools/convert/sources/grouped_codes.py b/tools/convert/sources/grouped_codes.py
+new file mode 100644
+index 0000000..18b92d4
+--- /dev/null
++++ b/tools/convert/sources/grouped_codes.py
+@@ -0,0 +1,49 @@
++"""Grouped-integer codes and FP16 group scales chosen outside the converter (e.g. GPTQ)."""
++
++from __future__ import annotations
++
++from tools.artifact.formats import QuantFormat, get_format
++from .logical import EncodedRows, LogicalSource
++from .safetensors import SafetensorsSource
++
++CODES, SCALES = ".gptq_codes", ".gptq_scales"
++
++
++def has_grouped_codes(store: SafetensorsSource, prefix: str) -> bool:
++    return store.has(prefix + CODES)
++
++
++def grouped_codes_source(
++    store: SafetensorsSource, prefix: str, shape: tuple[int, int], format: str
++) -> LogicalSource:
++    spec = get_format(format)
++    if not isinstance(spec, QuantFormat):
++        raise ValueError(f"{prefix}: grouped codes require a grouped integer format")
++    n, k = shape
++    group = spec.group_size
++    if k % group:
++        raise ValueError(f"{prefix}: grouped code import requires whole groups")
++    for suffix, expected, dtype in ((CODES, (n, k), "I8"), (SCALES, (n, k // group), "F16")):
++        info = store.describe(prefix + suffix)
++        if info.shape != expected or info.dtype != dtype:
++            raise ValueError(
++                f"{prefix}{suffix}: expected {dtype}{expected}, got {info.dtype}{info.shape}"
++            )
++
++    def encoded(begin: int, end: int) -> EncodedRows:
++        if not 0 <= begin < end <= n:
++            raise ValueError(f"{prefix}: invalid encoded rows [{begin},{end})")
++        codes = store.read_flat(prefix + CODES, begin * k, end * k).reshape(end - begin, k)
++        scales = store.read_flat(
++            prefix + SCALES, begin * (k // group), end * (k // group)
++        ).reshape(end - begin, k // group)
++        return EncodedRows(format, codes, scales)
++
++    def read(begin: int, end: int):
++        first, last = begin // k, (end + k - 1) // k
++        words = encoded(first, last)
++        values = words.codes.float().reshape(last - first, k // group, group)
++        values = values * words.scales.float()[..., None]
++        return values.reshape(-1)[begin - first * k : end - first * k]
++
++    return LogicalSource(shape, f"{store.path}:{prefix} ({format} codes)", read, encoded)
+-- 
+2.34.1
+

@@ -1,0 +1,58 @@
+From 4ead4d33f400ebd0e2b42abfe70a0db3b901258f Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 13:42:12 +0800
+Subject: [PATCH 11/49] Prefill final-norm dump (NINFER_DRAFT_DUMP, name final)
+ for soft-label drafter distillation
+
+---
+ src/models/qwen3_5/execution/text.cpp | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index 12aa5b9..6780d8c 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -62,6 +62,32 @@
+ namespace ninfer::models::qwen3_5::execution {
+ namespace {
+ 
++// Research: NINFER_DRAFT_DUMP=DIR appends prefill final-norm columns to DIR/final.bf16 (see draft.cpp).
++void research_dump_final(const Tensor& x, cudaStream_t stream) {
++    static const char* dir = std::getenv("NINFER_DRAFT_DUMP");
++    if (dir == nullptr || *dir == 0) { return; }
++    static const char* only = std::getenv("NINFER_DRAFT_DUMP_ONLY");
++    if (only != nullptr && *only != 0 &&
++        (std::string(",") + only + ",").find(",final,") == std::string::npos) {
++        return;
++    }
++    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
++    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
++    if (capture != cudaStreamCaptureStatusNone) {
++        throw std::runtime_error("NINFER_DRAFT_DUMP requires --no-cuda-graph");
++    }
++    if (x.dtype != DType::BF16 || x.nb[0] != 2) { throw std::runtime_error("final dump: BF16 only"); }
++    const std::int64_t k = x.ne[0], columns = x.ne[1];
++    std::vector<std::uint16_t> host(static_cast<std::size_t>(k * columns));
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy2D(host.data(), k * 2, x.data, x.nb[1], k * 2, columns,
++                            cudaMemcpyDeviceToHost));
++    std::FILE* f = std::fopen((std::string(dir) + "/final.bf16").c_str(), "ab");
++    if (f == nullptr) { throw std::runtime_error("final dump: cannot open"); }
++    std::fwrite(host.data(), 2, host.size(), f);
++    std::fclose(f);
++}
++
+ void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
+              WorkspaceArena& workspace, cudaStream_t stream) {
+     ops::linear(x, parameters.weight, out, parameters.policy, workspace, stream);
+@@ -1382,6 +1408,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
+                             ? matrix_window(prefill_hidden_, len)
+                             : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
+             ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
++            research_dump_final(xf, s);
+ 
+             if (is_last) {
+                 Tensor last_xf = xf.slice(1, len - 1, 1);
+-- 
+2.34.1
+

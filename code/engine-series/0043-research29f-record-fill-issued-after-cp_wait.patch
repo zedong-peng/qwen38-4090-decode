@@ -1,0 +1,36 @@
+From 50110cc57707d9d67c2d940ce2ecb2b7bb480da1 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 43/49] research29f: record fill issued after cp_wait
+
+---
+ src/ops/linear_attention/gated_delta_net/recurrent.cuh | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index c562200..24be899 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -1133,14 +1133,14 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+         if (pack < kBlockDv / 8) { store_vec(&value_raw[token][pack * 8], make_uint4(0, 0, 0, 0)); }
+         if (pack == 0) { gate_raw[token] = make_uint2(0U, 0U); }
+     }
+-    // research29: the next GEMM's weight lines, queued behind this CTA's own copies.
+-    ops::detail::L2FillLoads<2> l2_fill;
+-    l2_fill.issue(access.fill,
+-                  (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * kThreads + thread,
+-                  gridDim.x * gridDim.y * gridDim.z * kThreads);
+     std::uint32_t next_state_word = 0U;
+     cp_wait<0>();
+     __syncthreads();
++    // research29: the next GEMM's weight lines; research29f: issued once this CTA's own copies have landed.
++    ops::detail::L2FillLoads<2> l2_fill{};
++    l2_fill.issue(access.fill,
++                  (blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z)) * kThreads + thread,
++                  gridDim.x * gridDim.y * gridDim.z * kThreads);
+ 
+     if constexpr (FusedConv) {
+         // gdn_projected_conv_kernel's convolution, per channel column: DFS pre-order puts every ancestor before its
+-- 
+2.34.1
+

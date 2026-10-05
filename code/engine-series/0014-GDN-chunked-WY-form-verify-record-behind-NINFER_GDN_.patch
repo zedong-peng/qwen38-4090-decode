@@ -1,0 +1,539 @@
+From 459929cf7d0f60ee6eb5d19e7d5b177e152d5ae4 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 17:37:08 +0800
+Subject: [PATCH 14/49] GDN: chunked (WY-form) verify record behind
+ NINFER_GDN_CHUNKED_RECORD=1
+
+Unrolls the gated delta rule along each column root path: Gram matrices and
+s0 projections on tensor cores (fp32 state as bf16 hi+lo), a 16x16 forward
+substitution for the deltas, then outputs. Records and prefetch are written
+as in the staged kernel. Bench (27B geometry, width 16): out rel.err 4.8e-5,
+records identical; 6.3 us vs staged 12-20 us.
+---
+ bench/ops/benchmarks.cmake                    |   1 +
+ bench/ops/gdn_chunked_bench.cu                | 156 ++++++++++
+ .../gated_delta_net/recurrent.cu              |  16 +-
+ .../gated_delta_net/recurrent.cuh             | 289 ++++++++++++++++++
+ 4 files changed, 460 insertions(+), 2 deletions(-)
+ create mode 100644 bench/ops/gdn_chunked_bench.cu
+
+diff --git a/bench/ops/benchmarks.cmake b/bench/ops/benchmarks.cmake
+index 59920c2..72a0faa 100644
+--- a/bench/ops/benchmarks.cmake
++++ b/bench/ops/benchmarks.cmake
+@@ -61,3 +61,4 @@ ninfer_add_op_bench(ninfer_context_kv_materialize_bench
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")
+ ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
+ ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
++ninfer_add_op_bench(ninfer_gdn_chunked_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_chunked_bench.cu")
+diff --git a/bench/ops/gdn_chunked_bench.cu b/bench/ops/gdn_chunked_bench.cu
+new file mode 100644
+index 0000000..91aa29e
+--- /dev/null
++++ b/bench/ops/gdn_chunked_bench.cu
+@@ -0,0 +1,156 @@
++// Staged vs chunked GDN verify record (NINFER_GDN_CHUNKED_RECORD): output agreement, record identity and
++// latency for the 27B geometry (48 value heads, 16 key heads), one row, width 16, verify tree and chain.
++// Inputs are random but in the deployed range: unit-variance q/k/v, log gates in [-1.2, -0.02], beta in
++// [0.05, 0.95], state entries N(0, 0.05).
++// usage: ninfer_gdn_chunked_bench [REPEAT]
++
++#include "ninfer/ops/gated_delta_net.h"
++
++#include <cuda_bf16.h>
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <vector>
++
++using namespace ninfer;
++
++namespace {
++
++constexpr int kDim = 128, kQk = 16, kHv = 48, kWidth = 16, kSlots = 2;
++
++#define CK(x)                                                                                    \
++    do {                                                                                         \
++        cudaError_t e_ = (x);                                                                    \
++        if (e_ != cudaSuccess) {                                                                 \
++            std::fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_));      \
++            std::exit(1);                                                                        \
++        }                                                                                        \
++    } while (0)
++
++template <class T>
++T* upload(const std::vector<T>& h) {
++    T* d = nullptr;
++    CK(cudaMalloc(&d, h.size() * sizeof(T)));
++    CK(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice));
++    return d;
++}
++
++template <class T>
++std::vector<T> download(const T* d, std::size_t n) {
++    std::vector<T> h(n);
++    CK(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost));
++    return h;
++}
++
++struct Case {
++    const char* name;
++    bool tree;
++};
++
++} // namespace
++
++int main(int argc, char** argv) {
++    const int repeat = argc > 1 ? std::atoi(argv[1]) : 200;
++    std::mt19937 rng(20261003);
++    std::normal_distribution<float> normal(0.0f, 1.0f);
++    std::uniform_real_distribution<float> uni(0.0f, 1.0f);
++    const std::size_t qk_n = static_cast<std::size_t>(kDim) * kQk * kWidth;
++    const std::size_t v_n  = static_cast<std::size_t>(kDim) * kHv * kWidth;
++    const std::size_t g_n  = static_cast<std::size_t>(kHv) * kWidth;
++    const std::size_t s_n  = static_cast<std::size_t>(kDim) * kDim * kHv * kSlots;
++    std::vector<__nv_bfloat16> hq(qk_n), hk(qk_n), hv(v_n);
++    for (auto& x : hq) x = __float2bfloat16(normal(rng));
++    for (auto& x : hk) x = __float2bfloat16(normal(rng));
++    for (auto& x : hv) x = __float2bfloat16(normal(rng));
++    std::vector<float> hg(g_n), hb(g_n), hs(s_n);
++    for (auto& x : hg) x = -0.02f - 1.18f * uni(rng);
++    for (auto& x : hb) x = 0.05f + 0.9f * uni(rng);
++    for (auto& x : hs) x = 0.05f * normal(rng);
++    const std::vector<std::int32_t> tree_parents = {-1, 0, 0, 2, 3, 3, 5, 6, 6, 8, 9, 10, 10, 12, 13, 14};
++    const std::vector<std::int32_t> initial      = {1};
++
++    auto* dq = upload(hq);
++    auto* dk = upload(hk);
++    auto* dv = upload(hv);
++    auto* dg = upload(hg);
++    auto* db = upload(hb);
++    auto* ds = upload(hs);
++    auto* dp = upload(tree_parents);
++    auto* di = upload(initial);
++    __nv_bfloat16 *out[2], *krec[2], *vrec[2];
++    float* grec[2];
++    for (int m = 0; m < 2; ++m) {
++        CK(cudaMalloc(&out[m], v_n * 2));
++        CK(cudaMalloc(&krec[m], qk_n * 2));
++        CK(cudaMalloc(&vrec[m], v_n * 2));
++        CK(cudaMalloc(&grec[m], g_n * 8));
++    }
++
++    const float scale = 1.0f / std::sqrt(static_cast<float>(kDim));
++    cudaStream_t stream;
++    CK(cudaStreamCreate(&stream));
++    cudaEvent_t a, e;
++    CK(cudaEventCreate(&a));
++    CK(cudaEventCreate(&e));
++
++    for (const Case c : {Case{"tree", true}, Case{"chain", false}}) {
++        float times[2]     = {0, 0};
++        for (int m = 0; m < 2; ++m) {
++            setenv("NINFER_GDN_CHUNKED_RECORD", m == 1 ? "1" : "0", 1);
++            Tensor q(dq, DType::BF16, {kDim, kQk, kWidth, 1});
++            Tensor k(dk, DType::BF16, {kDim, kQk, kWidth, 1});
++            Tensor v(dv, DType::BF16, {kDim, kHv, kWidth, 1});
++            Tensor g(dg, DType::FP32, {kHv, kWidth, 1});
++            Tensor beta(db, DType::FP32, {kHv, kWidth, 1});
++            Tensor states(ds, DType::FP32, {kDim, kDim, kHv, kSlots});
++            Tensor init(di, DType::I32, {1});
++            Tensor kr(krec[m], DType::BF16, {kDim, kQk, kWidth, 1});
++            Tensor vr(vrec[m], DType::BF16, {kDim, kHv, kWidth, 1});
++            Tensor gr(grec[m], DType::FP32, {2, kHv, kWidth, 1});
++            Tensor o(out[m], DType::BF16, {kDim, kHv, kWidth, 1});
++            const Tensor parents = c.tree ? Tensor(dp, DType::I32, {kWidth, 1}) : Tensor{};
++            CK(cudaMemset(out[m], 0xff, v_n * 2));
++            const auto launch = [&] {
++                ops::gated_delta_net_replay_record(q, k, v, g, beta, scale, states, Tensor{}, init, kr,
++                                                   vr, gr, o, Tensor{}, parents, stream);
++            };
++            launch();
++            CK(cudaStreamSynchronize(stream));
++            for (int w = 0; w < 20; ++w) launch();
++            CK(cudaEventRecord(a, stream));
++            for (int r = 0; r < repeat; ++r) launch();
++            CK(cudaEventRecord(e, stream));
++            CK(cudaEventSynchronize(e));
++            float ms = 0;
++            CK(cudaEventElapsedTime(&ms, a, e));
++            times[m] = 1000.0f * ms / static_cast<float>(repeat);
++        }
++        const auto o0 = download(out[0], v_n), o1 = download(out[1], v_n);
++        double num = 0, den = 0, mx = 0;
++        std::size_t diff_bits = 0;
++        for (std::size_t i = 0; i < v_n; ++i) {
++            const double x0 = __bfloat162float(o0[i]), x1 = __bfloat162float(o1[i]);
++            num += (x1 - x0) * (x1 - x0);
++            den += x0 * x0;
++            mx = std::max(mx, std::fabs(x1 - x0));
++            diff_bits += std::memcmp(&o0[i], &o1[i], 2) != 0;
++        }
++        const bool krec_same =
++            std::memcmp(download(krec[0], qk_n).data(), download(krec[1], qk_n).data(), qk_n * 2) == 0;
++        const bool vrec_same =
++            std::memcmp(download(vrec[0], v_n).data(), download(vrec[1], v_n).data(), v_n * 2) == 0;
++        const bool grec_same =
++            std::memcmp(download(grec[0], g_n * 2).data(), download(grec[1], g_n * 2).data(), g_n * 8) == 0;
++        std::printf("%-5s staged %6.2f us  chunked %6.2f us (%+.1f%%)  out rel.err %.2e max|d| %.3e "
++                    "bf16 differing %zu/%zu  records k/v/g identical %d/%d/%d\n",
++                    c.name, times[0], times[1], 100.0 * (times[1] / times[0] - 1.0), std::sqrt(num / den),
++                    mx, diff_bits, v_n, krec_same, vrec_same, grec_same);
++    }
++    return 0;
++}
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+index 734913d..2507e14 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -1,6 +1,7 @@
+ // Modified by satellitedown for Cinference: staged GDN records, next-state prefetch, verify trees.
+ // See NOTICE and upstream-provenance.json for upstream attribution.
+ 
++#include <cstdlib>
+ #include "ops/linear_attention/gated_delta_net/launch.h"
+ 
+ #include "core/device.h"
+@@ -103,13 +104,24 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+         static_cast<const float*>(next_states.data),
+         static_cast<const std::int32_t*>(tree_parents.data),
+     };
++    // Research flag NINFER_GDN_CHUNKED_RECORD=1: the chunked (WY-form) record, read at each launch.
++    const char* chunked_flag = std::getenv("NINFER_GDN_CHUNKED_RECORD");
++    const bool chunked       = chunked_flag != nullptr && chunked_flag[0] == '1';
+     if (tree_parents.data != nullptr) {
+         if (q.ne[2] > kStagedRecordMaxWidth) {
+             throw std::invalid_argument("GDN tree records support at most 16 columns");
+         }
+-        recurrent_record_staged_kernel<Masked, true><<<grid, block, 0, stream>>>(access);
++        if (chunked) {
++            recurrent_record_chunked_kernel<Masked, true><<<grid, block, 0, stream>>>(access);
++        } else {
++            recurrent_record_staged_kernel<Masked, true><<<grid, block, 0, stream>>>(access);
++        }
+     } else if (q.ne[2] <= kStagedRecordMaxWidth) {
+-        recurrent_record_staged_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
++        if (chunked) {
++            recurrent_record_chunked_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
++        } else {
++            recurrent_record_staged_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
++        }
+     } else {
+         recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+     }
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index 6f7a277..6a2d6f0 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -5,6 +5,7 @@
+ 
+ #include "ops/common/bf16_vector.cuh"
+ #include "ops/linear_attention/gated_delta_net/common.cuh"
++#include "ops/common/mma.cuh"
+ #include "ops/linear_attention/gated_delta_net/launch.h"
+ 
+ #include <cuda_bf16.h>
+@@ -992,6 +993,294 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+     zero_output_suffix(access, coord, valid, access.width);
+ }
+ 
++// Chunked (WY-form) record for verify trees and short chains (research path, NINFER_GDN_CHUNKED_RECORD=1).
++//
++// The staged kernel walks the columns in order and needs two warp reductions per column on the critical
++// path. A record only has to produce each column's output; the state itself is committed later by the
++// fold from the raw records this kernel writes exactly as the staged kernel does. Unrolling the gated
++// delta rule along a column's root path (A_i = exp(G_i), G_i = g_i + G_parent, k and q L2-normalized):
++//   s_i   = A_i s_0 + sum_{j in path(i)} exp(G_i - G_j) delta_j k_j^T
++//   delta_i + beta_i sum_{j in anc(i)} exp(G_i - G_j) (k_i . k_j) delta_j = beta_i (v_i - A_i s_0 . k_i)
++//   o_i   = scale (A_i s_0 . q_i + sum_{j in path(i)} exp(G_i - G_j) (q_i . k_j) delta_j)
++// A CTA forms s_0 . k_i and s_0 . q_i for its 16 state rows and the column Gram matrices on tensor cores
++// (bf16 operands; the FP32 state enters as a bf16 hi + lo split), then one 16-step forward substitution per
++// state row (ancestors precede descendants in DFS pre-order, so the system is lower triangular). Same grid,
++// access and record side effects as the staged kernel; outputs agree to FP32 rounding, not bit for bit.
++template <bool Masked, bool Tree>
++__global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
++    recurrent_record_chunked_kernel(RecordAccess<Masked> access) {
++    const RecurrentCoordinates coord = access.coordinates();
++    const std::int32_t valid         = access.active_columns(coord);
++    const int thread                 = coord.warp * kWarpSize + coord.lane;
++    constexpr int kThreads           = kWarpSize * kNumWarps;
++    constexpr int kPacksPerColumn    = kStateDim / 8;
++    constexpr int kW                 = kStagedRecordMaxWidth;
++    constexpr int kRowStride         = kStateDim + 8;  // bf16: 272-byte rows
++    constexpr int kStateStride       = kStateDim + 4;  // fp32: 528-byte rows
++    static_assert(kThreads == 128 && kW == 16 && kBlockDv == 16);
++
++    __shared__ __align__(16) __nv_bfloat16 key_raw[kW][kRowStride];
++    __shared__ __align__(16) __nv_bfloat16 query_raw[kW][kRowStride];
++    __shared__ __align__(16) float state_tile[kBlockDv][kStateStride];
++    __shared__ __align__(16) __nv_bfloat16 value_raw[kW][kBlockDv];
++    __shared__ __align__(8) uint2 gate_raw[kW];
++    __shared__ float key_scale[kW];
++    __shared__ float query_scale[kW];
++    __shared__ float cum_gate[kW];
++    __shared__ std::uint32_t ancestors[kW];
++    __shared__ float kk[kW][kW + 1];
++    __shared__ float qk[kW][kW + 1];
++    __shared__ float qq[kW];
++    __shared__ float proj_k[kBlockDv][kW + 1];
++    __shared__ float proj_q[kBlockDv][kW + 1];
++    __shared__ float coef[kW][kW + 1];
++    __shared__ float readout[kW][kW + 1];
++    __shared__ float delta_s[kBlockDv][kW + 1];
++
++    const std::uint32_t tile_dv = static_cast<std::uint32_t>(coord.state_tile * kBlockDv);
++    {
++        const float* state_base = access.state_read_base(coord) + static_cast<std::int64_t>(tile_dv) * kStateDim;
++        for (int task = thread; task < kBlockDv * (kStateDim / 4); task += kThreads) {
++            const int row = task / (kStateDim / 4);
++            const int c4  = task - row * (kStateDim / 4);
++            cp_async<16>(&state_tile[row][c4 * 4], state_base + static_cast<std::int64_t>(row) * kStateDim + c4 * 4);
++        }
++    }
++    for (int task = thread; task < valid * kPacksPerColumn; task += kThreads) {
++        const int token = task / kPacksPerColumn;
++        const int pack  = task - token * kPacksPerColumn;
++        cp_async<16>(&key_raw[token][pack * 8], access.key_ptr(coord, token) + pack * 8);
++        cp_async<16>(&query_raw[token][pack * 8], access.query_ptr(coord, token) + pack * 8);
++    }
++    for (int task = thread; task < valid * (kBlockDv / 8); task += kThreads) {
++        const int token = task / (kBlockDv / 8);
++        const int pack  = task - token * (kBlockDv / 8);
++        cp_async<16>(&value_raw[token][pack * 8],
++                     access.value_ptr(coord, token) + tile_dv + pack * 8);
++    }
++    for (int token = thread; token < valid; token += kThreads) {
++        const std::int64_t offset =
++            access.column(coord, token) * access.heads.H_v + coord.value_head;
++        cp_async<4>(&gate_raw[token].x, access.g + offset);
++        cp_async<4>(&gate_raw[token].y, access.beta + offset);
++    }
++    cp_commit();
++    // Unused column slots read as zeros, so the blocked loops below need no column guards.
++    for (int task = thread; task < (kW - valid) * kPacksPerColumn; task += kThreads) {
++        const int token = valid + task / kPacksPerColumn;
++        const int pack  = task % kPacksPerColumn;
++        store_vec(&key_raw[token][pack * 8], make_uint4(0, 0, 0, 0));
++        store_vec(&query_raw[token][pack * 8], make_uint4(0, 0, 0, 0));
++        if (pack < kBlockDv / 8) { store_vec(&value_raw[token][pack * 8], make_uint4(0, 0, 0, 0)); }
++        if (pack == 0) { gate_raw[token] = make_uint2(0U, 0U); }
++    }
++    cp_wait<0>();
++    __syncthreads();
++
++    // Records: the raw inputs, exactly as the staged kernel writes them.
++    if (coord.state_tile == 0 &&
++        static_cast<int>(coord.value_head) % access.heads.group_size() == 0) {
++        for (int task = thread; task < valid * kPacksPerColumn; task += kThreads) {
++            const int token = task / kPacksPerColumn;
++            const int pack  = task - token * kPacksPerColumn;
++            __nv_bfloat16* destination =
++                access.key_record +
++                (access.column(coord, token) * access.heads.H_qk + coord.qk_head) * kStateDim;
++            store_vec(destination + pack * 8, load_vec<uint4>(&key_raw[token][pack * 8]));
++        }
++    }
++    for (int task = thread; task < valid * (kBlockDv / 8); task += kThreads) {
++        const int token = task / (kBlockDv / 8);
++        const int pack  = task - token * (kBlockDv / 8);
++        __nv_bfloat16* destination =
++            access.value_record +
++            (access.column(coord, token) * access.heads.H_v + coord.value_head) * kStateDim;
++        store_vec(destination + tile_dv + pack * 8, load_vec<uint4>(&value_raw[token][pack * 8]));
++    }
++    if (coord.state_tile == 0) {
++        for (int token = thread; token < valid; token += kThreads) {
++            access.gate_record[access.column(coord, token) * access.heads.H_v + coord.value_head] =
++                gate_raw[token];
++        }
++    }
++    if (access.next_states != nullptr) {
++        constexpr int kLinesPerRow = kStateDim * static_cast<int>(sizeof(float)) / 128;
++        if (thread < kBlockDv * kLinesPerRow) {
++            const float* next_tile =
++                access.next_states +
++                static_cast<std::int64_t>(access.initial_slots[coord.batch]) *
++                    access.state_slot_stride +
++                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
++            prefetch_l2(next_tile +
++                        static_cast<std::int64_t>(tile_dv + thread / kLinesPerRow) * kStateDim +
++                        thread % kLinesPerRow * (128 / sizeof(float)));
++        }
++    }
++
++    // Tensor-core phase. Warp 0: Gram K K^T, Q K^T, Q Q^T (bf16 operands are exact, FP32 accumulate).
++    // Warps 1, 2: s_0 . k and s_0 . q with the FP32 state split as bf16 hi + lo (two passes, ~16-bit
++    // mantissa). Warp 3: root paths (strict-ancestor masks and cumulative log gates).
++    {
++        const int g = coord.lane >> 2;
++        const int q = coord.lane & 3;
++        const auto pair_at = [](const __nv_bfloat16* row, int col) {
++            return *reinterpret_cast<const unsigned*>(row + col);
++        };
++        if (coord.warp == 0) {
++            float d[3][2][4] = {};
++#pragma unroll
++            for (int ks = 0; ks < kStateDim / 16; ++ks) {
++                const int c = ks * 16 + 2 * q;
++                const unsigned ka[4] = {pair_at(key_raw[g], c), pair_at(key_raw[g + 8], c),
++                                        pair_at(key_raw[g], c + 8), pair_at(key_raw[g + 8], c + 8)};
++                const unsigned qa[4] = {pair_at(query_raw[g], c), pair_at(query_raw[g + 8], c),
++                                        pair_at(query_raw[g], c + 8), pair_at(query_raw[g + 8], c + 8)};
++#pragma unroll
++                for (int nt = 0; nt < 2; ++nt) {
++                    const unsigned kb0 = pair_at(key_raw[nt * 8 + g], c);
++                    const unsigned kb1 = pair_at(key_raw[nt * 8 + g], c + 8);
++                    const unsigned qb0 = pair_at(query_raw[nt * 8 + g], c);
++                    const unsigned qb1 = pair_at(query_raw[nt * 8 + g], c + 8);
++                    mma_bf16(d[0][nt][0], d[0][nt][1], d[0][nt][2], d[0][nt][3], ka[0], ka[1], ka[2], ka[3], kb0, kb1);
++                    mma_bf16(d[1][nt][0], d[1][nt][1], d[1][nt][2], d[1][nt][3], qa[0], qa[1], qa[2], qa[3], kb0, kb1);
++                    mma_bf16(d[2][nt][0], d[2][nt][1], d[2][nt][2], d[2][nt][3], qa[0], qa[1], qa[2], qa[3], qb0, qb1);
++                }
++            }
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt) {
++                const int col = nt * 8 + 2 * q;
++                kk[g][col] = d[0][nt][0];     kk[g][col + 1] = d[0][nt][1];
++                kk[g + 8][col] = d[0][nt][2]; kk[g + 8][col + 1] = d[0][nt][3];
++                qk[g][col] = d[1][nt][0];     qk[g][col + 1] = d[1][nt][1];
++                qk[g + 8][col] = d[1][nt][2]; qk[g + 8][col + 1] = d[1][nt][3];
++                if (col == g) { qq[g] = d[2][nt][0]; }
++                if (col + 1 == g) { qq[g] = d[2][nt][1]; }
++                if (col == g + 8) { qq[g + 8] = d[2][nt][2]; }
++                if (col + 1 == g + 8) { qq[g + 8] = d[2][nt][3]; }
++            }
++        } else if (coord.warp <= 2) {
++            const auto* columns = coord.warp == 1 ? key_raw : query_raw;
++            auto& proj          = coord.warp == 1 ? proj_k : proj_q;
++            float d[2][4]       = {};
++            const auto split = [](float x0, float x1, unsigned& hi, unsigned& lo) {
++                const __nv_bfloat162 h = __floats2bfloat162_rn(x0, x1);
++                const float2 hf        = __bfloat1622float2(h);
++                const __nv_bfloat162 l = __floats2bfloat162_rn(x0 - hf.x, x1 - hf.y);
++                hi = *reinterpret_cast<const unsigned*>(&h);
++                lo = *reinterpret_cast<const unsigned*>(&l);
++            };
++#pragma unroll
++            for (int ks = 0; ks < kStateDim / 16; ++ks) {
++                const int c = ks * 16 + 2 * q;
++                const float2 s0 = *reinterpret_cast<const float2*>(&state_tile[g][c]);
++                const float2 s1 = *reinterpret_cast<const float2*>(&state_tile[g + 8][c]);
++                const float2 s2 = *reinterpret_cast<const float2*>(&state_tile[g][c + 8]);
++                const float2 s3 = *reinterpret_cast<const float2*>(&state_tile[g + 8][c + 8]);
++                unsigned ah[4], al[4];
++                split(s0.x, s0.y, ah[0], al[0]);
++                split(s1.x, s1.y, ah[1], al[1]);
++                split(s2.x, s2.y, ah[2], al[2]);
++                split(s3.x, s3.y, ah[3], al[3]);
++#pragma unroll
++                for (int nt = 0; nt < 2; ++nt) {
++                    const unsigned b0 = pair_at(columns[nt * 8 + g], c);
++                    const unsigned b1 = pair_at(columns[nt * 8 + g], c + 8);
++                    mma_bf16(d[nt][0], d[nt][1], d[nt][2], d[nt][3], ah[0], ah[1], ah[2], ah[3], b0, b1);
++                    mma_bf16(d[nt][0], d[nt][1], d[nt][2], d[nt][3], al[0], al[1], al[2], al[3], b0, b1);
++                }
++            }
++#pragma unroll
++            for (int nt = 0; nt < 2; ++nt) {
++                const int col = nt * 8 + 2 * q;
++                proj[g][col] = d[nt][0];     proj[g][col + 1] = d[nt][1];
++                proj[g + 8][col] = d[nt][2]; proj[g + 8][col + 1] = d[nt][3];
++            }
++        } else if (coord.lane >= valid && coord.lane < kW) {
++            ancestors[coord.lane] = 0U;
++            cum_gate[coord.lane]  = 0.0f;
++        } else if (coord.lane < valid) {
++            const int column = coord.lane;
++            const std::int32_t* parents =
++                Tree ? access.tree_parents + static_cast<std::int64_t>(coord.batch) * access.width
++                     : nullptr;
++            std::uint32_t mask = 0;
++            float gate_sum     = __uint_as_float(gate_raw[column].x);
++            int parent         = Tree ? parents[column] : column - 1;
++            while (parent >= 0) {
++                mask |= 1U << parent;
++                gate_sum += __uint_as_float(gate_raw[parent].x);
++                parent = Tree ? parents[parent] : parent - 1;
++            }
++            ancestors[column] = mask;
++            cum_gate[column]  = gate_sum;
++        }
++    }
++    __syncthreads();
++
++    if (thread < kW) {
++        key_scale[thread]   = rsqrtf(kk[thread][thread] + kQkL2NormEps);
++        query_scale[thread] = rsqrtf(qq[thread] + kQkL2NormEps);
++    }
++    __syncthreads();
++
++    // coef_ij = beta_i exp(G_i - G_j) k_i . k_j over strict ancestors j; readout_ij = exp(G_i - G_j)
++    // q_i . k_j over the root path (j == i included), both on normalized columns.
++    for (int entry = thread; entry < kW * kW; entry += kThreads) {
++        const int i = entry / kW;
++        const int j = entry % kW;
++        float c = 0.0f, d = 0.0f;
++        if (i < valid && j <= i) {
++            const bool ancestor = (ancestors[i] >> j) & 1U;
++            if (ancestor || i == j) {
++                const float decay = expf(cum_gate[i] - cum_gate[j]);
++                d = decay * qk[i][j] * query_scale[i] * key_scale[j];
++                if (ancestor) {
++                    c = __uint_as_float(gate_raw[i].y) * decay * kk[i][j] * key_scale[i] *
++                        key_scale[j];
++                }
++            }
++        }
++        coef[i][j]    = c;
++        readout[i][j] = d;
++    }
++    __syncthreads();
++
++    // One forward substitution per state row (16 threads), then the outputs on all threads.
++    if (thread < kBlockDv) {
++        const int row = thread;
++        float delta[kW];
++        float rhs[kW];
++#pragma unroll
++        for (int i = 0; i < kW; ++i) {
++            rhs[i] = __uint_as_float(gate_raw[i].y) *
++                     (__bfloat162float(value_raw[i][row]) -
++                      expf(cum_gate[i]) * proj_k[row][i] * key_scale[i]);
++        }
++#pragma unroll
++        for (int i = 0; i < kW; ++i) {
++            float acc = rhs[i], acc2 = 0.0f;
++#pragma unroll
++            for (int j = 0; j < i; j += 2) {
++                acc = fmaf(-coef[i][j], delta[j], acc);
++                if (j + 1 < i) { acc2 = fmaf(-coef[i][j + 1], delta[j + 1], acc2); }
++            }
++            delta[i]        = acc + acc2;
++            delta_s[row][i] = delta[i];
++        }
++    }
++    __syncthreads();
++    for (int task = thread; task < kBlockDv * kW; task += kThreads) {
++        const int i   = task / kBlockDv;
++        const int row = task % kBlockDv;
++        if (i >= valid) { continue; }
++        float acc = expf(cum_gate[i]) * proj_q[row][i] * query_scale[i];
++#pragma unroll
++        for (int j = 0; j < kW; ++j) { acc = fmaf(readout[i][j], delta_s[row][j], acc); }
++        access.output_ptr(coord, i)[tile_dv + row] = __float2bfloat16(acc * access.scale);
++    }
++    zero_output_suffix(access, coord, valid, access.width);
++}
++
+ template <class Geometry>
+ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+-- 
+2.34.1
+

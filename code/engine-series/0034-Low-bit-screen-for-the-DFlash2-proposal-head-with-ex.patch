@@ -1,0 +1,477 @@
+From 22ab8642d6f6f547a3d638e1d78805aa7ec3b4fc Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 08:10:12 +0800
+Subject: [PATCH 34/49] Low-bit screen for the DFlash2 proposal head with exact
+ Q4 rescoring (NINFER_PROPOSAL_SCREEN, research25)
+
+NINFER_PROPOSAL_SCREEN=3 (or 2) builds, at load, the half-offset G64 screen of screen_lowbit.cuh from the 131072-row Q4
+G64 proposal head (3.25 bits per weight, 260 MiB) and runs the head's top-16 through it: screen, chunk merge, then an
+exact FP32 rescoring of each column's top-R screen rows on the Q4 codes (NINFER_PROPOSAL_SCREEN_R = 32, 64, 128, 256;
+R > 32 splits the rescoring across R/32 CTAs per column) and the top-16 keys in linear_topk's order. The candidate
+selector normalizes over a column's 16 candidates only, so the drafts change only where an exact top-16 row falls
+outside the screen's top-R. NINFER_PROPOSAL_SCREEN_CHECK=1 keeps the K-split drafts and prints the screen's recall.
+screen_lowbit.cuh's non-template kernels get internal linkage (two screen TUs under -rdc).
+
+Spec-Bench-480 forced on identical text (e2e31-dq3, research23 env), A B C A B C: 3-bit R32 ms/round -0.60% / -0.42%,
+tok/step +0.10% (ns), tok/s +0.70% / +0.53%; R64 -0.47% / -0.27%; null 0.00%. nsys per call: screen path 352 us
+(screen 325, merges 11, rescoring 16) vs the K-split path 458 us. Check mode: 3-bit R32 recall 0.908 of the exact
+top-16, top-1 0.9993; 2-bit R128 recall 0.853, top-1 0.987 (not used).
+---
+ include/ninfer/ops/linear_topk.h       |  10 +
+ src/models/qwen3_5/execution/draft.cpp |   8 +-
+ src/models/qwen3_5/execution/text.cpp  |   1 +
+ src/ops/linear_topk/proposal_screen.cu | 358 +++++++++++++++++++++++++
+ src/ops/linear_topk/screen_lowbit.cuh  |   4 +-
+ src/ops/linear_topk/sources.cmake      |   1 +
+ 6 files changed, 378 insertions(+), 4 deletions(-)
+ create mode 100644 src/ops/linear_topk/proposal_screen.cu
+
+diff --git a/include/ninfer/ops/linear_topk.h b/include/ninfer/ops/linear_topk.h
+index be3ab13..4ad6df6 100644
+--- a/include/ninfer/ops/linear_topk.h
++++ b/include/ninfer/ops/linear_topk.h
+@@ -100,4 +100,14 @@ void lowbit_screen_build(const Weight& q8_head, const LowBitScreen& screen, cuda
+ void lowbit_screen_verify(const Tensor& hidden, const Weight& q8_head, const LowBitScreen& screen,
+                           Tensor& tokens, cudaStream_t stream);
+ 
++// Research (NINFER_PROPOSAL_SCREEN=3|2): a low-bit screen of the 131072-row Q4 G64 proposal head with exact Q4
++// rescoring of each column's top screen rows. prepare (outside graph capture; idempotent) builds the screen when the
++// knob is on; proposal_screen_topk returns false when no screen was built (the caller runs linear_topk).
++void proposal_screen_prepare(const Weight& q4_head);
++bool proposal_screen_topk(const Tensor& hidden, const Weight& q4_head, const Tensor& row_to_global_ids,
++                          Tensor& candidate_ids, Tensor& candidate_scores, cudaStream_t stream);
++// NINFER_PROPOSAL_SCREEN_CHECK=1: proposal_screen_topk writes to scratch and returns false; this compares the
++// K-split head's candidate_ids with it (running totals printed by the device).
++void proposal_screen_check(const Tensor& candidate_ids, cudaStream_t stream);
++
+ } // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/draft.cpp b/src/models/qwen3_5/execution/draft.cpp
+index 22a4842..bf9db93 100644
+--- a/src/models/qwen3_5/execution/draft.cpp
++++ b/src/models/qwen3_5/execution/draft.cpp
+@@ -418,8 +418,12 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
+         } else {
+             const auto& head = *state.execution.parameters.proposal;
+             if (head.token_ids) {
+-                ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,
+-                                 stream);
++                if (!ops::proposal_screen_topk(hidden, head.head.weight, *head.token_ids, ids_flat,
++                                               scores, stream)) {
++                    ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,
++                                     stream);
++                    ops::proposal_screen_check(ids_flat, stream);
++                }
+             } else {
+                 ops::linear_topk(
+                     hidden, head.head.weight,
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index c77f706..919e7d4 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -297,6 +297,7 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
+         set_proposal_head(
+             &p.head, p.token_ids ? static_cast<const std::int32_t*>(p.token_ids->data) : nullptr,
+             dimension(p.rows));
++        if (p.token_ids) { ops::proposal_screen_prepare(p.head.weight); }
+     }
+     (void)two_level_head_enabled();
+ }
+diff --git a/src/ops/linear_topk/proposal_screen.cu b/src/ops/linear_topk/proposal_screen.cu
+new file mode 100644
+index 0000000..639386c
+--- /dev/null
++++ b/src/ops/linear_topk/proposal_screen.cu
+@@ -0,0 +1,358 @@
++// Research (NINFER_PROPOSAL_SCREEN=3 or 2, research25): the DFlash2 proposal head (the 131072-row Q4 G64 shortlist)
++// through the low-bit screen of the two-level verify head (screen_lowbit.cuh), built from the Q4 head at load, and an
++// exact Q4 rescoring of each column's top-R screen rows (NINFER_PROPOSAL_SCREEN_R = 32, 64, 128 or 256). The candidate
++// selector normalizes its lattice over the 16 candidates of a column only (candidate_selector_path.cu), so the drafts
++// are those of the K-split head whenever the exact top-16 lie inside the screen's top-R (scores can differ in the last
++// FP32 bits: other summation order).
++
++#include "core/weight.h"
++#include "ninfer/ops/linear_topk.h"
++
++#include "core/device.h"
++#include "ops/common/score_id_order.cuh"
++#include "ops/linear_topk/screen_lowbit.cuh"
++
++#include <algorithm>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <stdexcept>
++
++namespace ninfer::ops {
++namespace {
++
++namespace sq = detail::screen_q2;
++using S3                = sq::Schedule<3, 8, 8, 8, 3>;
++using S2                = sq::Schedule<2, 8, 8, 8, 3>;
++constexpr int kRows     = 131072;
++constexpr int kTop      = 16;
++constexpr int kCtas     = kRows / S3::kRows;
++constexpr int kChunks   = (kCtas + sq::kChunkCtas - 1) / sq::kChunkCtas;
++constexpr int kQ4Row    = sq::kHidden / 2;
++static_assert(kRows % S3::kRows == 0 && S2::kRows == S3::kRows && kChunks * sq::kCandidates <= 1024);
++
++// Q4 G64 row-split head (byte i of a group holds codes 2i and 2i + 1, low nibble first) -> the half-offset G64 screen
++// of screen_lowbit.cuh (same grid and planes as requant_kernel, from the dequantized Q4 values).
++template <int Bits>
++__global__ void requant_q4_kernel(const std::uint8_t* __restrict__ q4, const __half* __restrict__ q4_scales,
++                                  std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ high,
++                                  __half* __restrict__ scales, std::int64_t rows) {
++    constexpr int n = 1 << (Bits - 1);
++    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
++    if (index >= rows * sq::kGroups) return;
++    const std::int64_t row = index / sq::kGroups;
++    const int group = static_cast<int>(index % sq::kGroups);
++    const std::uint8_t* src = q4 + row * kQ4Row + group * 32;
++    const float s4 = __half2float(q4_scales[row * sq::kGroups + group]);
++    const auto value = [&](int i) {
++        const int b = src[i >> 1];
++        const int c = ((((i & 1) != 0 ? b >> 4 : b) & 15) ^ 8) - 8;
++        return static_cast<float>(c) * s4;
++    };
++    float absmax = 0.0f;
++    for (int i = 0; i < 64; ++i) absmax = fmaxf(absmax, fabsf(value(i)));
++    __half sh = __float2half_rn(absmax / (n - 0.5f));
++    if (__half2float(sh) == 0.0f && absmax > 0.0f) sh = __ushort_as_half(1);
++    const float s = __half2float(sh), inv = s > 0.0f ? 1.0f / s : 0.0f;
++    std::uint8_t* dst = codes + row * sq::kRowBytes + group * 16;
++    unsigned long long hbits = 0;
++    for (int b = 0; b < 16; ++b) {
++        unsigned byte = 0;
++        for (int e = 0; e < 4; ++e) {
++            const int i = 4 * b + e;
++            const int c = max(-n, min(n - 1, __float2int_rn(value(i) * inv - 0.5f))) + n;
++            byte |= static_cast<unsigned>(c & 3) << (2 * e);
++            hbits |= static_cast<unsigned long long>(c >> 2) << i;
++        }
++        dst[b] = static_cast<std::uint8_t>(byte);
++    }
++    if constexpr (Bits == 3) {
++        for (int b = 0; b < 8; ++b) high[row * (sq::kHidden / 8) + group * 8 + b] = static_cast<std::uint8_t>(hbits >> (8 * b));
++    }
++    scales[row * sq::kGroups + group] = __float2half_rn(s * 0.5f);
++}
++
++// Exact Q4 score of one head row for one column, by a warp (FP32; lane l takes groups l, l + 32, l + 64).
++__device__ __forceinline__ float rescore_row(int row, const __nv_bfloat16* __restrict__ xc,
++                                             const std::uint8_t* __restrict__ q4, const __half* __restrict__ q4_scales,
++                                             int lane) {
++    const std::uint8_t* codes = q4 + static_cast<std::int64_t>(row) * kQ4Row;
++    const __half* rs = q4_scales + static_cast<std::int64_t>(row) * sq::kGroups;
++    float acc = 0.0f;
++    for (int g = lane; g < sq::kGroups; g += 32) {
++        const uint4* cp = reinterpret_cast<const uint4*>(codes + g * 32);
++        const uint4* xp = reinterpret_cast<const uint4*>(xc + g * 64);
++        float part = 0.0f;
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            const uint4 c = cp[h];
++            const std::uint8_t* cb = reinterpret_cast<const std::uint8_t*>(&c);
++#pragma unroll
++            for (int v = 0; v < 4; ++v) {
++                const uint4 xv = xp[4 * h + v];
++                const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xv);
++#pragma unroll
++                for (int e = 0; e < 4; ++e) {
++                    const int b = cb[4 * v + e];
++                    part = fmaf(static_cast<float>(((b & 15) ^ 8) - 8), __bfloat162float(xb[2 * e]), part);
++                    part = fmaf(static_cast<float>(((b >> 4) ^ 8) - 8), __bfloat162float(xb[2 * e + 1]), part);
++                }
++            }
++        }
++        acc = fmaf(part, __half2float(rs[g]), acc);
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
++    return acc;
++}
++
++constexpr int kMid = kChunks * sq::kCandidates;  // screen candidates per column (512)
++static_assert((kMid & (kMid - 1)) == 0);
++
++// R = 32: one CTA (32 warps) per column: top-32 screen rows of the chunks, exact Q4 scores, then the column's top-16
++// keys (score, then lowest global id) in descending order, as linear_topk's merge writes them.
++__global__ void __launch_bounds__(1024) proposal_final_kernel(const std::uint64_t* __restrict__ mid,
++                                                              const __nv_bfloat16* __restrict__ hidden, int hidden_ld,
++                                                              const std::uint8_t* __restrict__ q4,
++                                                              const __half* __restrict__ q4_scales,
++                                                              const std::int32_t* __restrict__ row_to_global_ids,
++                                                              std::int32_t* __restrict__ out_ids,
++                                                              float* __restrict__ out_scores) {
++    __shared__ std::uint64_t a[kMid];
++    __shared__ std::uint64_t keys[32];
++    const int column = blockIdx.x;
++    for (int i = threadIdx.x; i < kMid; i += blockDim.x) a[i] = mid[static_cast<std::int64_t>(column) * kMid + i];
++    sq::bitonic_desc<kMid>(a);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int row = id_from_order_key(a[warp]);
++    const float acc = row != INT_MAX ? rescore_row(row, hidden + static_cast<std::int64_t>(column) * hidden_ld, q4,
++                                                   q4_scales, lane)
++                                     : 0.0f;
++    if (lane == 0) keys[warp] = row != INT_MAX ? score_id_order_key(acc, row_to_global_ids[row]) : 0;
++    sq::bitonic_desc<32>(keys);
++    if (threadIdx.x < kTop) {
++        out_ids[column * kTop + threadIdx.x]    = id_from_order_key(keys[threadIdx.x]);
++        out_scores[column * kTop + threadIdx.x] = score_from_order_key(keys[threadIdx.x]);
++    }
++}
++
++// R > 32, stage 1: grid (R / 32, columns); every CTA sorts the column's screen candidates and its 32 warps rescore
++// ranks [32 b, 32 b + 32).
++__global__ void __launch_bounds__(1024) proposal_rescore_kernel(const std::uint64_t* __restrict__ mid, int rescore,
++                                                                const __nv_bfloat16* __restrict__ hidden,
++                                                                int hidden_ld, const std::uint8_t* __restrict__ q4,
++                                                                const __half* __restrict__ q4_scales,
++                                                                const std::int32_t* __restrict__ row_to_global_ids,
++                                                                std::uint64_t* __restrict__ exact_keys) {
++    __shared__ std::uint64_t a[kMid];
++    const int column = blockIdx.y;
++    for (int i = threadIdx.x; i < kMid; i += blockDim.x) a[i] = mid[static_cast<std::int64_t>(column) * kMid + i];
++    sq::bitonic_desc<kMid>(a);
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, rank = 32 * blockIdx.x + warp;
++    const int row = id_from_order_key(a[rank]);
++    const float acc = row != INT_MAX ? rescore_row(row, hidden + static_cast<std::int64_t>(column) * hidden_ld, q4,
++                                                   q4_scales, lane)
++                                     : 0.0f;
++    if (lane == 0) {
++        exact_keys[static_cast<std::int64_t>(column) * rescore + rank] =
++            row != INT_MAX ? score_id_order_key(acc, row_to_global_ids[row]) : 0;
++    }
++}
++
++// R > 32, stage 2: one CTA per column sorts its R exact keys and writes the top-16.
++template <int R>
++__global__ void __launch_bounds__(256) proposal_top_kernel(const std::uint64_t* __restrict__ exact_keys,
++                                                           std::int32_t* __restrict__ out_ids,
++                                                           float* __restrict__ out_scores) {
++    __shared__ std::uint64_t keys[R];
++    const int column = blockIdx.x;
++    for (int i = threadIdx.x; i < R; i += blockDim.x) keys[i] = exact_keys[static_cast<std::int64_t>(column) * R + i];
++    sq::bitonic_desc<R>(keys);
++    if (threadIdx.x < kTop) {
++        out_ids[column * kTop + threadIdx.x]    = id_from_order_key(keys[threadIdx.x]);
++        out_scores[column * kTop + threadIdx.x] = score_from_order_key(keys[threadIdx.x]);
++    }
++}
++
++// NINFER_PROPOSAL_SCREEN_CHECK=1: the drafts keep the K-split head; the screen writes its top-16 to scratch and
++// check_kernel counts, per column, the exact top-16 ids found among the screen's 16, exact top-1 hits and identical
++// ordered lists, printing the running totals every 4096 calls.
++constexpr int kCheckColumns = 1024;
++__device__ unsigned long long g_check[5];  // calls, columns, ids found (of 16 per column), top-1 hits, identical lists
++
++__global__ void check_kernel(const std::int32_t* __restrict__ exact, const std::int32_t* __restrict__ screen,
++                             int columns, int bits, int rescore) {
++    const int lane = threadIdx.x;
++    for (int c = 0; c < columns; ++c) {
++        bool found = false, same = true;
++        if (lane < kTop) {
++            const int id = exact[c * kTop + lane];
++            for (int j = 0; j < kTop; ++j) found |= screen[c * kTop + j] == id;
++            same = screen[c * kTop + lane] == id;
++        }
++        const int hits = __popc(__ballot_sync(0xffffffffu, found));
++        const bool all = __all_sync(0xffffffffu, same);
++        if (lane == 0) {
++            g_check[2] += hits;
++            g_check[3] += screen[c * kTop] == exact[c * kTop];
++            g_check[4] += all;
++        }
++    }
++    if (lane == 0) {
++        g_check[1] += columns;
++        const unsigned long long calls = ++g_check[0];
++        if (calls % 4096 == 0) {
++            const double n = static_cast<double>(g_check[1]);
++            printf("NINFER_PROPOSAL_SCREEN_CHECK bits %d R %d calls %llu columns %llu recall %.5f top1 %.5f identical "
++                   "%.5f\n", bits, rescore, calls, g_check[1], g_check[2] / (16.0 * n), g_check[3] / n, g_check[4] / n);
++        }
++    }
++}
++
++struct ProposalScreen {
++    int bits = 0, rescore = 32;
++    bool check = false;
++    void *codes = nullptr, *high = nullptr, *scales = nullptr, *keys = nullptr, *mid = nullptr, *exact = nullptr;
++    std::int32_t* check_ids = nullptr;
++    float* check_scores = nullptr;
++};
++
++ProposalScreen& screen_state() {
++    static ProposalScreen s;
++    return s;
++}
++
++int requested_bits() {
++    static const int bits = [] {
++        const char* e = std::getenv("NINFER_PROPOSAL_SCREEN");
++        const int v = e != nullptr ? std::atoi(e) : 0;
++        return v == 2 || v == 3 ? v : 0;
++    }();
++    return bits;
++}
++
++bool screenable(const Weight& head) {
++    return head.qtype == QType::Q4_G64_FP16 && head.layout == QuantLayout::RowSplit &&
++           head.scale_dtype == DType::FP16 && head.group == 64 && head.n == kRows && head.k == sq::kHidden &&
++           head.qhigh == nullptr && head.qdata != nullptr && head.scales != nullptr;
++}
++
++template <class S>
++void run_screen(const ProposalScreen& s, const __nv_bfloat16* x, int ld, int n, cudaStream_t stream) {
++    static const bool configured = [] {
++        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                        S::kSmemBytes));
++        return true;
++    }();
++    (void)configured;
++    sq::screen_kernel<S><<<kCtas, S::kThreads, S::kSmemBytes, stream>>>(
++        x, ld, static_cast<const std::uint8_t*>(s.codes), static_cast<const std::uint8_t*>(s.high),
++        static_cast<const __half*>(s.scales), n, kRows, static_cast<std::uint64_t*>(s.keys));
++}
++
++} // namespace
++
++void proposal_screen_prepare(const Weight& head) {
++    const int bits = requested_bits();
++    ProposalScreen& s = screen_state();
++    if (bits == 0 || s.bits != 0) return;
++    if (!screenable(head)) {
++        std::fprintf(stderr, "NINFER_PROPOSAL_SCREEN: proposal head is not a 131072-row Q4 G64 head; screen off\n");
++        return;
++    }
++    const std::size_t code_bytes  = static_cast<std::size_t>(kRows) * sq::kRowBytes;
++    const std::size_t high_bytes  = bits == 3 ? static_cast<std::size_t>(kRows) * (sq::kHidden / 8) : 16;
++    const std::size_t scale_bytes = static_cast<std::size_t>(kRows) * sq::kGroups * 2;
++    const std::size_t key_bytes   = static_cast<std::size_t>(sq::kMaxColumns) * kCtas * sq::kPerCta * 8;
++    const std::size_t mid_bytes   = static_cast<std::size_t>(sq::kMaxColumns) * kChunks * sq::kCandidates * 8;
++    CUDA_CHECK(cudaMalloc(&s.codes, code_bytes));
++    CUDA_CHECK(cudaMalloc(&s.high, high_bytes));
++    CUDA_CHECK(cudaMalloc(&s.scales, scale_bytes));
++    CUDA_CHECK(cudaMalloc(&s.keys, key_bytes));
++    CUDA_CHECK(cudaMalloc(&s.mid, mid_bytes));
++    CUDA_CHECK(cudaMalloc(&s.exact, static_cast<std::size_t>(sq::kMaxColumns) * 256 * 8));
++    const std::int64_t threads = static_cast<std::int64_t>(kRows) * sq::kGroups;
++    const auto grid = static_cast<unsigned>((threads + 255) / 256);
++    const auto* q4  = static_cast<const std::uint8_t*>(head.qdata);
++    const auto* q4s = static_cast<const __half*>(head.scales);
++    if (bits == 3) {
++        requant_q4_kernel<3><<<grid, 256>>>(q4, q4s, static_cast<std::uint8_t*>(s.codes),
++                                            static_cast<std::uint8_t*>(s.high), static_cast<__half*>(s.scales), kRows);
++    } else {
++        requant_q4_kernel<2><<<grid, 256>>>(q4, q4s, static_cast<std::uint8_t*>(s.codes),
++                                            static_cast<std::uint8_t*>(s.high), static_cast<__half*>(s.scales), kRows);
++    }
++    CUDA_CHECK(cudaGetLastError());
++    CUDA_CHECK(cudaDeviceSynchronize());
++    const char* r = std::getenv("NINFER_PROPOSAL_SCREEN_R");
++    s.rescore = r != nullptr ? std::atoi(r) : 32;
++    if (s.rescore != 64 && s.rescore != 128 && s.rescore != 256) s.rescore = 32;
++    const char* check = std::getenv("NINFER_PROPOSAL_SCREEN_CHECK");
++    s.check = check != nullptr && std::atoi(check) != 0;
++    if (s.check) {
++        CUDA_CHECK(cudaMalloc(&s.check_ids, static_cast<std::size_t>(kCheckColumns) * kTop * 4));
++        CUDA_CHECK(cudaMalloc(&s.check_scores, static_cast<std::size_t>(kCheckColumns) * kTop * 4));
++    }
++    s.bits = bits;
++    std::fprintf(stderr, "NINFER_PROPOSAL_SCREEN: %d-bit screen of the proposal head, %.0f MiB, top-%d rescored%s\n",
++                 bits, static_cast<double>(code_bytes + (bits == 3 ? high_bytes : 0) + scale_bytes) / (1u << 20),
++                 s.rescore, s.check ? " (check only: drafts keep the K-split head)" : "");
++}
++
++bool proposal_screen_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
++                          Tensor& candidate_ids, Tensor& candidate_scores, cudaStream_t stream) {
++    const ProposalScreen& s = screen_state();
++    if (s.bits == 0) return false;
++    const std::int32_t columns = hidden.ne[1];
++    if (!screenable(head) || hidden.dtype != DType::BF16 || hidden.ne[0] != sq::kHidden || hidden.nb[1] % 16 != 0 ||
++        candidate_ids.dtype != DType::I32 || candidate_ids.ne[0] != kTop || candidate_ids.ne[1] != columns ||
++        candidate_scores.dtype != DType::FP32 || candidate_scores.ne[0] != kTop || candidate_scores.ne[1] != columns ||
++        row_to_global_ids.dtype != DType::I32 || row_to_global_ids.ne[0] != kRows) {
++        throw std::invalid_argument("proposal screen: invalid tensors");
++    }
++    if (s.check && columns > kCheckColumns) return false;
++    auto* out_ids    = s.check ? s.check_ids : static_cast<std::int32_t*>(candidate_ids.data);
++    auto* out_scores = s.check ? s.check_scores : static_cast<float*>(candidate_scores.data);
++    const int ld = static_cast<int>(hidden.nb[1] / sizeof(__nv_bfloat16));
++    for (int c0 = 0; c0 < columns; c0 += sq::kMaxColumns) {
++        const int n = std::min(sq::kMaxColumns, columns - c0);
++        const auto* x = static_cast<const __nv_bfloat16*>(hidden.data) + static_cast<std::int64_t>(c0) * ld;
++        if (s.bits == 3) {
++            run_screen<S3>(s, x, ld, n, stream);
++        } else {
++            run_screen<S2>(s, x, ld, n, stream);
++        }
++        sq::merge_chunk_kernel<<<dim3(kChunks, n), 512, 0, stream>>>(static_cast<const std::uint64_t*>(s.keys), kCtas,
++                                                                    static_cast<std::uint64_t*>(s.mid));
++        const auto* q4  = static_cast<const std::uint8_t*>(head.qdata);
++        const auto* q4s = static_cast<const __half*>(head.scales);
++        const auto* map = static_cast<const std::int32_t*>(row_to_global_ids.data);
++        const auto* mid = static_cast<const std::uint64_t*>(s.mid);
++        std::int32_t* ids = out_ids + static_cast<std::int64_t>(c0) * kTop;
++        float* scores     = out_scores + static_cast<std::int64_t>(c0) * kTop;
++        if (s.rescore == 32) {
++            proposal_final_kernel<<<n, 1024, 0, stream>>>(mid, x, ld, q4, q4s, map, ids, scores);
++        } else {
++            auto* exact = static_cast<std::uint64_t*>(s.exact);
++            proposal_rescore_kernel<<<dim3(s.rescore / 32, n), 1024, 0, stream>>>(mid, s.rescore, x, ld, q4, q4s, map,
++                                                                                exact);
++            switch (s.rescore) {
++            case 64: proposal_top_kernel<64><<<n, 256, 0, stream>>>(exact, ids, scores); break;
++            case 128: proposal_top_kernel<128><<<n, 256, 0, stream>>>(exact, ids, scores); break;
++            default: proposal_top_kernel<256><<<n, 256, 0, stream>>>(exact, ids, scores); break;
++            }
++        }
++        CUDA_CHECK(cudaGetLastError());
++    }
++    return !s.check;
++}
++
++void proposal_screen_check(const Tensor& candidate_ids, cudaStream_t stream) {
++    const ProposalScreen& s = screen_state();
++    if (!s.check || candidate_ids.ne[1] > kCheckColumns) return;
++    check_kernel<<<1, 32, 0, stream>>>(static_cast<const std::int32_t*>(candidate_ids.data), s.check_ids,
++                                       candidate_ids.ne[1], s.bits, s.rescore);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++} // namespace ninfer::ops
+diff --git a/src/ops/linear_topk/screen_lowbit.cuh b/src/ops/linear_topk/screen_lowbit.cuh
+index eb7119d..8ba09a0 100644
+--- a/src/ops/linear_topk/screen_lowbit.cuh
++++ b/src/ops/linear_topk/screen_lowbit.cuh
+@@ -253,7 +253,7 @@ __device__ __forceinline__ void bitonic_desc(std::uint64_t* a) {
+ }
+ 
+ // Stage 2: grid (chunks, columns); chunk c holds CTAs [128c, 128c + 128).
+-__global__ void __launch_bounds__(512) merge_chunk_kernel(const std::uint64_t* __restrict__ keys, int ctas,
++static __global__ void __launch_bounds__(512) merge_chunk_kernel(const std::uint64_t* __restrict__ keys, int ctas,
+                                                           std::uint64_t* __restrict__ mid) {
+     __shared__ std::uint64_t a[kChunkCtas * kPerCta];
+     const int chunk = blockIdx.x, column = blockIdx.y, chunks = gridDim.x;
+@@ -266,7 +266,7 @@ __global__ void __launch_bounds__(512) merge_chunk_kernel(const std::uint64_t* _
+ }
+ 
+ // Stage 3: one CTA (32 warps) per column: top-32 of the chunks, exact Q8 rescoring, argmax.
+-__global__ void __launch_bounds__(1024) final_kernel(const std::uint64_t* __restrict__ mid, int chunks,
++static __global__ void __launch_bounds__(1024) final_kernel(const std::uint64_t* __restrict__ mid, int chunks,
+                                                      const __nv_bfloat16* __restrict__ hidden, int hidden_ld,
+                                                      const std::int8_t* __restrict__ q8_codes,
+                                                      const __half* __restrict__ q8_scales,
+diff --git a/src/ops/linear_topk/sources.cmake b/src/ops/linear_topk/sources.cmake
+index a9c1ad3..8947eb6 100644
+--- a/src/ops/linear_topk/sources.cmake
++++ b/src/ops/linear_topk/sources.cmake
+@@ -9,4 +9,5 @@ target_sources(ninfer_ops PRIVATE
+   "${CMAKE_CURRENT_LIST_DIR}/merge.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/two_level_head.cu"
+   "${CMAKE_CURRENT_LIST_DIR}/screen_head.cu"
++  "${CMAKE_CURRENT_LIST_DIR}/proposal_screen.cu"
+ )
+-- 
+2.34.1
+

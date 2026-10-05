@@ -1,0 +1,107 @@
+From 01739980c5af417cb3c86af2fac0162dc8191e50 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 39/49] research29d: strided K-slice fills
+ (NINFER_L2_FILL_STRIDED, measured -1%, off)
+
+---
+ include/ninfer/ops/l2_fill.h |  6 ++++--
+ src/ops/common/l2_fill.cuh   | 11 ++++++++---
+ src/ops/linear/l2_fill.cpp   | 33 +++++++++++++++++++++++++++++++++
+ 3 files changed, 45 insertions(+), 5 deletions(-)
+
+diff --git a/include/ninfer/ops/l2_fill.h b/include/ninfer/ops/l2_fill.h
+index 5a9c88d..d748af9 100644
+--- a/include/ninfer/ops/l2_fill.h
++++ b/include/ninfer/ops/l2_fill.h
+@@ -15,8 +15,10 @@
+ namespace ninfer::ops {
+ 
+ struct L2FillRange {
+-    const void* base    = nullptr; // 128-byte aligned
+-    std::uint32_t lines = 0;       // 128-byte lines from base
++    const void* base         = nullptr; // 128-byte aligned
++    std::uint32_t lines      = 0;       // 128-byte lines in the range
++    std::uint32_t run_lines  = 0;       // research29d: 0 = contiguous from base; else runs of run_lines
++    std::uint32_t run_stride = 0;       // lines starting every run_stride lines from base
+ };
+ 
+ struct L2Fill {
+diff --git a/src/ops/common/l2_fill.cuh b/src/ops/common/l2_fill.cuh
+index 362320b..4e33986 100644
+--- a/src/ops/common/l2_fill.cuh
++++ b/src/ops/common/l2_fill.cuh
+@@ -9,6 +9,11 @@
+ 
+ namespace ninfer::ops::detail {
+ 
++__device__ __forceinline__ const char* l2_fill_line(const L2FillRange& range, std::uint32_t i) {
++    if (range.run_lines != 0) { i = (i / range.run_lines) * range.run_stride + i % range.run_lines; }
++    return static_cast<const char*>(range.base) + static_cast<std::size_t>(i) * 128;
++}
++
+ // Up to L line loads per thread: thread t of T takes lines t, t + T, ... of the fill's ranges in order.
+ template <int L>
+ struct L2FillLoads {
+@@ -21,11 +26,11 @@ struct L2FillLoads {
+             std::uint32_t i = t + static_cast<std::uint32_t>(j) * threads;
+             const char* p   = nullptr;
+             if (i < fill.range[0].lines) {
+-                p = static_cast<const char*>(fill.range[0].base) + static_cast<std::size_t>(i) * 128;
++                p = l2_fill_line(fill.range[0], i);
+             } else if ((i -= fill.range[0].lines) < fill.range[1].lines) {
+-                p = static_cast<const char*>(fill.range[1].base) + static_cast<std::size_t>(i) * 128;
++                p = l2_fill_line(fill.range[1], i);
+             } else if ((i -= fill.range[1].lines) < fill.range[2].lines) {
+-                p = static_cast<const char*>(fill.range[2].base) + static_cast<std::size_t>(i) * 128;
++                p = l2_fill_line(fill.range[2], i);
+             }
+             if (p != nullptr) { asm volatile("ld.global.cg.L2::128B.u32 %0, [%1];" : "=r"(v[j]) : "l"(p)); }
+         }
+diff --git a/src/ops/linear/l2_fill.cpp b/src/ops/linear/l2_fill.cpp
+index 234831d..ff91978 100644
+--- a/src/ops/linear/l2_fill.cpp
++++ b/src/ops/linear/l2_fill.cpp
+@@ -75,6 +75,39 @@ L2Fill l2_fill_for_weight(const Weight& w, std::uint64_t skip_bytes, std::uint64
+         }
+         row_bytes += planes[i].row_bytes;
+     }
++    // research29d (NINFER_L2_FILL_STRIDED=1): the K slice [f0, f1) of every row of each line-sized row-split plane.
++    static const bool strided = [] {
++        const char* e = std::getenv("NINFER_L2_FILL_STRIDED");
++        const bool on = e != nullptr && std::atoi(e) == 1;
++        if (on) { std::fprintf(stderr, "NINFER_L2_FILL_STRIDED=1: K-prefix fills of every row\n"); }
++        return on;
++    }();
++    if (strided) {
++        const double total = static_cast<double>(row_bytes) * static_cast<double>(rows);
++        const double f0    = std::min(1.0, static_cast<double>(skip_bytes) / total);
++        const double f1    = std::min(1.0, static_cast<double>(skip_bytes + bytes) / total);
++        if (f1 <= f0) { return fill; }
++        for (int i = 0; i < count; ++i) {
++            const std::uint64_t plane_bytes = planes[i].row_bytes * static_cast<std::uint64_t>(rows);
++            const bool row_runs             = w.q3_tile == 0 && planes[i].row_bytes % 128 == 0;
++            if (row_runs) {
++                const std::uint64_t row_lines = planes[i].row_bytes / 128;
++                const auto l0 = static_cast<std::uint64_t>(f0 * static_cast<double>(row_lines) + 0.5);
++                const auto l1 = static_cast<std::uint64_t>(f1 * static_cast<double>(row_lines) + 0.5);
++                if (l1 <= l0) { continue; }
++                fill.range[i] = {static_cast<const char*>(planes[i].base) + l0 * 128,
++                                 static_cast<std::uint32_t>((l1 - l0) * static_cast<std::uint64_t>(rows)),
++                                 static_cast<std::uint32_t>(l1 - l0), static_cast<std::uint32_t>(row_lines)};
++            } else {
++                const auto first = static_cast<std::uint64_t>(f0 * static_cast<double>(plane_bytes)) / 128;
++                const auto last  = (static_cast<std::uint64_t>(f1 * static_cast<double>(plane_bytes)) + 127) / 128;
++                if (last <= first) { continue; }
++                fill.range[i] = {static_cast<const char*>(planes[i].base) + first * 128,
++                                 static_cast<std::uint32_t>(last - first)};
++            }
++        }
++        return fill;
++    }
+     const std::uint64_t r0 = std::min<std::uint64_t>(skip_bytes / row_bytes, rows);
+     const std::uint64_t r1 = std::min<std::uint64_t>((skip_bytes + bytes) / row_bytes, rows);
+     if (r1 <= r0) { return fill; }
+-- 
+2.34.1
+

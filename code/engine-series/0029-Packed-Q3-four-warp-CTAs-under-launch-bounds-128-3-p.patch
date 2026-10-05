@@ -1,0 +1,116 @@
+From bfe9a75c6e8c4bfa0d4ef17b4a6de72e5043eb9f Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sun, 4 Oct 2026 18:40:12 +0800
+Subject: [PATCH 29/49] Packed Q3 four-warp CTAs under launch bounds (128, 3);
+ packed down R5 G8 S3 (research20b)
+
+---
+ src/core/weight.h                           |  2 +-
+ src/models/qwen3_5/execution/parameters.cpp |  2 +-
+ src/ops/linear/ada_small_t_mma.cuh          | 24 +++++++++++++++++++++
+ src/ops/linear_add/q4/q4_linear_add.cu      |  7 +++---
+ 4 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/weight.h b/src/core/weight.h
+index 1bcb3a4..0b36c88 100644
+--- a/src/core/weight.h
++++ b/src/core/weight.h
+@@ -55,7 +55,7 @@ struct Weight {
+     const void* q3_high        = nullptr;
+     bool q3_odd                = false; // the planes hold odd codes 2c + 1 (half grid), u = (d + 7) / 2
+     // Research (NINFER_Q3_TILED): 0 row-major Q3 planes; 1 / 2 q3_low holds stage-packed tiles
+-    // [low | high | LS8 bytes] of the gate/up (R4 G8, paired halves) / down (R5 G16) route, q3_high is null.
++    // [low | high | LS8 bytes] of the gate/up (R4 G8, paired halves) / down (R5 G8) route, q3_high is null.
+     int q3_tile                = 0;
+     float input_scale_divisor  = 0.0F;
+ };
+diff --git a/src/models/qwen3_5/execution/parameters.cpp b/src/models/qwen3_5/execution/parameters.cpp
+index 86950b4..99f2390 100644
+--- a/src/models/qwen3_5/execution/parameters.cpp
++++ b/src/models/qwen3_5/execution/parameters.cpp
+@@ -486,7 +486,7 @@ Parameters::Parameters(const Model& source) : model(source) {
+                         pack(dense->gate_up.weight, 1, 32, 8, 17408);
+                     }
+                     if (dense->down.weight.n == 5120 && dense->down.weight.k == 17408) {
+-                        pack(dense->down.weight, 2, 40, 16, 0);
++                        pack(dense->down.weight, 2, 40, 8, 0);
+                     }
+                 }
+             }
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index bd095e3..65342f7 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -61,6 +61,8 @@ struct AdaSmallTSchedule {
+     // Research (NINFER_Q3_TILED): `codes` holds stage-packed tiles [low | high | LS8 bytes] (q3_pack_tiles); the
+     // high and scale pointers are unused and super must be set.
+     static constexpr bool kPacked            = Packed;
++    // Packed four-warp Q3 CTAs need three per SM (<= 168 registers): 76.6 us vs 80.6+ at two (bench_diag2.cu).
++    static constexpr int kMinBlocks          = (Packed && Warps == 4) ? 3 : 1;
+     static constexpr int kLowTileBytes       = 8 * RowTiles * kLowBytes * GroupsPerStage;
+     static constexpr int kHighTileBytes      = (Format != AdaWeightFormat::Q4) ? 8 * RowTiles * 8 * GroupsPerStage : 0;
+     static constexpr int kTileBytes          = kLowTileBytes + kHighTileBytes + 8 * RowTiles * GroupsPerStage;
+@@ -462,6 +464,16 @@ __launch_bounds__(S::kThreads) __global__ void ada_small_t_mma_kernel(
+                                       static_cast<int>(blockIdx.x), super);
+ }
+ 
++// The same CTA under __launch_bounds__(threads, S::kMinBlocks) (packed Q3 schedules; see kMinBlocks).
++template <class S, int K, class RowMap, class Epilogue>
++__launch_bounds__(S::kThreads, S::kMinBlocks) __global__ void ada_small_t_mma_min_blocks_kernel(
++    const __nv_bfloat16* __restrict__ x, std::int32_t x_ld, const std::uint8_t* __restrict__ codes,
++    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
++    std::int32_t tokens, Epilogue epilogue, const float* __restrict__ super) {
++    ada_small_t_mma_cta<S, K, RowMap>(x, x_ld, codes, high, scales, tokens, epilogue,
++                                      static_cast<int>(blockIdx.x), super);
++}
++
+ // One weight matrix of a dual launch.
+ template <class Epilogue>
+ struct AdaSmallTOperand {
+@@ -497,6 +509,18 @@ void ada_small_t_mma_launch(const __nv_bfloat16* x, std::int32_t x_ld, const std
+                             const std::uint8_t* high, const std::uint8_t* scales, std::int32_t rows,
+                             std::int32_t tokens, Epilogue epilogue, cudaStream_t stream,
+                             const float* super = nullptr) {
++    if constexpr (S::kMinBlocks > 1) {
++        static const bool configured_min_blocks = [] {
++            CUDA_CHECK(cudaFuncSetAttribute(ada_small_t_mma_min_blocks_kernel<S, K, RowMap, Epilogue>,
++                                            cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSmemBytes));
++            return true;
++        }();
++        (void)configured_min_blocks;
++        ada_small_t_mma_min_blocks_kernel<S, K, RowMap, Epilogue>
++            <<<rows / S::kRowsPerCta, S::kThreads, S::kSmemBytes, stream>>>(x, x_ld, codes, high, scales, tokens,
++                                                                            epilogue, super);
++        return;
++    }
+     static const bool configured = [] {
+         CUDA_CHECK(cudaFuncSetAttribute(ada_small_t_mma_kernel<S, K, RowMap, Epilogue>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+diff --git a/src/ops/linear_add/q4/q4_linear_add.cu b/src/ops/linear_add/q4/q4_linear_add.cu
+index 746e9a0..a7fb4aa 100644
+--- a/src/ops/linear_add/q4/q4_linear_add.cu
++++ b/src/ops/linear_add/q4/q4_linear_add.cu
+@@ -112,16 +112,17 @@ void launch_ada(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t
+         // Q3 shadow planes (NINFER_Q3_SHADOW): 16 groups per stage, 42.1 us at K = 17408, T = 16
+         // against 50.1 us for the Q4 codes (kernels/q3/bench_q3_sweep.cu); the same bits.
+         constexpr int kG = K == 17408 ? 16 : 8;
+-        // NINFER_Q3_TILED: the planes are packed per (40-row CTA, 16-group stage) tile; same bits.
++        // NINFER_Q3_TILED: the planes are packed per (40-row CTA, 8-group stage) tile, three stages (40.9 vs
++        // 42.0 us for G16 S2 packed); warp w still sums the groups w mod 8 in order, so the bits are unchanged.
+         if (w.q3_tile != 0) {
+             if (K != 17408 || w.q3_tile != 2 || ada_super(w) == nullptr) {
+                 throw std::invalid_argument("q4 linear_add ada small-T: Q3 tiles packed for another route");
+             }
+             if (w.q3_odd) {
+-                launch_ada_q3<AdaSmallTSchedule<AdaWeightFormat::Q3Odd, 5, 8, TokenTiles, kG, 2, true, true>, K>(
++                launch_ada_q3<AdaSmallTSchedule<AdaWeightFormat::Q3Odd, 5, 8, TokenTiles, 8, 3, true, true>, K>(
+                     x, w, epilogue, stream);
+             } else {
+-                launch_ada_q3<AdaSmallTSchedule<AdaWeightFormat::Q3, 5, 8, TokenTiles, kG, 2, true, true>, K>(
++                launch_ada_q3<AdaSmallTSchedule<AdaWeightFormat::Q3, 5, 8, TokenTiles, 8, 3, true, true>, K>(
+                     x, w, epilogue, stream);
+             }
+             return;
+-- 
+2.34.1
+

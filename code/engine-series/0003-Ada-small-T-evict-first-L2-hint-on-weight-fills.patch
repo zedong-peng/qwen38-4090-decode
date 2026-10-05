@@ -1,0 +1,86 @@
+From e4191a7e57957873755fa28ecb383c8f4f2b1afa Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 00:42:33 +0800
+Subject: [PATCH 03/49] Ada small-T: evict-first L2 hint on weight fills
+
+Every weight byte is read once per call; evict-first fills keep activations and records resident
+(upstream does the same on its Blackwell routes; its CUDA 13.1 ptxas guard does not apply to the
+12.8 build used here, and the hinted fill is bit-exact in kernels/bench_tail.cu).
+Tree K15 K8V4: json 311 -> 315, code 375 -> 380, sustained 262 -> 265 tok/s, outputs identical.
+---
+ src/ops/linear/ada_small_t_mma.cuh | 29 ++++++++++++++++++++++-------
+ 1 file changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/src/ops/linear/ada_small_t_mma.cuh b/src/ops/linear/ada_small_t_mma.cuh
+index 1ac532d..4418742 100644
+--- a/src/ops/linear/ada_small_t_mma.cuh
++++ b/src/ops/linear/ada_small_t_mma.cuh
+@@ -31,9 +31,11 @@ namespace ninfer::ops::detail {
+ enum class AdaWeightFormat { Q4, Q5 };
+ 
+ template <AdaWeightFormat Format, int RowTiles, int Warps, int TokenTiles, int GroupsPerStage,
+-          int Stages>
++          int Stages, bool EvictFirst = true>
+ struct AdaSmallTSchedule {
+     static constexpr AdaWeightFormat kFormat = Format;
++    // Weight fills carry an L2 evict-first hint: each weight byte is read once per call.
++    static constexpr bool kEvictFirst        = EvictFirst;
+     static constexpr bool kHasHigh           = Format == AdaWeightFormat::Q5;
+     static constexpr int kRowTiles           = RowTiles;
+     static constexpr int kWarps              = Warps;
+@@ -133,6 +135,19 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+     const int q        = lane & 3;
+     const int group_id = lane >> 2;
+ 
++    unsigned long long weight_policy = 0;
++    if constexpr (S::kEvictFirst) {
++        asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(weight_policy));
++    }
++    const auto fill16 = [&](void* dst, const void* src) {
++        if constexpr (S::kEvictFirst) {
++            asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
++                         :
++                         : "r"(smem_addr(dst)), "l"(src), "l"(weight_policy));
++        } else {
++            cp_async<16, Cache::cg>(dst, src);
++        }
++    };
+     const auto issue = [&](int stage) {
+         std::uint8_t* code_dst  = smem + (stage % S::kStages) * S::kStageBytes;
+         std::uint8_t* high_dst  = code_dst + S::kCodeBytes;
+@@ -144,8 +159,8 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+             const int row = i / kCodeChunks;
+             const int c   = i % kCodeChunks;
+             const std::int64_t src_row = RowMap::weight_row(block, row, kRows);
+-            cp_async<16, Cache::cg>(code_dst + row * S::kCodeStride + 16 * c,
+-                                    codes + (src_row * kGroups + g0) * 32 + 16 * c);
++            fill16(code_dst + row * S::kCodeStride + 16 * c,
++                   codes + (src_row * kGroups + g0) * 32 + 16 * c);
+         }
+         if constexpr (S::kHasHigh) {
+             constexpr int kHighChunks = S::kG / 2;
+@@ -153,8 +168,8 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+                 const int row = i / kHighChunks;
+                 const int c   = i % kHighChunks;
+                 const std::int64_t src_row = RowMap::weight_row(block, row, kRows);
+-                cp_async<16, Cache::cg>(high_dst + row * S::kHighStride + 16 * c,
+-                                        high + (src_row * kGroups + g0) * 8 + 16 * c);
++                fill16(high_dst + row * S::kHighStride + 16 * c,
++                       high + (src_row * kGroups + g0) * 8 + 16 * c);
+             }
+         }
+         if constexpr (S::kG == 4) {
+@@ -169,8 +184,8 @@ __device__ __forceinline__ void ada_small_t_mma_cta(
+                 const int row = i / kScaleChunks;
+                 const int c   = i % kScaleChunks;
+                 const std::int64_t src_row = RowMap::weight_row(block, row, kRows);
+-                cp_async<16, Cache::cg>(scale_dst + row * S::kScaleStride + 16 * c,
+-                                        scales + (src_row * kGroups + g0) * 2 + 16 * c);
++                fill16(scale_dst + row * S::kScaleStride + 16 * c,
++                       scales + (src_row * kGroups + g0) * 2 + 16 * c);
+             }
+         }
+     };
+-- 
+2.34.1
+

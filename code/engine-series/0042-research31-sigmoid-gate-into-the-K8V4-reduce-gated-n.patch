@@ -1,0 +1,431 @@
+From c98a735010c76df56b08ad621f03b553f972e956 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Mon, 5 Oct 2026 21:42:19 +0800
+Subject: [PATCH 42/49] research31: sigmoid gate into the K8V4 reduce, gated
+ norm into the record's last CTA (NINFER_FUSED_ATTN_GATE /
+ NINFER_FUSED_GATED_NORM, bit-exact, slower, off)
+
+---
+ include/ninfer/ops/fused_tail.h               | 31 ++++++++++
+ src/models/qwen3_5/execution/text.cpp         | 35 +++++++++--
+ src/ops/linear/l2_fill.cpp                    | 57 ++++++++++++++++++
+ .../gated_delta_net/recurrent.cu              | 25 ++++++++
+ .../gated_delta_net/recurrent.cuh             | 60 +++++++++++++++++++
+ .../dense/causal_cache/small_t_k8v4.cu        |  5 +-
+ .../dense/causal_cache/small_t_k8v4.cuh       | 20 +++++--
+ 7 files changed, 222 insertions(+), 11 deletions(-)
+ create mode 100644 include/ninfer/ops/fused_tail.h
+
+diff --git a/include/ninfer/ops/fused_tail.h b/include/ninfer/ops/fused_tail.h
+new file mode 100644
+index 0000000..5c694fb
+--- /dev/null
++++ b/include/ninfer/ops/fused_tail.h
+@@ -0,0 +1,31 @@
++#pragma once
++
++// ninfer::ops - research31: verify-path ops folded into the kernel that produces their input. The model defers an
++// op, the launcher that can apply it claims it, and the model runs the separate kernel only when nothing claimed it.
++
++#include <cstdint>
++
++namespace ninfer::ops {
++
++// NINFER_FUSED_ATTN_GATE=1: the K8V4 reduce applies the attention output's sigmoid gate (sigmoid_mul).
++bool fused_attn_gate_enabled();
++void attn_gate_defer(const void* gate);
++// The reduce launch: the pending gate (nullptr if none), now marked applied.
++const void* attn_gate_claim();
++// After the attention call: true when a launcher applied the gate. Clears the pending state.
++bool attn_gate_finish();
++
++// NINFER_FUSED_GATED_NORM=1: the chunked GDN record applies gated_rmsnorm(o, weight, z, eps) -> out.
++struct GatedNormFuse {
++    const void* weight = nullptr;
++    const void* z      = nullptr;
++    void* out          = nullptr;
++    float eps          = 0.0F;
++    std::int32_t d     = 0;
++};
++bool fused_gated_norm_enabled();
++void gated_norm_defer(const GatedNormFuse& fuse);
++bool gated_norm_claim(GatedNormFuse& fuse);
++bool gated_norm_finish();
++
++} // namespace ninfer::ops
+diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
+index e943d16..545efba 100644
+--- a/src/models/qwen3_5/execution/text.cpp
++++ b/src/models/qwen3_5/execution/text.cpp
+@@ -29,6 +29,7 @@
+ #include "ninfer/ops/gdn_gating_proj.h"
+ #include "ninfer/ops/gdn_input_proj.h"
+ #include "ninfer/ops/l2_fill.h"
++#include "ninfer/ops/fused_tail.h"
+ #include "ninfer/ops/linear.h"
+ #include "ninfer/ops/kv_cache_append.h"
+ #include "ninfer/ops/speculative_round.h"
+@@ -1041,6 +1042,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+                                         active_sequence_batch_});
+         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
+         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
++        // research31 (NINFER_FUSED_ATTN_GATE): the K8V4 reduce applies the sigmoid gate below.
++        if (ops::fused_attn_gate_enabled() && ph == Phase::Verify && !attn_overlap) {
++            ops::attn_gate_defer(gate.data);
++        }
+         // research29c (NINFER_L2_FILL bit 64): the wide verify attention warms the output projection.
+         if ((ops::l2_fill_mask() & 64) && ph == Phase::Verify && !attn_overlap) {
+             ops::l2_fill_set(ops::l2_fill_for_weight(p.output.weight, 0, ops::l2_fill_bytes("ATTN", 8u << 20)));
+@@ -1069,7 +1074,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
+         CUDA_CHECK(cudaEventRecord(ctx_.concurrent.events[kAttnAttentionReady], as));
+         CUDA_CHECK(cudaStreamWaitEvent(s, ctx_.concurrent.events[kAttnAttentionReady], 0));
+     }
+-    ops::sigmoid_mul(gate, a, s);
++    if (!ops::attn_gate_finish()) { ops::sigmoid_mul(gate, a, s); }
+ 
+     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
+                     p.output.policy, work_, s);
+@@ -1206,6 +1211,14 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+     Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
+                    .view({dimension(config_.gdn->linear_value_head_dim),
+                           dimension(config_.gdn->linear_num_value_heads), T});
++    // research31: on the verify path the normalized output is allocated right after o (nothing else is allocated
++    // in between there), so a deferred gated norm knows its destination.
++    Tensor on_verify;
++    if (ph == Phase::Verify) {
++        on_verify = workspace::gdn_normalized_output(work_, config_, T)
++                        .view({dimension(config_.gdn->linear_value_head_dim),
++                               dimension(config_.gdn->linear_num_value_heads), T});
++    }
+     if (ph == Phase::Verify) {
+         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
+         const std::int32_t width = active_sequence_width_;
+@@ -1236,6 +1249,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+             // The overlapped route queues the recurrence on the concurrent stream beside z.
+             const cudaStream_t record_stream =
+                 overlapped || overlap_q4 > 0 ? ctx_.concurrent.stream : s;
++            // research31 (NINFER_FUSED_GATED_NORM): the chunked record applies the gated norm.
++            if (ops::fused_gated_norm_enabled() && !overlapped && overlap_q4 == 0) {
++                ops::GatedNormFuse fuse;
++                fuse.weight = p.norm.data;
++                fuse.z      = z.data;
++                fuse.out    = on_verify.data;
++                fuse.eps    = config_.rms_norm_eps;
++                fuse.d      = dimension(config_.gdn->linear_value_head_dim);
++                ops::gated_norm_defer(fuse);
++            }
+             // research29 (NINFER_L2_FILL bit 1): the record warms the output projection's next rows.
+             l2_out_fill(1, "RECORD", 4u << 20);
+             ops::gated_delta_net_replay_record(
+@@ -1269,14 +1292,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
+             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
+     }
+ 
+-    Tensor on = workspace::gdn_normalized_output(work_, config_, T)
+-                    .view({dimension(config_.gdn->linear_value_head_dim),
+-                           dimension(config_.gdn->linear_num_value_heads), T});
++    Tensor on = on_verify.data != nullptr
++                    ? on_verify
++                    : workspace::gdn_normalized_output(work_, config_, T)
++                          .view({dimension(config_.gdn->linear_value_head_dim),
++                                 dimension(config_.gdn->linear_num_value_heads), T});
+     // The overlapped route ran the recurrence on the concurrent stream.
+     if (overlapped || overlap_q4 > 0) { gdn_join_concurrent(ctx_, kGdnRecurrenceReady, s); }
+     (void)ops::l2_fill_take();
+     l2_out_fill(8, "GATED", 1u << 20);
+-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
++    if (!ops::gated_norm_finish()) { ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s); }
+     (void)ops::l2_fill_take();
+ 
+     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
+diff --git a/src/ops/linear/l2_fill.cpp b/src/ops/linear/l2_fill.cpp
+index ff91978..f5826ff 100644
+--- a/src/ops/linear/l2_fill.cpp
++++ b/src/ops/linear/l2_fill.cpp
+@@ -1,5 +1,6 @@
+ // research29 (NINFER_L2_FILL): host side of ninfer/ops/l2_fill.h.
+ #include "ninfer/ops/l2_fill.h"
++#include "ninfer/ops/fused_tail.h"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -129,3 +130,59 @@ L2Fill l2_fill_take() {
+ }
+ 
+ } // namespace ninfer::ops
++
++// research31: verify-path fusion hand-offs (include/ninfer/ops/fused_tail.h).
++namespace ninfer::ops {
++namespace {
++bool env_flag(const char* name) {
++    const char* e = std::getenv(name);
++    const bool on = e != nullptr && std::atoi(e) == 1;
++    if (on) { std::fprintf(stderr, "%s=1\n", name); }
++    return on;
++}
++struct AttnGateState {
++    const void* gate = nullptr;
++    bool claimed     = false;
++};
++thread_local AttnGateState attn_gate_state;
++struct GatedNormState {
++    GatedNormFuse fuse;
++    bool set     = false;
++    bool claimed = false;
++};
++thread_local GatedNormState gated_norm_state;
++} // namespace
++
++bool fused_attn_gate_enabled() {
++    static const bool on = env_flag("NINFER_FUSED_ATTN_GATE");
++    return on;
++}
++void attn_gate_defer(const void* gate) { attn_gate_state = AttnGateState{gate, false}; }
++const void* attn_gate_claim() {
++    if (attn_gate_state.gate == nullptr || attn_gate_state.claimed) { return nullptr; }
++    attn_gate_state.claimed = true;
++    return attn_gate_state.gate;
++}
++bool attn_gate_finish() {
++    const bool applied = attn_gate_state.gate != nullptr && attn_gate_state.claimed;
++    attn_gate_state    = AttnGateState{};
++    return applied;
++}
++
++bool fused_gated_norm_enabled() {
++    static const bool on = env_flag("NINFER_FUSED_GATED_NORM");
++    return on;
++}
++void gated_norm_defer(const GatedNormFuse& fuse) { gated_norm_state = GatedNormState{fuse, true, false}; }
++bool gated_norm_claim(GatedNormFuse& fuse) {
++    if (!gated_norm_state.set || gated_norm_state.claimed) { return false; }
++    gated_norm_state.claimed = true;
++    fuse                     = gated_norm_state.fuse;
++    return true;
++}
++bool gated_norm_finish() {
++    const bool applied = gated_norm_state.set && gated_norm_state.claimed;
++    gated_norm_state   = GatedNormState{};
++    return applied;
++}
++} // namespace ninfer::ops
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cu b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+index 020a641..c5e869e 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cu
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cu
+@@ -7,6 +7,7 @@
+ #include "core/device.h"
+ #include "ops/linear_attention/gated_delta_net/recurrent.cuh"
+ #include "ops/gdn_input_proj/gdn_projected_conv.h"
++#include "ninfer/ops/fused_tail.h"
+ 
+ #include <cuda_bf16.h>
+ 
+@@ -17,6 +18,12 @@
+ namespace ninfer::ops::detail::gated_delta_net {
+ namespace {
+ 
++// research31 (NINFER_FUSED_GATED_NORM): arrival counters of the chunked record's fused gated norm, one per
++// (sequence, value head); every launch's last CTA per head resets its counter.
++constexpr int kNormCounterBatches = 64;
++constexpr int kNormCounterHeads   = 64;
++__device__ int g_gdn_norm_counters[kNormCounterBatches * kNormCounterHeads];
++
+ static_assert(sizeof(GdnReplayFoldKernelRow) == 16);
+ static_assert(alignof(GdnReplayFoldKernelRow) == 16);
+ static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
+@@ -111,6 +118,24 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
+     // Research flag NINFER_GDN_CHUNKED_RECORD=1: the chunked (WY-form) record, read at each launch.
+     const char* chunked_flag = std::getenv("NINFER_GDN_CHUNKED_RECORD");
+     const bool chunked       = chunked_flag != nullptr && chunked_flag[0] == '1';
++    // research31 (NINFER_FUSED_GATED_NORM): only the chunked route applies a deferred gated norm.
++    if (chunked && q.ne[2] <= kStagedRecordMaxWidth && v.ne[1] <= kNormCounterHeads &&
++        q.ne[3] <= kNormCounterBatches && v.ne[0] == 128) {
++        ops::GatedNormFuse norm;
++        if (ops::gated_norm_claim(norm)) {
++            static int* counters = [] {
++                void* p = nullptr;
++                CUDA_CHECK(cudaGetSymbolAddress(&p, g_gdn_norm_counters));
++                return static_cast<int*>(p);
++            }();
++            access.norm_weight   = static_cast<const __nv_bfloat16*>(norm.weight);
++            access.norm_z        = static_cast<const __nv_bfloat16*>(norm.z);
++            access.norm_out      = static_cast<__nv_bfloat16*>(norm.out);
++            access.norm_eps      = norm.eps;
++            access.norm_d        = norm.d;
++            access.norm_counters = counters;
++        }
++    }
+     // research30 (NINFER_FUSED_CONV_RECORD=1): a convolution deferred by compose_record. The chunked route fuses it;
+     // any other route (or a mismatch) launches it first, as before.
+     ops::detail::PendingRecordConv conv = ops::detail::take_pending_record_conv();
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index 9a898c6..c562200 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -8,6 +8,7 @@
+ #include "ops/common/mma.cuh"
+ #include "ops/common/l2_fill.cuh"
+ #include "ops/gdn_input_proj/gdn_conv.cuh"
++#include "ops/kernel/rmsnorm.cuh"
+ #include "ops/linear_attention/gated_delta_net/launch.h"
+ 
+ #include <cuda_bf16.h>
+@@ -390,6 +391,14 @@ struct RecordAccess {
+     std::int32_t conv_channels         = 0;
+     std::int32_t conv_key_offset       = 0;
+     std::int32_t conv_value_offset     = 0;
++    // research31 (NINFER_FUSED_GATED_NORM): gated_rmsnorm(out, norm_weight, norm_z) -> norm_out by the last
++    // value-tile CTA of each (sequence, value head); norm_counters[batch * H_v + head] start and end at zero.
++    const __nv_bfloat16* norm_weight = nullptr;
++    const __nv_bfloat16* norm_z      = nullptr;
++    __nv_bfloat16* norm_out          = nullptr;
++    float norm_eps                   = 0.0F;
++    std::int32_t norm_d              = 0;
++    int* norm_counters               = nullptr;
+ 
+     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
+         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+@@ -1381,6 +1390,57 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+         access.output_ptr(coord, i)[tile_dv + row] = __float2bfloat16(acc * access.scale);
+     }
+     zero_output_suffix(access, coord, valid, access.width);
++    if (access.norm_out != nullptr) {
++        // research31: the last value tile of this head normalizes its columns as rmsnorm_warp_bf16x2_kernel
++        // <Gated> does (one warp per column; lane l holds pairs l and l + 32).
++        __shared__ int norm_last;
++        __threadfence();
++        __syncthreads();
++        int* counter = access.norm_counters + static_cast<std::int64_t>(coord.batch) * access.heads.H_v +
++                       coord.value_head;
++        if (thread == 0) { norm_last = atomicAdd(counter, 1) == kStateDim / kBlockDv - 1; }
++        __syncthreads();
++        if (norm_last) {
++            __threadfence();
++            const int pairs = access.norm_d / 2;
++            const auto* x2  = reinterpret_cast<const __nv_bfloat162*>(access.out);
++            const auto* w2  = reinterpret_cast<const __nv_bfloat162*>(access.norm_weight);
++            const auto* z2  = reinterpret_cast<const __nv_bfloat162*>(access.norm_z);
++            auto* o2        = reinterpret_cast<__nv_bfloat162*>(access.norm_out);
++            for (int column = coord.warp; column < access.width; column += kNumWarps) {
++                const std::int64_t row_base =
++                    (access.column(coord, column) * access.heads.H_v + coord.value_head) * pairs;
++                __nv_bfloat162 values[4], weights[4], gates[4];
++                float sum = 0.0f;
++#pragma unroll
++                for (int k = 0; k < 4; ++k) {
++                    const int pair = coord.lane + k * kWarpSize;
++                    if (pair < pairs) {
++                        values[k]  = __ldcg(x2 + row_base + pair);
++                        weights[k] = w2[pair];
++                        gates[k]   = z2[row_base + pair];
++                        sum = __fadd_rn(sum, ops::rmsnorm_pair_square_sum(__bfloat1622float2(values[k])));
++                    }
++                }
++                sum       = ops::warp_reduce_sum(sum);
++                float inv = coord.lane == 0 ? rsqrtf(sum / static_cast<float>(access.norm_d) + access.norm_eps) : 0.0f;
++                inv       = __shfl_sync(kFullWarpMask, inv, 0);
++#pragma unroll
++                for (int k = 0; k < 4; ++k) {
++                    const int pair = coord.lane + k * kWarpSize;
++                    if (pair < pairs) {
++                        const float2 xf = __bfloat1622float2(values[k]);
++                        const float2 wf = __bfloat1622float2(weights[k]);
++                        const float2 zf = __bfloat1622float2(gates[k]);
++                        o2[row_base + pair] = __floats2bfloat162_rn(
++                            ops::rmsnorm_epilogue<ops::RmsEpilogue::Gated>(xf.x, inv, wf.x, zf.x),
++                            ops::rmsnorm_epilogue<ops::RmsEpilogue::Gated>(xf.y, inv, wf.y, zf.y));
++                    }
++                }
++            }
++            if (thread == 0) { *counter = 0; }
++        }
++    }
+     l2_fill.consume(access.fill, next_state_word);
+ }
+ 
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+index 061cd77..c200664 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+@@ -9,6 +9,7 @@
+ #include "ops/common/math.h"
+ #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
+ #include "ninfer/ops/l2_fill.h"
++#include "ninfer/ops/fused_tail.h"
+ 
+ #include <cstdint>
+ #include <stdexcept>
+@@ -116,6 +117,8 @@ void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& i
+                         const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+     constexpr int Block = 256;
+     const dim3 grid(Geometry::QHeads, invocation.width * invocation.batch_size);
++    // research31 (NINFER_FUSED_ATTN_GATE): the attention output's sigmoid gate, when the model deferred it.
++    const auto* gate = static_cast<const __nv_bfloat16*>(ops::attn_gate_claim());
+     const auto launch = [&]<bool Offset>() {
+         causal_attention_small_t_k8v4_reduce_output_kernel<Geometry, MultiBatch, Masked, Offset>
+             <<<grid, Block, 0, stream>>>(
+@@ -127,7 +130,7 @@ void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& i
+                     ? nullptr
+                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                 invocation.width, invocation.full_width, invocation.column_begin,
+-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
++                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data), gate);
+     };
+     if (invocation.column_begin == 0) {
+         launch.template operator()<false>();
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+index 29fb273..e4ca8b2 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh
+@@ -20,6 +20,7 @@
+ #include "ops/common/mbarrier.cuh"
+ #include "ops/common/memory.cuh"
+ #include "ops/common/mma.cuh"
++#include "ops/common/math.cuh"
+ #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
+ #include "ops/kv_cache/hadamard_d256.cuh"
+ #include "ops/kv_cache/k8v4_value.cuh"
+@@ -1610,7 +1611,13 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
+     const float* partial_acc, const float* partial_m, const float* partial_l,
+     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
+     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
+-    std::int32_t split_count, __nv_bfloat16* out) {
++    std::int32_t split_count, __nv_bfloat16* out, const __nv_bfloat16* gate = nullptr) {
++    // research31 (NINFER_FUSED_ATTN_GATE): with a gate, every output element o becomes
++    // bf16(float(bf16(o)) * sigmoid(float(gate))) as sigmoid_gate_mul_pair forms it.
++    const auto gated = [gate](std::int64_t index, __nv_bfloat16 value) {
++        if (gate == nullptr) { return value; }
++        return __float2bfloat16_rn(__bfloat162float(value) * sigmoid(__bfloat162float(gate[index])));
++    };
+     const int q_head      = static_cast<int>(blockIdx.x);
+     const int flat_column = static_cast<int>(blockIdx.y);
+     int batch             = 0;
+@@ -1633,8 +1640,10 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
+     if constexpr (Masked) {
+         const int absolute_column = token + (Offset ? column_begin : 0);
+         if (absolute_column >= valid_columns[batch]) {
+-            if (tid < kCausalHeadDim)
+-                out[causal_q_index<Geometry>(q_head, tid, output_column)] = __float2bfloat16(0.0f);
++            if (tid < kCausalHeadDim) {
++                const std::int64_t index = causal_q_index<Geometry>(q_head, tid, output_column);
++                out[index]               = gated(index, __float2bfloat16(0.0f));
++            }
+             return;
+         }
+     }
+@@ -1677,8 +1686,9 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
+     normalized_hadamard_d256_inplace(values, tid);
+ #pragma unroll
+     for (int r = 0; r < 8; ++r) {
+-        const int d                                             = tid + 32 * r;
+-        out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(values[r]);
++        const int d              = tid + 32 * r;
++        const std::int64_t index = causal_q_index<Geometry>(q_head, d, output_column);
++        out[index]               = gated(index, __float2bfloat16(values[r]));
+     }
+ }
+ 
+-- 
+2.34.1
+

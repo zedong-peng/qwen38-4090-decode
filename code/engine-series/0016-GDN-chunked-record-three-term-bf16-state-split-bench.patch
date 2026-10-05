@@ -1,0 +1,174 @@
+From e2c2a77b7b147e9d76697875622bda99bbee148a Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 19:23:24 +0800
+Subject: [PATCH 16/49] GDN chunked record: three-term bf16 state split; bench
+ checks against an FP64 reference
+
+s0.k and s0.q now see the full 24-bit state mantissa (hi on one accumulator, mid + lo on another).
+Against FP64 (27B geometry, width 16) both kernels have rel.err 1.65e-3 (bf16 output rounding);
+outputs that are not the correctly rounded value: staged 10, chunked 24 (was 53) of 98304 (tree).
+---
+ bench/ops/gdn_chunked_bench.cu                | 57 +++++++++++++++++++
+ .../gated_delta_net/recurrent.cuh             | 38 ++++++++-----
+ 2 files changed, 80 insertions(+), 15 deletions(-)
+
+diff --git a/bench/ops/gdn_chunked_bench.cu b/bench/ops/gdn_chunked_bench.cu
+index 91aa29e..1af4b2d 100644
+--- a/bench/ops/gdn_chunked_bench.cu
++++ b/bench/ops/gdn_chunked_bench.cu
+@@ -53,6 +53,47 @@ struct Case {
+     bool tree;
+ };
+ 
++// FP64 reference of the gated delta rule along each column's root path (value head h reads key head
++// h / (kHv / kQk); state rows are value dims, columns key dims; q, k L2-normalized with eps 1e-6).
++std::vector<double> reference(const std::vector<__nv_bfloat16>& q, const std::vector<__nv_bfloat16>& k,
++                              const std::vector<__nv_bfloat16>& v, const std::vector<float>& g,
++                              const std::vector<float>& beta, const std::vector<float>& states, int slot,
++                              const std::vector<std::int32_t>& parents, double scale) {
++    std::vector<double> out(static_cast<std::size_t>(kDim) * kHv * kWidth);
++    std::vector<double> S(static_cast<std::size_t>(kWidth) * kDim * kDim), kn(kDim), qn(kDim);
++    for (int h = 0; h < kHv; ++h) {
++        const int kh = h / (kHv / kQk);
++        const float* s0 = states.data() + (static_cast<std::size_t>(slot) * kHv + h) * kDim * kDim;
++        for (int i = 0; i < kWidth; ++i) {
++            const int p = parents[i];
++            double* Si = &S[static_cast<std::size_t>(i) * kDim * kDim];
++            for (int e = 0; e < kDim * kDim; ++e) Si[e] = p < 0 ? s0[e] : S[static_cast<std::size_t>(p) * kDim * kDim + e];
++            double ks = 0, qs = 0;
++            for (int d = 0; d < kDim; ++d) {
++                kn[d] = __bfloat162float(k[(static_cast<std::size_t>(i) * kQk + kh) * kDim + d]);
++                qn[d] = __bfloat162float(q[(static_cast<std::size_t>(i) * kQk + kh) * kDim + d]);
++                ks += kn[d] * kn[d]; qs += qn[d] * qn[d];
++            }
++            ks = 1.0 / std::sqrt(ks + 1e-6); qs = 1.0 / std::sqrt(qs + 1e-6);
++            for (int d = 0; d < kDim; ++d) { kn[d] *= ks; qn[d] *= qs; }
++            const double a = std::exp(static_cast<double>(g[static_cast<std::size_t>(i) * kHv + h]));
++            const double b = beta[static_cast<std::size_t>(i) * kHv + h];
++            for (int r = 0; r < kDim; ++r) {
++                double proj = 0;
++                for (int c = 0; c < kDim; ++c) proj += Si[r * kDim + c] * kn[c];
++                const double delta = b * (__bfloat162float(v[(static_cast<std::size_t>(i) * kHv + h) * kDim + r]) - a * proj);
++                double o = 0;
++                for (int c = 0; c < kDim; ++c) {
++                    Si[r * kDim + c] = a * Si[r * kDim + c] + delta * kn[c];
++                    o += Si[r * kDim + c] * qn[c];
++                }
++                out[(static_cast<std::size_t>(i) * kHv + h) * kDim + r] = scale * o;
++            }
++        }
++    }
++    return out;
++}
++
+ } // namespace
+ 
+ int main(int argc, char** argv) {
+@@ -132,6 +173,22 @@ int main(int argc, char** argv) {
+             times[m] = 1000.0f * ms / static_cast<float>(repeat);
+         }
+         const auto o0 = download(out[0], v_n), o1 = download(out[1], v_n);
++        {
++            std::vector<std::int32_t> par(kWidth);
++            for (int i = 0; i < kWidth; ++i) par[i] = c.tree ? tree_parents[i] : i - 1;
++            const auto ref = reference(hq, hk, hv, hg, hb, hs, 1, par, scale);
++            double rn = 0, e0 = 0, e1 = 0, m0 = 0, m1 = 0;
++            std::size_t r0 = 0, r1 = 0;
++            for (std::size_t i = 0; i < v_n; ++i) {
++                const double a = __bfloat162float(o0[i]), b = __bfloat162float(o1[i]), x = ref[i];
++                rn += x * x; e0 += (a - x) * (a - x); e1 += (b - x) * (b - x);
++                m0 = std::max(m0, std::fabs(a - x)); m1 = std::max(m1, std::fabs(b - x));
++                const __nv_bfloat16 xr = __float2bfloat16(static_cast<float>(x));
++                r0 += std::memcmp(&o0[i], &xr, 2) != 0; r1 += std::memcmp(&o1[i], &xr, 2) != 0;
++            }
++            std::printf("%-5s vs FP64: staged rel.err %.3e max %.3e not-correctly-rounded %zu | chunked rel.err %.3e max %.3e "
++                        "not-correctly-rounded %zu (of %zu)\n", c.name, std::sqrt(e0 / rn), m0, r0, std::sqrt(e1 / rn), m1, r1, v_n);
++        }
+         double num = 0, den = 0, mx = 0;
+         std::size_t diff_bits = 0;
+         for (std::size_t i = 0; i < v_n; ++i) {
+diff --git a/src/ops/linear_attention/gated_delta_net/recurrent.cuh b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+index 6a2d6f0..ac185cc 100644
+--- a/src/ops/linear_attention/gated_delta_net/recurrent.cuh
++++ b/src/ops/linear_attention/gated_delta_net/recurrent.cuh
+@@ -1003,7 +1003,7 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+ //   delta_i + beta_i sum_{j in anc(i)} exp(G_i - G_j) (k_i . k_j) delta_j = beta_i (v_i - A_i s_0 . k_i)
+ //   o_i   = scale (A_i s_0 . q_i + sum_{j in path(i)} exp(G_i - G_j) (q_i . k_j) delta_j)
+ // A CTA forms s_0 . k_i and s_0 . q_i for its 16 state rows and the column Gram matrices on tensor cores
+-// (bf16 operands; the FP32 state enters as a bf16 hi + lo split), then one 16-step forward substitution per
++// (bf16 operands; the FP32 state enters as a three-term bf16 split, 24-bit mantissa), then one 16-step forward substitution per
+ // state row (ancestors precede descendants in DFS pre-order, so the system is lower triangular). Same grid,
+ // access and record side effects as the staged kernel; outputs agree to FP32 rounding, not bit for bit.
+ template <bool Masked, bool Tree>
+@@ -1118,8 +1118,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+     }
+ 
+     // Tensor-core phase. Warp 0: Gram K K^T, Q K^T, Q Q^T (bf16 operands are exact, FP32 accumulate).
+-    // Warps 1, 2: s_0 . k and s_0 . q with the FP32 state split as bf16 hi + lo (two passes, ~16-bit
+-    // mantissa). Warp 3: root paths (strict-ancestor masks and cumulative log gates).
++    // Warps 1, 2: s_0 . k and s_0 . q with the FP32 state split as bf16 hi + mid + lo (three passes, the
++    // full 24-bit mantissa; the small terms accumulate separately and join the hi sum at the end). Warp 3: root paths (strict-ancestor masks and cumulative log gates).
+     {
+         const int g = coord.lane >> 2;
+         const int q = coord.lane & 3;
+@@ -1162,12 +1162,17 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+             const auto* columns = coord.warp == 1 ? key_raw : query_raw;
+             auto& proj          = coord.warp == 1 ? proj_k : proj_q;
+             float d[2][4]       = {};
+-            const auto split = [](float x0, float x1, unsigned& hi, unsigned& lo) {
++            float e[2][4]       = {};
++            const auto split = [](float x0, float x1, unsigned& hi, unsigned& mid, unsigned& lo) {
+                 const __nv_bfloat162 h = __floats2bfloat162_rn(x0, x1);
+                 const float2 hf        = __bfloat1622float2(h);
+-                const __nv_bfloat162 l = __floats2bfloat162_rn(x0 - hf.x, x1 - hf.y);
+-                hi = *reinterpret_cast<const unsigned*>(&h);
+-                lo = *reinterpret_cast<const unsigned*>(&l);
++                const float r0 = x0 - hf.x, r1 = x1 - hf.y;
++                const __nv_bfloat162 m = __floats2bfloat162_rn(r0, r1);
++                const float2 mf        = __bfloat1622float2(m);
++                const __nv_bfloat162 l = __floats2bfloat162_rn(r0 - mf.x, r1 - mf.y);
++                hi  = *reinterpret_cast<const unsigned*>(&h);
++                mid = *reinterpret_cast<const unsigned*>(&m);
++                lo  = *reinterpret_cast<const unsigned*>(&l);
+             };
+ #pragma unroll
+             for (int ks = 0; ks < kStateDim / 16; ++ks) {
+@@ -1176,24 +1181,27 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 3)
+                 const float2 s1 = *reinterpret_cast<const float2*>(&state_tile[g + 8][c]);
+                 const float2 s2 = *reinterpret_cast<const float2*>(&state_tile[g][c + 8]);
+                 const float2 s3 = *reinterpret_cast<const float2*>(&state_tile[g + 8][c + 8]);
+-                unsigned ah[4], al[4];
+-                split(s0.x, s0.y, ah[0], al[0]);
+-                split(s1.x, s1.y, ah[1], al[1]);
+-                split(s2.x, s2.y, ah[2], al[2]);
+-                split(s3.x, s3.y, ah[3], al[3]);
++                unsigned ah[4], am[4], al[4];
++                split(s0.x, s0.y, ah[0], am[0], al[0]);
++                split(s1.x, s1.y, ah[1], am[1], al[1]);
++                split(s2.x, s2.y, ah[2], am[2], al[2]);
++                split(s3.x, s3.y, ah[3], am[3], al[3]);
+ #pragma unroll
+                 for (int nt = 0; nt < 2; ++nt) {
+                     const unsigned b0 = pair_at(columns[nt * 8 + g], c);
+                     const unsigned b1 = pair_at(columns[nt * 8 + g], c + 8);
+                     mma_bf16(d[nt][0], d[nt][1], d[nt][2], d[nt][3], ah[0], ah[1], ah[2], ah[3], b0, b1);
+-                    mma_bf16(d[nt][0], d[nt][1], d[nt][2], d[nt][3], al[0], al[1], al[2], al[3], b0, b1);
++                    mma_bf16(e[nt][0], e[nt][1], e[nt][2], e[nt][3], al[0], al[1], al[2], al[3], b0, b1);
++                    mma_bf16(e[nt][0], e[nt][1], e[nt][2], e[nt][3], am[0], am[1], am[2], am[3], b0, b1);
+                 }
+             }
+ #pragma unroll
+             for (int nt = 0; nt < 2; ++nt) {
+                 const int col = nt * 8 + 2 * q;
+-                proj[g][col] = d[nt][0];     proj[g][col + 1] = d[nt][1];
+-                proj[g + 8][col] = d[nt][2]; proj[g + 8][col + 1] = d[nt][3];
++                proj[g][col]     = d[nt][0] + e[nt][0];
++                proj[g][col + 1] = d[nt][1] + e[nt][1];
++                proj[g + 8][col]     = d[nt][2] + e[nt][2];
++                proj[g + 8][col + 1] = d[nt][3] + e[nt][3];
+             }
+         } else if (coord.lane >= valid && coord.lane < kW) {
+             ancestors[coord.lane] = 0U;
+-- 
+2.34.1
+

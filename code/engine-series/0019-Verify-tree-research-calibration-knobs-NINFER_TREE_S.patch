@@ -1,0 +1,114 @@
+From 8e9f908bf2104587ee7e14fdb893ba5576b1eba6 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Sat, 3 Oct 2026 19:50:16 +0800
+Subject: [PATCH 19/49] Verify tree: research calibration knobs
+ (NINFER_TREE_STEP_TEMP, NINFER_TREE_STEP_BIAS, NINFER_TREE_LOOKUP_SCALE)
+
+Defaults reproduce the deployed selection bit for bit.
+---
+ .../bf16/candidate_selector_path.cu           | 52 +++++++++++++++----
+ 1 file changed, 42 insertions(+), 10 deletions(-)
+
+diff --git a/src/ops/candidate_selector/bf16/candidate_selector_path.cu b/src/ops/candidate_selector/bf16/candidate_selector_path.cu
+index 021e2d5..d5db391 100644
+--- a/src/ops/candidate_selector/bf16/candidate_selector_path.cu
++++ b/src/ops/candidate_selector/bf16/candidate_selector_path.cu
+@@ -181,9 +181,17 @@ constexpr int kTreeNodes                = kMaxSteps + 1;
+ constexpr int kTreeLookupOnly = 1 << 16;
+ constexpr int kTreeOnLookup   = 1 << 17;
+ 
++// Research calibration of the lattice (see tree_calibration()): per-step inverse temperature and additive
++// log-probability bias, and a scale on the lookup chain's log-probability.
++struct TreeCalibration {
++    float inverse_temperature[kMaxSteps];
++    float bias[kMaxSteps];
++    float lookup_scale;
++};
++
+ __global__ __launch_bounds__(32) void selector_tree_kernel(
+     DeviceArgs a, const float* edges, const std::int32_t* extents, std::int32_t* tree_parents,
+-    std::int32_t* tree_masks, std::int32_t* rope_positions, float inverse_temperature,
++    std::int32_t* tree_masks, std::int32_t* rope_positions, TreeCalibration calibration,
+     const std::int32_t* lookup_tokens, const std::int32_t* lookup_counts,
+     const float* lookup_log_probability) {
+     __shared__ __align__(16) float staged[kMaxSteps * kCandidates * kCandidates];
+@@ -206,7 +214,7 @@ __global__ __launch_bounds__(32) void selector_tree_kernel(
+     if (lookup_tokens != nullptr) {
+         lookup_count = lookup_counts[batch];
+         lookup_count = lookup_count < 0 ? 0 : (lookup_count > steps ? steps : lookup_count);
+-        lookup_log_p = lookup_log_probability[batch];
++        lookup_log_p = lookup_log_probability[batch] * calibration.lookup_scale;
+         lookup       = lookup_tokens + static_cast<std::int64_t>(batch) * steps;
+     }
+     // The lattice rank of each chain token at its step, -1 when the drafter did not propose it.
+@@ -223,7 +231,9 @@ __global__ __launch_bounds__(32) void selector_tree_kernel(
+ 
+     // Every lattice row's transition log-probabilities, in place: one row per lane at a time.
+     for (int row = lane; row < steps * kCandidates; row += 32) {
+-        float* values = &staged[row * kCandidates];
++        float* values                   = &staged[row * kCandidates];
++        const float inverse_temperature = calibration.inverse_temperature[row / kCandidates];
++        const float bias                = calibration.bias[row / kCandidates];
+         float e[kCandidates];
+ #pragma unroll
+         for (int c = 0; c < kCandidates; c += 4) {
+@@ -239,7 +249,7 @@ __global__ __launch_bounds__(32) void selector_tree_kernel(
+         float z = 0.0F;
+ #pragma unroll
+         for (int c = 0; c < kCandidates; ++c) z += __expf(e[c] - m);
+-        const float shift = m + __logf(z);
++        const float shift = m + __logf(z) - bias;
+ #pragma unroll
+         for (int c = 0; c < kCandidates; c += 4) {
+             *reinterpret_cast<float4*>(values + c) =
+@@ -412,11 +422,33 @@ __global__ __launch_bounds__(32) void lookup_chain_tree_kernel(
+     }
+ }
+ 
+-// Research override: NINFER_TREE_TEMPERATURE replaces the tree temperature (default 1.5).
+-float tree_inverse_temperature() {
+-    static const float value = [] {
+-        const char* env = std::getenv("NINFER_TREE_TEMPERATURE");
+-        return env != nullptr ? 1.0F / std::strtof(env, nullptr) : kTreeInverseTemperature;
++// Research overrides (tools/patch_tree_calib.py): NINFER_TREE_TEMPERATURE replaces the tree temperature
++// (default 1.5); NINFER_TREE_STEP_TEMP / NINFER_TREE_STEP_BIAS give comma-separated per-step temperatures /
++// log-probability biases; NINFER_TREE_LOOKUP_SCALE scales the lookup chain's log-probability.
++TreeCalibration tree_calibration() {
++    static const TreeCalibration value = [] {
++        TreeCalibration c{};
++        const char* env       = std::getenv("NINFER_TREE_TEMPERATURE");
++        const float inverse   = env != nullptr ? 1.0F / std::strtof(env, nullptr) : kTreeInverseTemperature;
++        const auto parse_list = [](const char* name, float* out, bool reciprocal) {
++            const char* text = std::getenv(name);
++            for (int i = 0; text != nullptr && *text != 0 && i < kMaxSteps; ++i) {
++                char* end     = nullptr;
++                const float v = std::strtof(text, &end);
++                if (end == text) break;
++                out[i] = reciprocal ? 1.0F / v : v;
++                text   = *end == ',' ? end + 1 : end;
++            }
++        };
++        for (int i = 0; i < kMaxSteps; ++i) {
++            c.inverse_temperature[i] = inverse;
++            c.bias[i]                = 0.0F;
++        }
++        parse_list("NINFER_TREE_STEP_TEMP", c.inverse_temperature, true);
++        parse_list("NINFER_TREE_STEP_BIAS", c.bias, false);
++        const char* scale = std::getenv("NINFER_TREE_LOOKUP_SCALE");
++        c.lookup_scale    = scale != nullptr ? std::strtof(scale, nullptr) : 1.0F;
++        return c;
+     }();
+     return value;
+ }
+@@ -447,7 +479,7 @@ void candidate_selector_tree_launch(
+     selector_tree_kernel<<<candidate_ids.ne[2], 32, 0, stream>>>(
+         args, edge_data, static_cast<const std::int32_t*>(current_extents.data),
+         static_cast<std::int32_t*>(tree_parents.data), static_cast<std::int32_t*>(tree_masks.data),
+-        static_cast<std::int32_t*>(rope_positions.data), tree_inverse_temperature(),
++        static_cast<std::int32_t*>(rope_positions.data), tree_calibration(),
+         static_cast<const std::int32_t*>(lookup_tokens.data),
+         static_cast<const std::int32_t*>(lookup_counts.data),
+         static_cast<const float*>(lookup_log_probability.data));
+-- 
+2.34.1
+
