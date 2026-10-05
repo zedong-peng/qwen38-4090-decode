@@ -1,0 +1,40 @@
+From 350b9d5720b04274eb0fec40ae2107efe5af2328 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Tue, 6 Oct 2026 03:43:12 +0800
+Subject: [PATCH 52/53] research41: NINFER_RDC option; whole-program CUDA
+ compilation (-DNINFER_RDC=OFF) is bit-exact and faster
+
+Every ninfer CUDA archive was built with CUDA_SEPARABLE_COMPILATION ON (-rdc=true). Nothing needs cross-TU device
+linking, and whole-program compilation of the same source changes register allocation: of 2801 common kernels 541
+use fewer registers (verify screen 123 -> 94, Q4 gate/up 84 -> 72 = 3 CTAs/SM instead of 2, GDN record 96 -> 83,
+rmsnorm 56 -> 39) and 336 more. Default stays ON; configure a separate build dir with -DNINFER_RDC=OFF.
+
+Spec-Bench-480 unforced ids 482/482 identical; forced ms/round -0.43% / -0.24% with +0.34% / +0.53% drift against
+it (~ -0.5%); nsys Q4 gate/up 100.6 -> 98.4 us (job 119).
+---
+ cmake/NinferTargets.cmake | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/cmake/NinferTargets.cmake b/cmake/NinferTargets.cmake
+index 854513d..37e937c 100644
+--- a/cmake/NinferTargets.cmake
++++ b/cmake/NinferTargets.cmake
+@@ -6,10 +6,13 @@ function(ninfer_internal_includes target)
+     ${PROJECT_SOURCE_DIR}/src)
+ endfunction()
+ 
++# research41: OFF compiles every CUDA translation unit whole-program (no relocatable device code).
++option(NINFER_RDC "Relocatable device code for the ninfer CUDA archives" ON)
++
+ function(ninfer_cuda_archive target)
+   set_target_properties(${target} PROPERTIES
+-    CUDA_SEPARABLE_COMPILATION ON
+-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
++    CUDA_SEPARABLE_COMPILATION ${NINFER_RDC}
++    CUDA_RESOLVE_DEVICE_SYMBOLS ${NINFER_RDC})
+   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+ endfunction()
+ 
+-- 
+2.34.1
+

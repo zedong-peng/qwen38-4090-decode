@@ -1,0 +1,174 @@
+From f5cc59001c2e5d297e3a4c592bd6797ea8feecf8 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Tue, 6 Oct 2026 04:34:29 +0800
+Subject: [PATCH 53/53] research38d: NINFER_ATTN_FILL_FIT=1 sizes the
+ row-split/row-pair L2 fill to the spare resident slots (off)
+
+One fill slice whose first fill_ctas CTAs (the slots two CTAs per SM leave next to the attention CTAs) each keep 16
+lines per thread in flight; the rest of the slice exits. Bit-exact (fills only prefetch; ids 482/482). nsys: the
+row-pair kernel gets slower (12.35 -> 14.40 us; 16 SMs cannot pull 8 MB as fast as 48 CTAs), GEMMs unchanged; the
+forced A B A B is within run-to-run variation (-0.19% under a linear drift + cold-first-run model). Default off.
+---
+ .../dense/causal_cache/small_t_k8v4.cu        | 35 ++++++++++++--
+ .../causal_cache/small_t_k8v4_rowsplit.cuh    | 46 +++++++++++++++----
+ 2 files changed, 67 insertions(+), 14 deletions(-)
+
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+index b2fde26..fec8db9 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+@@ -35,6 +35,15 @@ int k8v4_rowsplit_mode() {
+     return mode;
+ }
+ 
++// research38d (NINFER_ATTN_FILL_FIT=1): the row-split / row-pair fill CTAs take only the spare resident slots.
++bool k8v4_fill_fit() {
++    static const bool fit = [] {
++        const char* value = std::getenv("NINFER_ATTN_FILL_FIT");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    return fit;
++}
++
+ int k8v4_rowsplit_sms() {
+     static const int count = [] {
+         int device = 0;
+@@ -103,6 +112,18 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+                 const std::uint32_t per = 8u * static_cast<std::uint32_t>(threads * ctas_per_slice);
+                 return static_cast<std::int32_t>((fill_lines + per - 1) / per);
+             };
++            // research38d: with NINFER_ATTN_FILL_FIT, one slice whose first fill_ctas CTAs fill the slots that two
++            // CTAs per SM leave next to the attention CTAs (16 lines per thread).
++            const auto fill_fit = [&](int threads, int ctas_per_slice, int slots, std::int32_t& fill_slices,
++                                      std::int32_t& fill_ctas) {
++                fill_ctas = 0;
++                if (!k8v4_fill_fit() || fill_lines == 0) { return; }
++                const int spare  = 2 * k8v4_rowsplit_sms() - ctas_per_slice * slots;
++                const int needed = static_cast<int>((fill_lines + 16u * threads - 1) / (16u * threads));
++                if (spare <= 0) { return; }
++                fill_ctas   = std::min(needed, spare);
++                fill_slices = (fill_ctas + ctas_per_slice - 1) / ctas_per_slice;
++            };
+             if constexpr (CacheInput::writes_cache) {
+                 causal_attention_small_t_k8v4_prepare_append_kernel<Geometry, TokenTile, false, Masked, CacheInput>
+                     <<<(TokenTile * Geometry::KVHeads + 3) / 4, 128, 0, stream>>>(
+@@ -121,13 +142,16 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+                 // One resident wave at two CTAs per SM.
+                 const int slots =
+                     std::max(1, 2 * k8v4_rowsplit_sms() / (Geometry::KVHeads * RS::RowGroups));
+-                const std::int32_t fill_slices = fill_slices_for(RS::Threads, Geometry::KVHeads * RS::RowGroups);
++                std::int32_t fill_slices = fill_slices_for(RS::Threads, Geometry::KVHeads * RS::RowGroups);
++                std::int32_t fill_ctas   = 0;
++                fill_fit(RS::Threads, Geometry::KVHeads * RS::RowGroups, slots, fill_slices, fill_ctas);
+                 kernel<<<dim3(Geometry::KVHeads, RS::RowGroups, slots + fill_slices), RS::Threads,
+                          RS::DynamicBytes, stream>>>(q_ptr, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr,
+                                                      v_scale_ptr, tables_ptr, valid_ptr, masks_ptr, rows_ptr,
+                                                      cache.block_tables.ne[0], invocation.full_width,
+                                                      invocation.column_begin, logical_capacity, splits, slots, scale,
+-                                                     partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_slices);
++                                                     partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_slices,
++                                                     fill_ctas);
+                 CUDA_CHECK(cudaGetLastError());
+             };
+             if (mode == 3) {
+@@ -138,12 +162,15 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+                 CUDA_CHECK(attr);
+                 constexpr int RowGroups = TokenTile * Geometry::GroupSize / 16;
+                 const int slots         = std::max(1, 2 * k8v4_rowsplit_sms() / (Geometry::KVHeads * RowGroups));
+-                const std::int32_t fill_slices = fill_slices_for(RP::Threads, Geometry::KVHeads * RowGroups);
++                std::int32_t fill_slices = fill_slices_for(RP::Threads, Geometry::KVHeads * RowGroups);
++                std::int32_t fill_ctas   = 0;
++                fill_fit(RP::Threads, Geometry::KVHeads * RowGroups, slots, fill_slices, fill_ctas);
+                 kernel<<<dim3(Geometry::KVHeads, RowGroups, slots + fill_slices), RP::Threads, RP::DynamicBytes,
+                          stream>>>(q_ptr, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
+                                    tables_ptr, valid_ptr, masks_ptr, rows_ptr, cache.block_tables.ne[0],
+                                    invocation.full_width, invocation.column_begin, logical_capacity, splits, slots,
+-                                   scale, partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_slices);
++                                   scale, partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_slices,
++                                   fill_ctas);
+                 CUDA_CHECK(cudaGetLastError());
+             } else if (mode == 1) {
+                 run.template operator()<1>();
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh
+index b221157..73dd575 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh
+@@ -175,7 +175,8 @@ __launch_bounds__(K8V4RowSplitSchedule<Geometry, TokenTile, RT>::Threads, RT <=
+         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t split_count,
+         std::int32_t slots, float attention_scale, float* partial_acc, float* partial_m,
+-        float* partial_l, ops::L2Fill fill = {}, std::int32_t fill_slices = 0) {
++        float* partial_l, ops::L2Fill fill = {}, std::int32_t fill_slices = 0,
++        std::int32_t fill_ctas = 0) {
+     using S                     = K8V4RowSplitSchedule<Geometry, TokenTile, RT>;
+     constexpr int RowCount      = S::RowCount;
+     constexpr int Threads       = S::Threads;
+@@ -220,11 +221,23 @@ __launch_bounds__(K8V4RowSplitSchedule<Geometry, TokenTile, RT>::Threads, RT <=
+     if (fill_slices > 0 && static_cast<int>(blockIdx.z) >= static_cast<int>(gridDim.z) - fill_slices) {
+         // research38c (NINFER_L2_FILL bit 64): z-slices past the slots warm the next GEMM's weights in L2, as
+         // the wide kernel's fill rows do: start after the attention CTAs' first requests, two lines in flight.
+-        __nanosleep(1500);
+         const int fz          = static_cast<int>(blockIdx.z) - (static_cast<int>(gridDim.z) - fill_slices);
+-        const std::uint32_t t = static_cast<std::uint32_t>(
+-            ((fz * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y)) * static_cast<int>(gridDim.x) +
+-             static_cast<int>(blockIdx.x)) * Threads + tid);
++        const std::uint32_t c = static_cast<std::uint32_t>(
++            (fz * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y)) * static_cast<int>(gridDim.x) +
++            static_cast<int>(blockIdx.x));
++        if (fill_ctas > 0) {
++            // research38d (NINFER_ATTN_FILL_FIT=1): fill_ctas CTAs sized to the spare resident slots, 16 lines per
++            // thread in flight at once; the rest of the slice exits.
++            if (c >= static_cast<std::uint32_t>(fill_ctas)) { return; }
++            __nanosleep(1500);
++            detail::L2FillLoads<16> l2_fill;
++            l2_fill.issue(fill, c * static_cast<std::uint32_t>(Threads) + static_cast<std::uint32_t>(tid),
++                          static_cast<std::uint32_t>(fill_ctas) * static_cast<std::uint32_t>(Threads));
++            l2_fill.consume(fill);
++            return;
++        }
++        __nanosleep(1500);
++        const std::uint32_t t = c * static_cast<std::uint32_t>(Threads) + static_cast<std::uint32_t>(tid);
+         const std::uint32_t n =
+             static_cast<std::uint32_t>(fill_slices) * gridDim.x * gridDim.y * static_cast<std::uint32_t>(Threads);
+         std::uint32_t acc = 0U;
+@@ -700,7 +713,8 @@ __launch_bounds__(K8V4RowPairSchedule::Threads, 2) __global__
+         const std::int32_t* tree_masks, const std::int32_t* table_rows, std::int32_t table_stride,
+         std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
+         std::int32_t split_count, std::int32_t slots, float attention_scale, float* partial_acc,
+-        float* partial_m, float* partial_l, ops::L2Fill fill = {}, std::int32_t fill_slices = 0) {
++        float* partial_m, float* partial_l, ops::L2Fill fill = {}, std::int32_t fill_slices = 0,
++        std::int32_t fill_ctas = 0) {
+     using S                     = K8V4RowPairSchedule;
+     constexpr int Threads       = S::Threads;
+     constexpr int Bc            = S::Bc;
+@@ -742,11 +756,23 @@ __launch_bounds__(K8V4RowPairSchedule::Threads, 2) __global__
+     if (fill_slices > 0 && static_cast<int>(blockIdx.z) >= static_cast<int>(gridDim.z) - fill_slices) {
+         // research38c (NINFER_L2_FILL bit 64): z-slices past the slots warm the next GEMM's weights in L2, as
+         // the wide kernel's fill rows do: start after the attention CTAs' first requests, two lines in flight.
+-        __nanosleep(1500);
+         const int fz          = static_cast<int>(blockIdx.z) - (static_cast<int>(gridDim.z) - fill_slices);
+-        const std::uint32_t t = static_cast<std::uint32_t>(
+-            ((fz * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y)) * static_cast<int>(gridDim.x) +
+-             static_cast<int>(blockIdx.x)) * Threads + tid);
++        const std::uint32_t c = static_cast<std::uint32_t>(
++            (fz * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y)) * static_cast<int>(gridDim.x) +
++            static_cast<int>(blockIdx.x));
++        if (fill_ctas > 0) {
++            // research38d (NINFER_ATTN_FILL_FIT=1): fill_ctas CTAs sized to the spare resident slots, 16 lines per
++            // thread in flight at once; the rest of the slice exits.
++            if (c >= static_cast<std::uint32_t>(fill_ctas)) { return; }
++            __nanosleep(1500);
++            detail::L2FillLoads<16> l2_fill;
++            l2_fill.issue(fill, c * static_cast<std::uint32_t>(Threads) + static_cast<std::uint32_t>(tid),
++                          static_cast<std::uint32_t>(fill_ctas) * static_cast<std::uint32_t>(Threads));
++            l2_fill.consume(fill);
++            return;
++        }
++        __nanosleep(1500);
++        const std::uint32_t t = c * static_cast<std::uint32_t>(Threads) + static_cast<std::uint32_t>(tid);
+         const std::uint32_t n =
+             static_cast<std::uint32_t>(fill_slices) * gridDim.x * gridDim.y * static_cast<std::uint32_t>(Threads);
+         std::uint32_t acc = 0U;
+-- 
+2.34.1
+

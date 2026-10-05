@@ -1,4 +1,4 @@
-# Engine patch series (51 commits)
+# Engine patch series (53 commits)
 
 These are the Ada (RTX 4090) and research commits behind the speed study, exported with `git format-patch`. Every
 research feature is behind an environment knob that defaults to off, and each commit message states its measured
@@ -11,6 +11,9 @@ NINFER_GDN_STATE_F16=1 NINFER_L2_FILL=121 NINFER_L2_FILL_NORM_KB=1536 NINFER_L2_
 NINFER_L2_FILL_GATED_KB=768 NINFER_L2_FILL_RECORD_KB=2048 NINFER_ATTN_ROWSPLIT=3 NINFER_SCREEN_TILED=1
 ninfer-serve ... --spec dflash2 --draft-tokens 15 --verify-tree --kv-dtype k8v4 --no-prefix-reuse
 ```
+
+Build the engine whole-program (patch 0052): configure a separate build directory with `-DNINFER_RDC=OFF`. It is
+bit-exact and about 0.5% faster than the default `-rdc=true` build.
 
 ## Base
 
