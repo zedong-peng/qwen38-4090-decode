@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your fidelity test never runs your decode kernels</title>
+<style>
+/* Layout: one reading column (~66ch) with full-column data figures: a to-scale ledger and a stacked round budget. */
+:root {
+  --bg: #f4f6f5;
+  --fg: #17211e;
+  --muted: #5a6662;
+  --rule: #d5ddd9;
+  --accent: #0d6b5b;
+  --accent-soft: #cfe4de;
+  --warm: #b26b12;
+  --panel: #ffffff;
+  --g: #0d6b5b; --s: #3d8f7f; --n: #7aa99c; --a: #b26b12; --r: #d29a48; --f: #8a7cb8; --o: #a3aaa7; --i: #e2e6e4;
+  --display: "Helvetica Neue", "Segoe UI", Arial, sans-serif;
+  --body: Charter, "Bitstream Charter", Georgia, "Times New Roman", serif;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111816; --fg: #e3ebe8; --muted: #9aa8a3; --rule: #2a3633; --accent: #5cc4ae; --accent-soft: #1d3b34;
+    --warm: #e0a24e; --panel: #172120;
+    --g: #4fb39e; --s: #3a8a7a; --n: #2f6a5e; --a: #e0a24e; --r: #a87632; --f: #9d8fd0; --o: #6c7672; --i: #2a3431;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111816; --fg: #e3ebe8; --muted: #9aa8a3; --rule: #2a3633; --accent: #5cc4ae; --accent-soft: #1d3b34;
+  --warm: #e0a24e; --panel: #172120;
+  --g: #4fb39e; --s: #3a8a7a; --n: #2f6a5e; --a: #e0a24e; --r: #a87632; --f: #9d8fd0; --o: #6c7672; --i: #2a3431;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 18px; line-height: 1.6; }
+.wrap { max-width: 44rem; margin: 0 auto; padding-inline: 20px; padding-block: 48px 72px; display: flex; flex-direction: column; gap: 1.1rem; }
+.eyebrow { font-family: var(--mono); font-size: 0.78rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(2rem, 5.5vw, 3.1rem); line-height: 1.05; margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
+h1 .num { color: var(--accent); font-variant-numeric: tabular-nums; }
+h2 { font-family: var(--display); font-weight: 700; font-size: 1.45rem; line-height: 1.2; margin: 1.6rem 0 0; text-wrap: balance; }
+p, ul, ol { margin: 0; }
+ul, ol { padding-left: 1.3rem; display: flex; flex-direction: column; gap: 0.35rem; }
+.lede { font-size: 1.12rem; color: var(--fg); }
+.note { font-size: 0.92rem; color: var(--muted); font-style: italic; }
+strong { font-weight: 600; }
+code { font-family: var(--mono); font-size: 0.86em; background: var(--accent-soft); padding: 0.05em 0.3em; border-radius: 3px; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tldr { border-left: 3px solid var(--accent); padding: 0.2rem 0 0.2rem 1rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.tldr ul { gap: 0.45rem; }
+figure { margin: 0.4rem 0 0; display: flex; flex-direction: column; gap: 0.6rem; }
+figcaption { font-size: 0.9rem; color: var(--muted); }
+.ledger { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.55rem; font-family: var(--mono); font-size: 0.8rem; }
+.ledger li { display: grid; grid-template-columns: minmax(0, 1fr) 4.2rem; grid-template-areas: "lab lab" "track val"; column-gap: 0.6rem; row-gap: 0.15rem; align-items: center; }
+.ledger .lab { grid-area: lab; color: var(--fg); font-family: var(--body); font-size: 0.92rem; line-height: 1.3; }
+.ledger .track { grid-area: track; height: 10px; background: var(--rule); border-radius: 2px; overflow: hidden; }
+.ledger .bar { display: block; height: 100%; background: var(--accent); }
+.ledger li:first-child .bar, .ledger li:nth-child(2) .bar { background: var(--muted); }
+.ledger .val { grid-area: val; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
+.axis { display: grid; grid-template-columns: minmax(0, 1fr) 4.2rem; column-gap: 0.6rem; font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+.axis .ticks { display: flex; justify-content: space-between; }
+.stack { display: flex; height: 26px; border-radius: 3px; overflow: hidden; }
+.seg { display: block; height: 100%; min-width: 1px; }
+.seg-g { background: var(--g); } .seg-s { background: var(--s); } .seg-n { background: var(--n); } .seg-a { background: var(--a); }
+.seg-r { background: var(--r); } .seg-f { background: var(--f); } .seg-o { background: var(--o); } .seg-i { background: var(--i); }
+.legend { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: 0.3rem 1.2rem; font-size: 0.88rem; }
+.legend li { display: flex; align-items: center; gap: 0.5rem; }
+.legend .sw { width: 0.8rem; height: 0.8rem; border-radius: 2px; flex: none; }
+.legend .num { margin-left: auto; font-family: var(--mono); font-size: 0.8rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tbl { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 0.9rem; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 0.4rem 0.55rem; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; white-space: normal; }
+th { font-family: var(--mono); font-weight: 500; font-size: 0.74rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+td { font-family: var(--mono); font-size: 0.85rem; }
+td:first-child { font-family: var(--body); font-size: 0.92rem; }
+tr.now td { color: var(--accent); font-weight: 500; }
+.steps { counter-reset: s; list-style: none; padding: 0; gap: 0.7rem; }
+.steps li { counter-increment: s; display: grid; grid-template-columns: 1.6rem minmax(0, 1fr); gap: 0.4rem; }
+.steps li::before { content: counter(s); font-family: var(--mono); font-size: 0.85rem; color: var(--accent); padding-top: 0.2rem; }
+.nope li { color: var(--fg); }
+.nope li strong { color: var(--warm); font-weight: 600; }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 1.4rem 0 0; width: 100%; }
+@media (max-width: 520px) { body { font-size: 17px; } .wrap { padding-inline: 16px; padding-block: 32px 56px; } }
+</style>
+</head>
+<body>
+<article class="wrap">
+<h1>Your fidelity test never runs your decode kernels</h1>
+<p class="note"><em>Draft, 2026-10-05. Third post of the single-RTX-4090 Qwen3.8-27B series. Tools: <code>code/fidelity/dfid.py</code>, <code>ref_var.py</code> and <code>code/engine-patches/patch_hidden_dump.py</code>.</em></p>
+<p>The usual way to check a quantized or optimized LLM engine is to score a text corpus through it and compare its next-token distributions with a high-precision reference: KL, top-1 agreement and perplexity. We do the same, against an FP32-compute reference, on 46,059 predictions.</p>
+<p>That check runs the <strong>prefill</strong> path: long chunks, big GEMMs, one pass. A speculative decoder spends its life in a different path. Every round, a 16-token verify forward reads the recurrent state written by the previous round and writes it back. Some optimizations touch only that path:</p>
+<ul><li>storing the Gated DeltaNet state in FP16 between rounds;</li><li>folding a norm into a GEMM epilogue on verify widths;</li><li>a different kernel route at T = 16.</li></ul>
+<p>The prefill tool cannot see any of them.</p>
+<h2>Measuring the verify path directly</h2>
+<p>The idea: run the real decode loop on fixed text, and capture what the target computes for each token it accepts.</p>
+<ol><li><strong>Fixed text.</strong> Forced decoding (<code>NINFER_FORCE_TOKENS</code>, from the previous post) makes every configuration walk the same reference continuation of each Spec-Bench prompt. The verify forward still runs normally.</li><li><strong>Dump the head inputs.</strong> <code>NINFER_HIDDEN_DUMP</code> writes two things:<ul><li>the prompt ids when each request starts;</li><li>after every verify round, the final-normed hidden state of each accepted column, together with the round's frontier.</li></ul></li></ol>
+<p>Column <em>c</em> of a round predicts the token at frontier + 1 + <em>c</em>. Graph capture is off for these runs, because host code inside a captured round runs only once.</p>
+<ol><li><strong>Same arithmetic as the reference.</strong> Offline, hidden × the checkpoint's BF16 head gives FP32 logits, exactly as the reference computes them. Engine head quantization drops out, so only the backbone's decode numerics are measured.</li><li><strong>Reference on the same text.</strong> prompt + continuation goes through the BF16 checkpoint, layer-streamed on one 24 GB card (<code>ref_var.py</code>, variable-length windows): 241 windows in 14 minutes.</li></ol>
+<p>Before trusting it, check the alignment. 236 of 240 dumped columns reproduce the forced next token under the BF16 head, and the 4 misses are near-ties. Every column is present, and the first round sits at frontier = prompt length.</p>
+<h2>FP32 vs FP16 recurrent state, on the decode path</h2>
+<div class="tbl"><table><thead><tr><th>state storage</th><th>columns</th><th>KL64</th><th>top-1</th><th>PPL</th></tr></thead><tbody><tr><td>FP32</td><td>40,889</td><td>0.02125</td><td>0.9588</td><td>1.1942</td></tr><tr><td>FP16</td><td>40,634</td><td>0.02079</td><td>0.9586</td><td>1.1930</td></tr></tbody></table></div>
+<ul><li>Per Spec-Bench group, on identical columns, KL moves by ±0.5% in both directions, and PPL agrees to the fourth digit.</li><li>Top-1 on the common columns: FP16 loses 79 agreements and gains 56, a net −23 (sign test p ≈ 0.06).</li></ul>
+<h2>The near-tie tax</h2>
+<p>Is −23 a real cost of FP16? The prefill tool's probes answer it. There, the carried state was rounded to fewer mantissa bits at every 64-token boundary:</p>
+<div class="tbl"><table><thead><tr><th>state rounding</th><th>net top-1 vs FP32 (of 46,059)</th></tr></thead><tbody><tr><td>10 mantissa bits</td><td>−9</td></tr><tr><td>8 bits</td><td>−11</td></tr><tr><td>7 bits</td><td>−11</td></tr><tr><td>5 bits</td><td>−14</td></tr><tr><td>exact FP16</td><td>−22</td></tr><tr><td>FP16 storage</td><td>−24</td></tr></tbody></table></div>
+<p>Every perturbation is net negative by a similar amount, and the size does not track the precision: 5 bits costs less than FP16. The explanation is selection, not damage.</p>
+<ul><li>Near a tie, the engine's argmax agrees with the reference more often than chance, because the two computations are close.</li><li>Any added noise re-randomizes some of those near-ties.</li><li>On average, that turns agreements into disagreements.</li></ul>
+<p>So <strong>every non-bit-exact change pays ≈10–25 top-1 agreements per 40–46k predictions, with no KL or PPL signal.</strong></p>
+<p>That matters for quality bars. A rule like "top-1 must not drop below the baseline" is biased against every change, however harmless. The bar we now use:</p>
+<ul><li>KL and PPL not worse than the reference release;</li><li>top-1 above the release's.</li></ul>
+<p>Within that bar, the top-1 headroom is a budget that each non-bit-exact change spends. FP16 GDN state spent nearly all of ours: 42,606 against the release's 42,605. It buys +0.7–0.9% tok/s.</p>
+<h2>Checklist</h2>
+<ul><li>If an optimization only runs at decode widths, prefill fidelity says nothing about it. Dump the verify path on forced text and score that.</li><li>Remove what is common to all configurations (the head) and compute logits exactly like the reference.</li><li>Before the expensive reference, validate the alignment with argmax against the forced token.</li><li>Read top-1 flips as gained/lost counts with a sign test. Expect a small negative net for any perturbation.</li></ul>
+</article>
+</body>
+</html>
