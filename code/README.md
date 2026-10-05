@@ -1,6 +1,6 @@
 # Measurement tools for speculative decoding on one GPU
 
-These are the tools behind a Qwen3.8-27B + DFlash2 speed study on a single RTX 4090, which went from 237.6 to ≈313
+These are the tools behind a Qwen3.8-27B + DFlash2 speed study on a single RTX 4090, which went from 237.6 to 319.4
 tok/s on Spec-Bench-480. They answer three questions:
 
 1. **Is B faster than A?** This covers changes as small as 0.3%, including changes that alter the generated text.
