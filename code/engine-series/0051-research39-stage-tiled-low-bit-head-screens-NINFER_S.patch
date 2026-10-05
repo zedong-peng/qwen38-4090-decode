@@ -1,0 +1,264 @@
+From bfd7441d2cbbaf7f95d695ca5b2ed5f4a3139ca7 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Tue, 6 Oct 2026 02:43:40 +0800
+Subject: [PATCH 51/51] research39: stage-tiled low-bit head screens
+ (NINFER_SCREEN_TILED=1)
+
+The codes, high bits and scales of a screen CTA's 64 rows and one pipeline stage (8 groups) are contiguous in each
+plane, so a stage is three contiguous reads instead of 64 row segments per plane. Same shared-memory tiles, so keys,
+candidates and tokens are bit-identical. nsys: verify screen 580.6 -> 560.4 us, proposal screen 324.7 -> 305.8 us.
+---
+ src/ops/linear_topk/proposal_screen.cu | 31 +++++++++++-----
+ src/ops/linear_topk/screen_head.cu     | 20 +++++++++--
+ src/ops/linear_topk/screen_lowbit.cuh  | 49 +++++++++++++++++++++++---
+ 3 files changed, 84 insertions(+), 16 deletions(-)
+
+diff --git a/src/ops/linear_topk/proposal_screen.cu b/src/ops/linear_topk/proposal_screen.cu
+index 639386c..172fa0d 100644
+--- a/src/ops/linear_topk/proposal_screen.cu
++++ b/src/ops/linear_topk/proposal_screen.cu
+@@ -33,7 +33,7 @@ static_assert(kRows % S3::kRows == 0 && S2::kRows == S3::kRows && kChunks * sq::
+ 
+ // Q4 G64 row-split head (byte i of a group holds codes 2i and 2i + 1, low nibble first) -> the half-offset G64 screen
+ // of screen_lowbit.cuh (same grid and planes as requant_kernel, from the dequantized Q4 values).
+-template <int Bits>
++template <int Bits, bool Tiled = false>
+ __global__ void requant_q4_kernel(const std::uint8_t* __restrict__ q4, const __half* __restrict__ q4_scales,
+                                   std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ high,
+                                   __half* __restrict__ scales, std::int64_t rows) {
+@@ -54,7 +54,7 @@ __global__ void requant_q4_kernel(const std::uint8_t* __restrict__ q4, const __h
+     __half sh = __float2half_rn(absmax / (n - 0.5f));
+     if (__half2float(sh) == 0.0f && absmax > 0.0f) sh = __ushort_as_half(1);
+     const float s = __half2float(sh), inv = s > 0.0f ? 1.0f / s : 0.0f;
+-    std::uint8_t* dst = codes + row * sq::kRowBytes + group * 16;
++    std::uint8_t* dst = codes + (Tiled ? sq::tiled_offset(row, group, 16) : row * sq::kRowBytes + group * 16);
+     unsigned long long hbits = 0;
+     for (int b = 0; b < 16; ++b) {
+         unsigned byte = 0;
+@@ -67,9 +67,10 @@ __global__ void requant_q4_kernel(const std::uint8_t* __restrict__ q4, const __h
+         dst[b] = static_cast<std::uint8_t>(byte);
+     }
+     if constexpr (Bits == 3) {
+-        for (int b = 0; b < 8; ++b) high[row * (sq::kHidden / 8) + group * 8 + b] = static_cast<std::uint8_t>(hbits >> (8 * b));
++        std::uint8_t* hdst = high + (Tiled ? sq::tiled_offset(row, group, 8) : row * (sq::kHidden / 8) + group * 8);
++        for (int b = 0; b < 8; ++b) hdst[b] = static_cast<std::uint8_t>(hbits >> (8 * b));
+     }
+-    scales[row * sq::kGroups + group] = __float2half_rn(s * 0.5f);
++    scales[Tiled ? sq::tiled_offset(row, group, 2) / 2 : row * sq::kGroups + group] = __float2half_rn(s * 0.5f);
+ }
+ 
+ // Exact Q4 score of one head row for one column, by a warp (FP32; lane l takes groups l, l + 32, l + 64).
+@@ -222,6 +223,15 @@ ProposalScreen& screen_state() {
+     return s;
+ }
+ 
++// research39 (NINFER_SCREEN_TILED=1): stage-tiled screen planes (screen_lowbit.cuh).
++bool screen_tiled() {
++    static const bool tiled = [] {
++        const char* e = std::getenv("NINFER_SCREEN_TILED");
++        return e != nullptr && std::atoi(e) != 0;
++    }();
++    return tiled;
++}
++
+ int requested_bits() {
+     static const int bits = [] {
+         const char* e = std::getenv("NINFER_PROPOSAL_SCREEN");
+@@ -240,12 +250,15 @@ bool screenable(const Weight& head) {
+ template <class S>
+ void run_screen(const ProposalScreen& s, const __nv_bfloat16* x, int ld, int n, cudaStream_t stream) {
+     static const bool configured = [] {
+-        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
++                                        S::kSmemBytes));
++        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         S::kSmemBytes));
+         return true;
+     }();
+     (void)configured;
+-    sq::screen_kernel<S><<<kCtas, S::kThreads, S::kSmemBytes, stream>>>(
++    const auto screen = screen_tiled() ? sq::screen_kernel<S, true> : sq::screen_kernel<S, false>;
++    screen<<<kCtas, S::kThreads, S::kSmemBytes, stream>>>(
+         x, ld, static_cast<const std::uint8_t*>(s.codes), static_cast<const std::uint8_t*>(s.high),
+         static_cast<const __half*>(s.scales), n, kRows, static_cast<std::uint64_t*>(s.keys));
+ }
+@@ -276,10 +289,12 @@ void proposal_screen_prepare(const Weight& head) {
+     const auto* q4  = static_cast<const std::uint8_t*>(head.qdata);
+     const auto* q4s = static_cast<const __half*>(head.scales);
+     if (bits == 3) {
+-        requant_q4_kernel<3><<<grid, 256>>>(q4, q4s, static_cast<std::uint8_t*>(s.codes),
++        (screen_tiled() ? requant_q4_kernel<3, true> : requant_q4_kernel<3, false>)<<<grid, 256>>>(
++            q4, q4s, static_cast<std::uint8_t*>(s.codes),
+                                             static_cast<std::uint8_t*>(s.high), static_cast<__half*>(s.scales), kRows);
+     } else {
+-        requant_q4_kernel<2><<<grid, 256>>>(q4, q4s, static_cast<std::uint8_t*>(s.codes),
++        (screen_tiled() ? requant_q4_kernel<2, true> : requant_q4_kernel<2, false>)<<<grid, 256>>>(
++            q4, q4s, static_cast<std::uint8_t*>(s.codes),
+                                             static_cast<std::uint8_t*>(s.high), static_cast<__half*>(s.scales), kRows);
+     }
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/src/ops/linear_topk/screen_head.cu b/src/ops/linear_topk/screen_head.cu
+index 51670dc..de30332 100644
+--- a/src/ops/linear_topk/screen_head.cu
++++ b/src/ops/linear_topk/screen_head.cu
+@@ -7,6 +7,7 @@
+ #include "ops/linear_topk/screen_lowbit.cuh"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <stdexcept>
+ 
+ namespace ninfer::ops {
+@@ -20,6 +21,15 @@ constexpr int kCtas      = kHeadRows / S3::kRows;
+ constexpr int kChunks    = (kCtas + sq::kChunkCtas - 1) / sq::kChunkCtas;
+ static_assert(kHeadRows % S3::kRows == 0 && kChunks * sq::kCandidates <= 1024);
+ 
++// research39 (NINFER_SCREEN_TILED=1): stage-tiled screen planes (screen_lowbit.cuh).
++bool screen_tiled() {
++    static const bool tiled = [] {
++        const char* e = std::getenv("NINFER_SCREEN_TILED");
++        return e != nullptr && std::atoi(e) != 0;
++    }();
++    return tiled;
++}
++
+ void require_head(const Weight& q8) {
+     if (q8.qtype != QType::Q8_G32_FP16 || q8.layout != QuantLayout::RowSplit || q8.n != kHeadRows ||
+         q8.k != sq::kHidden || q8.qdata == nullptr || q8.scales == nullptr) {
+@@ -42,7 +52,8 @@ LowBitScreenSizes lowbit_screen_sizes() {
+ void lowbit_screen_build(const Weight& q8, const LowBitScreen& screen, cudaStream_t stream) {
+     require_head(q8);
+     const std::int64_t threads = static_cast<std::int64_t>(kHeadRows) * sq::kGroups;
+-    sq::requant_kernel<3><<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
++    const auto requant = screen_tiled() ? sq::requant_kernel<3, true> : sq::requant_kernel<3, false>;
++    requant<<<static_cast<unsigned>((threads + 255) / 256), 256, 0, stream>>>(
+         static_cast<const std::int8_t*>(q8.qdata), static_cast<const __half*>(q8.scales),
+         static_cast<std::uint8_t*>(screen.codes), static_cast<std::uint8_t*>(screen.high),
+         static_cast<__half*>(screen.scales), kHeadRows);
+@@ -58,7 +69,9 @@ void lowbit_screen_verify(const Tensor& hidden, const Weight& q8, const LowBitSc
+         throw std::invalid_argument("low-bit screen verify: invalid tensors");
+     }
+     static const bool configured = [] {
+-        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S3>,
++        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S3, false>,
++                                        cudaFuncAttributeMaxDynamicSharedMemorySize, S3::kSmemBytes));
++        CUDA_CHECK(cudaFuncSetAttribute(sq::screen_kernel<S3, true>,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, S3::kSmemBytes));
+         return true;
+     }();
+@@ -69,7 +82,8 @@ void lowbit_screen_verify(const Tensor& hidden, const Weight& q8, const LowBitSc
+     for (int c0 = 0; c0 < columns; c0 += sq::kMaxColumns) {
+         const int n = std::min(sq::kMaxColumns, columns - c0);
+         const auto* x = static_cast<const __nv_bfloat16*>(hidden.data) + static_cast<std::int64_t>(c0) * ld;
+-        sq::screen_kernel<S3><<<kCtas, S3::kThreads, S3::kSmemBytes, stream>>>(
++        const auto screen_fn = screen_tiled() ? sq::screen_kernel<S3, true> : sq::screen_kernel<S3, false>;
++        screen_fn<<<kCtas, S3::kThreads, S3::kSmemBytes, stream>>>(
+             x, ld, static_cast<const std::uint8_t*>(screen.codes),
+             static_cast<const std::uint8_t*>(screen.high), static_cast<const __half*>(screen.scales), n,
+             kValidRows, keys);
+diff --git a/src/ops/linear_topk/screen_lowbit.cuh b/src/ops/linear_topk/screen_lowbit.cuh
+index 8ba09a0..9d32354 100644
+--- a/src/ops/linear_topk/screen_lowbit.cuh
++++ b/src/ops/linear_topk/screen_lowbit.cuh
+@@ -29,6 +29,19 @@ constexpr int kPerCta     = 8;    // rows kept per CTA and column
+ constexpr int kChunkCtas  = 128;  // CTAs per stage-2 chunk (1024 keys)
+ constexpr int kCandidates = 32;
+ constexpr int kMaxColumns = 16;
++// research39 (NINFER_SCREEN_TILED=1): stage-tiled planes. The codes, high bits and scales of one screen CTA's 64 rows
++// and one pipeline stage (8 groups) are contiguous in each plane, so a stage is three contiguous reads instead of 64
++// row segments per plane. Same values, same shared-memory tiles, same arithmetic.
++constexpr int kTileRows   = 64;
++constexpr int kTileGroups = 8;
++
++// Byte offset of (row, group) in a stage-tiled plane with `bytes` bytes per group.
++__device__ __forceinline__ std::int64_t tiled_offset(std::int64_t row, int group, int bytes) {
++    const std::int64_t block = row / kTileRows;
++    const int r = static_cast<int>(row - block * kTileRows);
++    const int stage = group / kTileGroups, c = group - stage * kTileGroups;
++    return ((block * (kGroups / kTileGroups) + stage) * kTileRows + r) * (bytes * kTileGroups) + c * bytes;
++}
+ 
+ template <int Bits, int RowTiles, int Warps, int GroupsPerStage, int Stages>
+ struct Schedule {
+@@ -57,7 +70,7 @@ __device__ __forceinline__ unsigned decode_pair(unsigned bits) {
+     return *reinterpret_cast<const unsigned*>(&v);
+ }
+ 
+-template <class S>
++template <class S, bool Tiled = false>
+ __global__ void __launch_bounds__(S::kThreads) screen_kernel(const __nv_bfloat16* __restrict__ x, int x_ld,
+                                                              const std::uint8_t* __restrict__ codes,
+                                                              const std::uint8_t* __restrict__ high,
+@@ -65,6 +78,7 @@ __global__ void __launch_bounds__(S::kThreads) screen_kernel(const __nv_bfloat16
+                                                              int valid_rows, std::uint64_t* __restrict__ keys) {
+     constexpr int R = S::kRowTiles, kRows = S::kRows, J = S::kG / S::kWarps;
+     constexpr int kPipe = kGroups / S::kG;
++    static_assert(!Tiled || (kRows == kTileRows && S::kG == kTileGroups));
+     extern __shared__ __align__(16) std::uint8_t smem[];
+     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, q = lane & 3, gid = lane >> 2;
+     const int block = blockIdx.x;
+@@ -81,6 +95,30 @@ __global__ void __launch_bounds__(S::kThreads) screen_kernel(const __nv_bfloat16
+         std::uint8_t* hdst = cdst + kRows * S::kCodeStride;
+         std::uint8_t* sdst = hdst + kRows * S::kHighStride;
+         const int g0 = stage * S::kG;
++        if constexpr (Tiled) {
++            const std::int64_t t = static_cast<std::int64_t>(block) * kPipe + stage;
++            const std::uint8_t* csrc = codes + t * (kRows * 16 * S::kG);
++            const std::uint8_t* hsrc = high + t * (kRows * 8 * S::kG);
++            const std::uint8_t* ssrc = reinterpret_cast<const std::uint8_t*>(scales) + t * (kRows * 2 * S::kG);
++            for (int i = tid; i < kRows * S::kG; i += S::kThreads) {
++                const int row = i / S::kG, c = i % S::kG;
++                fill16(cdst + row * S::kCodeStride + 16 * c, csrc + 16 * i);
++            }
++            if constexpr (S::kBits == 3) {
++                constexpr int kChunks = S::kG / 2;
++                for (int i = tid; i < kRows * kChunks; i += S::kThreads) {
++                    const int row = i / kChunks, c = i % kChunks;
++                    fill16(hdst + row * S::kHighStride + 16 * c, hsrc + 16 * i);
++                }
++            }
++            constexpr int kChunks = 2 * S::kG / 16;
++            static_assert(2 * S::kG % 16 == 0);
++            for (int i = tid; i < kRows * kChunks; i += S::kThreads) {
++                const int row = i / kChunks, c = i % kChunks;
++                fill16(sdst + row * S::kScaleStride + 16 * c, ssrc + 16 * i);
++            }
++            return;
++        }
+         for (int i = tid; i < kRows * S::kG; i += S::kThreads) {
+             const int row = i / S::kG, c = i % S::kG;
+             fill16(cdst + row * S::kCodeStride + 16 * c, codes + (row0 + row) * kRowBytes + (g0 + c) * 16);
+@@ -324,7 +362,7 @@ static __global__ void __launch_bounds__(1024) final_kernel(const std::uint64_t*
+ }
+ 
+ // Q8 G32 head -> half-offset G64 screen: one thread per (row, 64-group).
+-template <int Bits>
++template <int Bits, bool Tiled = false>
+ __global__ void requant_kernel(const std::int8_t* __restrict__ q8_codes, const __half* __restrict__ q8_scales,
+                                std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ high,
+                                __half* __restrict__ scales, std::int64_t rows) {
+@@ -341,7 +379,7 @@ __global__ void requant_kernel(const std::int8_t* __restrict__ q8_codes, const _
+     __half sh = __float2half_rn(absmax / (n - 0.5f));
+     if (__half2float(sh) == 0.0f && absmax > 0.0f) sh = __ushort_as_half(1);
+     const float s = __half2float(sh), inv = s > 0.0f ? 1.0f / s : 0.0f;
+-    std::uint8_t* dst = codes + row * kRowBytes + group * 16;
++    std::uint8_t* dst = codes + (Tiled ? tiled_offset(row, group, 16) : row * kRowBytes + group * 16);
+     unsigned long long hbits = 0;
+     for (int b = 0; b < 16; ++b) {
+         unsigned byte = 0;
+@@ -355,9 +393,10 @@ __global__ void requant_kernel(const std::int8_t* __restrict__ q8_codes, const _
+         dst[b] = static_cast<std::uint8_t>(byte);
+     }
+     if constexpr (Bits == 3) {
+-        for (int b = 0; b < 8; ++b) high[row * (kHidden / 8) + group * 8 + b] = static_cast<std::uint8_t>(hbits >> (8 * b));
++        std::uint8_t* hdst = high + (Tiled ? tiled_offset(row, group, 8) : row * (kHidden / 8) + group * 8);
++        for (int b = 0; b < 8; ++b) hdst[b] = static_cast<std::uint8_t>(hbits >> (8 * b));
+     }
+-    scales[row * kGroups + group] = __float2half_rn(s * 0.5f);
++    scales[Tiled ? tiled_offset(row, group, 2) / 2 : row * kGroups + group] = __float2half_rn(s * 0.5f);
+ }
+ 
+ } // namespace ninfer::ops::detail::screen_q2
+-- 
+2.34.1
+

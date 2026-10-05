@@ -1,0 +1,1339 @@
+From 9c870599b7784c8540fcba41017fd4eadb464895 Mon Sep 17 00:00:00 2001
+From: qwen38-4090 <noreply@localhost>
+Date: Tue, 6 Oct 2026 02:43:40 +0800
+Subject: [PATCH 50/51] research38/38b/38c: row-split and row-pair K8V4 verify
+ attention (NINFER_ATTN_ROWSPLIT=1|2|3)
+
+The 16-column INT8-V verify tree of one row runs a row-split kernel (1 or 2 row tiles per CTA) or, with 3, a
+row-pair kernel (one 16-row tile per CTA, eight warps scoring the split's key tiles in pairs). The new columns are
+appended first by a 16-block kernel. Split partials are bit-identical, so the K8V4 reduce is unchanged. The next
+GEMM's L2 fill (NINFER_L2_FILL bit 64) runs in grid z-slices past the slots.
+
+Spec-Bench-480 unforced ids 482/482 identical; with research39, forced ms/round -0.72% / -0.58% (job 118b).
+---
+ .../dense/causal_cache/small_t_k8v4.cu        |   87 ++
+ .../causal_cache/small_t_k8v4_rowsplit.cuh    | 1196 +++++++++++++++++
+ 2 files changed, 1283 insertions(+)
+ create mode 100644 src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh
+
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+index c200664..b2fde26 100644
+--- a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4.cu
+@@ -8,10 +8,13 @@
+ #include "core/paged_kv_storage.h"
+ #include "ops/common/math.h"
+ #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
++#include "ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh"
+ #include "ninfer/ops/l2_fill.h"
+ #include "ninfer/ops/fused_tail.h"
+ 
++#include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
+ #include <stdexcept>
+ #include <tuple>
+ #include <type_traits>
+@@ -19,6 +22,30 @@
+ namespace ninfer::ops::detail {
+ namespace {
+ 
++// research38 (NINFER_ATTN_ROWSPLIT=1|2|3): the 16-column INT8-V verify tree of a single row runs the row-split
++// kernel with 1 or 2 row tiles per CTA, or (3) the row-pair kernel with one row tile and eight warps per CTA
++// (small_t_k8v4_rowsplit.cuh); the new columns are appended first by a 16-block kernel. Bit-identical split
++// partials, so the K8V4 reduce is unchanged.
++int k8v4_rowsplit_mode() {
++    static const int mode = [] {
++        const char* value = std::getenv("NINFER_ATTN_ROWSPLIT");
++        const int m       = value == nullptr ? 0 : std::atoi(value);
++        return m >= 1 && m <= 3 ? m : 0;
++    }();
++    return mode;
++}
++
++int k8v4_rowsplit_sms() {
++    static const int count = [] {
++        int device = 0;
++        int sms    = 0;
++        CUDA_CHECK(cudaGetDevice(&device));
++        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
++        return sms;
++    }();
++    return count;
++}
++
+ template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree, bool VInt8,
+           typename CacheInput>
+ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
+@@ -66,6 +93,66 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
+         CUDA_CHECK(cudaGetLastError());
+     };
+ 
++    if constexpr (RowTiles > 3 && TokenTile == 16 && Tree && VInt8 && !MultiBatch &&
++                  Geometry::QHeads == 24) {
++        if (const int mode = k8v4_rowsplit_mode(); mode != 0) {
++            // research38c: the next GEMM's L2 fill runs in grid z-slices past the slots (8 lines per thread).
++            const ops::L2Fill fill = ops::l2_fill_take();
++            const std::uint32_t fill_lines = fill.range[0].lines + fill.range[1].lines + fill.range[2].lines;
++            const auto fill_slices_for = [&](int threads, int ctas_per_slice) {
++                const std::uint32_t per = 8u * static_cast<std::uint32_t>(threads * ctas_per_slice);
++                return static_cast<std::int32_t>((fill_lines + per - 1) / per);
++            };
++            if constexpr (CacheInput::writes_cache) {
++                causal_attention_small_t_k8v4_prepare_append_kernel<Geometry, TokenTile, false, Masked, CacheInput>
++                    <<<(TokenTile * Geometry::KVHeads + 3) / 4, 128, 0, stream>>>(
++                        q_ptr, invocation.full_width, invocation.column_begin, invocation.batch_size, nullptr,
++                        nullptr, 0, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
++                        tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], logical_capacity);
++                CUDA_CHECK(cudaGetLastError());
++            }
++            const auto run = [&]<int RT>() {
++                using RS    = K8V4RowSplitSchedule<Geometry, TokenTile, RT>;
++                auto kernel = causal_attention_small_t_k8v4_rowsplit_kernel<Geometry, TokenTile, RT, false,
++                                                                            Masked, true>;
++                static const cudaError_t attr = cudaFuncSetAttribute(
++                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, RS::DynamicBytes);
++                CUDA_CHECK(attr);
++                // One resident wave at two CTAs per SM.
++                const int slots =
++                    std::max(1, 2 * k8v4_rowsplit_sms() / (Geometry::KVHeads * RS::RowGroups));
++                const std::int32_t fill_slices = fill_slices_for(RS::Threads, Geometry::KVHeads * RS::RowGroups);
++                kernel<<<dim3(Geometry::KVHeads, RS::RowGroups, slots + fill_slices), RS::Threads,
++                         RS::DynamicBytes, stream>>>(q_ptr, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr,
++                                                     v_scale_ptr, tables_ptr, valid_ptr, masks_ptr, rows_ptr,
++                                                     cache.block_tables.ne[0], invocation.full_width,
++                                                     invocation.column_begin, logical_capacity, splits, slots, scale,
++                                                     partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_slices);
++                CUDA_CHECK(cudaGetLastError());
++            };
++            if (mode == 3) {
++                using RP    = K8V4RowPairSchedule;
++                auto kernel = causal_attention_small_t_k8v4_rowpair_kernel<Geometry, TokenTile, false, Masked, true>;
++                static const cudaError_t attr =
++                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, RP::DynamicBytes);
++                CUDA_CHECK(attr);
++                constexpr int RowGroups = TokenTile * Geometry::GroupSize / 16;
++                const int slots         = std::max(1, 2 * k8v4_rowsplit_sms() / (Geometry::KVHeads * RowGroups));
++                const std::int32_t fill_slices = fill_slices_for(RP::Threads, Geometry::KVHeads * RowGroups);
++                kernel<<<dim3(Geometry::KVHeads, RowGroups, slots + fill_slices), RP::Threads, RP::DynamicBytes,
++                         stream>>>(q_ptr, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
++                                   tables_ptr, valid_ptr, masks_ptr, rows_ptr, cache.block_tables.ne[0],
++                                   invocation.full_width, invocation.column_begin, logical_capacity, splits, slots,
++                                   scale, partial_acc_ptr, partial_m_ptr, partial_l_ptr, fill, fill_slices);
++                CUDA_CHECK(cudaGetLastError());
++            } else if (mode == 1) {
++                run.template operator()<1>();
++            } else {
++                run.template operator()<2>();
++            }
++            return;
++        }
++    }
+     if constexpr (RowTiles > 3) {
+         // A complete wide verify block: compute warps own whole 16-row tiles for the split. The
+         // block's query tile is rotated and quantized once here instead of in every split CTA.
+diff --git a/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh
+new file mode 100644
+index 0000000..b221157
+--- /dev/null
++++ b/src/ops/softmax_attention/dense/causal_cache/small_t_k8v4_rowsplit.cuh
+@@ -0,0 +1,1196 @@
++// research38 (NINFER_ATTN_ROWSPLIT): row-split and row-pair K8V4 verify attention for short contexts.
++// See NOTICE and upstream-provenance.json for upstream attribution.
++
++#pragma once
++
++// The wide kernel gives one CTA the 96 query rows of a KV head and one key split, so a verify
++// block at a few hundred keys runs on 16-60 SMs and each CTA spends ~1.3 us of Tensor Core time
++// per 32-key tile. Here a CTA owns RT 16-row tiles of one (KV head, split) and four warps share
++// each row tile: warp q scores keys 8q..8q+7 of a tile (QK over all 256 dimensions) and
++// multiplies P by value dimensions 64q..64q+63 (INT8 group q), so the Tensor Core work of a split
++// spreads over 6/RT CTAs. Every per-row operation and every reduction order of the wide kernel is
++// kept (row maxima are exact; the row sum of P is formed per lane in key order and then summed
++// over the quad as warp_sum<4> does; PV runs the same two chained FP16-accumulated MMAs per 32
++// keys), so the split numerators and statistics are bit-identical and the K8V4 reduce is reused.
++//
++// The new columns are appended to the cache by the prepare kernel, before any CTA reads a tile.
++//
++// Value fragments come straight from the INT8 tile: the MMA for value tile j of quarter q maps
++// B column n to dimension 64q + 8n + j, so a lane's eight values of one key are eight contiguous
++// bytes; the accumulator column 2*lid (+1) of tile j is then dimension 64q + 16*lid + j (+8).
++// Key rows of a quarter are stored in the order k ^ ((k >> 1) & 1), which puts the four even
++// (odd) keys a load instruction reads on alternating 64-byte bank halves.
++
++#include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
++
++#ifndef K8V4_ROWSPLIT_STAMP
++#define K8V4_ROWSPLIT_STAMP(i)
++#endif
++
++namespace ninfer::ops {
++
++template <typename Geometry, int TokenTile, int RT>
++struct K8V4RowSplitSchedule {
++    static constexpr int RowCount = TokenTile * Geometry::GroupSize;
++    static constexpr int RowTiles = RowCount / 16;
++    static_assert(RowCount % 16 == 0 && RowTiles % RT == 0);
++    static constexpr int RowGroups    = RowTiles / RT;
++    static constexpr int Warps        = 4 * RT;
++    static constexpr int Threads      = 32 * Warps;
++    static constexpr int Bc           = 32;
++    static constexpr int Stages       = 2;
++    static constexpr int KBytes       = Bc * kCausalHeadDim;
++    static constexpr int VBytes       = Bc * kKVCacheInt8HeadDim;
++    static constexpr int QuarterBytes = Bc * kKVCacheInt8Group;
++    static constexpr int KScaleBytes  = Bc * static_cast<int>(sizeof(__half));
++    static constexpr int VScaleBytes  = Bc * kKVCacheInt8Groups * static_cast<int>(sizeof(__half));
++    static constexpr int StageBytes   = KBytes + VBytes + KScaleBytes + VScaleBytes;
++    static constexpr int QBytes       = RT * 16 * kCausalHeadDim;
++    static constexpr int DynamicBytes = Stages * StageBytes + QBytes;
++    static_assert(StageBytes % 16 == 0);
++};
++
++__device__ __forceinline__ int k8v4_rowsplit_vrow(int key) { return key ^ ((key >> 1) & 1); }
++
++// FP16 bits of two INT8 codes (byte `byte` of words a and b, already XORed with 0x80) as
++// 1024 + u, the exact form k8v4_value_i8x8_to_f16x8 widens.
++__device__ __forceinline__ unsigned k8v4_rowsplit_pair_bits(unsigned a, unsigned b, int byte) {
++    const unsigned selector = static_cast<unsigned>(byte) | (static_cast<unsigned>(byte + 4) << 8);
++    return (__byte_perm(a, b, selector) & 0x00FF00FFU) | 0x64006400U;
++}
++
++// Appends the block's new K/V columns (when CacheInput writes the cache) and prepares the query
++// tile, one warp per row. Blocks [0, prepare_blocks) prepare query rows exactly as
++// causal_attention_small_t_k8v4_prepare_query_kernel; the rest append one (token, KV head) per
++// warp with the wide kernel's append rule: tokens below valid_tokens whose position lies in
++// [0, positions[TokenTile - 1]] of a block that the wide kernel would not write neutral.
++template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
++__launch_bounds__(128) __global__ void causal_attention_small_t_k8v4_prepare_append_kernel(
++    const __nv_bfloat16* q, std::int32_t full_width, std::int32_t column_begin,
++    std::int32_t batch_size, std::uint8_t* codes, float* scales, std::int32_t prepare_blocks,
++    CacheInput input, const std::int32_t* positions, std::uint8_t* cache_k, std::uint8_t* cache_v,
++    __half* cache_k_scale, std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
++    const std::int32_t* valid_columns, const std::int32_t* table_rows, std::int32_t table_stride,
++    std::int32_t logical_capacity) {
++    constexpr int RowCount = TokenTile * Geometry::GroupSize;
++    constexpr int D        = kCausalHeadDim;
++    const int lane         = static_cast<int>(threadIdx.x) & 31;
++    if (static_cast<int>(blockIdx.x) < prepare_blocks) {
++        const int flat_row = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x) / 32;
++        const int row      = flat_row % RowCount;
++        const int kv_head  = flat_row / RowCount % Geometry::KVHeads;
++        const int batch    = flat_row / (RowCount * Geometry::KVHeads);
++        if (batch >= batch_size) return;
++        std::int64_t column_base = column_begin;
++        if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
++        int q_head = 0;
++        int token  = 0;
++        causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
++        float values[8];
++        k8v4_load_query_row(q + static_cast<std::int64_t>(D) * Geometry::QHeads * column_base +
++                                causal_q_index<Geometry>(q_head, 0, token),
++                            lane, values);
++        std::uint8_t row_codes[8];
++        const float qs          = k8v4_quantize_query_row(values, lane, row_codes);
++        const std::int64_t base = k8v4_prepared_row<Geometry>(batch, kv_head, row, RowCount);
++#pragma unroll
++        for (int r = 0; r < 8; ++r) codes[base * D + lane + 32 * r] = row_codes[r];
++        if (lane == 0) scales[base] = qs;
++        return;
++    }
++    if constexpr (CacheInput::writes_cache) {
++        constexpr unsigned FullMask = 0xffffffffU;
++        const int flat =
++            (static_cast<int>(blockIdx.x) - prepare_blocks) * 4 + static_cast<int>(threadIdx.x) / 32;
++        const int kv_head = flat % Geometry::KVHeads;
++        const int token   = flat / Geometry::KVHeads % TokenTile;
++        const int batch   = flat / (Geometry::KVHeads * TokenTile);
++        if (batch >= batch_size) return;
++        std::int64_t column_base = column_begin;
++        if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
++        // The new rows are loaded first: they do not depend on the position or page lookups.
++        input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
++        input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
++        float values[8];
++        float v_values[8];
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const int d = lane + 32 * r;
++            values[r] = __bfloat162float(input.k[kv_cache_fp8_src_index<Geometry>(kv_head, d, token)]);
++            v_values[r] =
++                __bfloat162float(input.v[kv_cache_nvfp4_src_index<Geometry>(kv_head, d, token)]);
++        }
++        int valid_tokens = TokenTile;
++        if constexpr (Masked) {
++            const int remaining = valid_columns[batch] - column_begin;
++            valid_tokens        = remaining <= 0 ? 0 : min(remaining, TokenTile);
++        }
++        positions += column_base;
++        const std::int32_t first_pos = positions[0];
++        const std::int32_t last_pos  = positions[TokenTile - 1];
++        const int position           = positions[token];
++        const int table_row          = table_rows == nullptr ? 0 : table_rows[batch];
++        if (token >= valid_tokens) return;
++        if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
++        if (position < 0 || position > last_pos) return;
++        const int physical_page =
++            block_tables[static_cast<std::int64_t>(table_row) * table_stride +
++                         (position >> kPagedKVPageShift)];
++        const int page_offset = position & kPagedKVPageMask;
++        float local_absmax = 0.0F;
++        normalized_hadamard_d256_inplace(values, lane);
++#pragma unroll
++        for (float value : values) local_absmax = fmaxf(local_absmax, fabsf(value));
++        const auto k_quant = kv_cache_fp8_quant_params(warp_max(local_absmax, FullMask));
++#pragma unroll
++        for (int r = 0; r < 8; ++r) {
++            const int d = lane + 32 * r;
++            cache_k[kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, d, page_offset)] =
++                kv_cache_fp8_quant_code(values[r], k_quant.inverse_scale);
++        }
++        if (lane == 0) {
++            cache_k_scale[kv_cache_fp8_scale_index<Geometry>(physical_page, kv_head, page_offset)] =
++                k_quant.scale;
++        }
++#pragma unroll
++        for (int r = 0; r < 8; ++r) values[r] = v_values[r];
++        normalized_hadamard_d256_inplace(values, lane);
++        k8v4_value_store_int8_row<Geometry>(values, lane, cache_v, cache_v_scale, physical_page,
++                                            kv_head, page_offset);
++    }
++}
++
++
++// Grid (KVHeads, RowGroups, slots * batch): slot z of a (KV head, row group) takes the contiguous
++// splits [z * c, z * c + c) of the window's active splits, c = ceil(active / slots), as one stream
++// of key tiles; each split's statistics and numerator are written when its last tile is done.
++// The launch sizes slots so the grid is one resident wave, so no CTA waits behind idle ones.
++template <typename Geometry, int TokenTile, int RT, bool MultiBatch, bool Masked, bool Tree>
++__launch_bounds__(K8V4RowSplitSchedule<Geometry, TokenTile, RT>::Threads, RT <= 2 ? 2 : 1) __global__
++    void causal_attention_small_t_k8v4_rowsplit_kernel(
++        const __nv_bfloat16* q, const std::int32_t* positions,
++        const std::uint8_t* cache_k, const std::uint8_t* cache_v, const __half* cache_k_scale,
++        const std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
++        const std::int32_t* valid_columns, const std::int32_t* tree_masks,
++        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
++        std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t split_count,
++        std::int32_t slots, float attention_scale, float* partial_acc, float* partial_m,
++        float* partial_l, ops::L2Fill fill = {}, std::int32_t fill_slices = 0) {
++    using S                     = K8V4RowSplitSchedule<Geometry, TokenTile, RT>;
++    constexpr int RowCount      = S::RowCount;
++    constexpr int Threads       = S::Threads;
++    constexpr int Bc            = S::Bc;
++    constexpr int D             = kCausalHeadDim;
++    constexpr int DB16          = D / 2;
++    constexpr int QKKs          = D / 32;
++    constexpr float Log2E       = 1.4426950408889634074F;
++    constexpr unsigned FullMask = 0xffffffffU;
++    using VC                    = K8V4Value<true>;
++
++    extern __shared__ __align__(16) std::uint8_t arena[];
++    __shared__ float q_scale_s[RT * 16];
++    __shared__ float bmax_s[RT][4][16];
++    __shared__ unsigned pbuf_s[RT][2][4][32];
++    __shared__ float2 tbuf_s[RT][4][32];
++    std::uint8_t* const q_s = arena + S::Stages * S::StageBytes;
++    const auto stage_k      = [&](int stage) { return arena + stage * S::StageBytes; };
++    const auto stage_v      = [&](int stage) { return stage_k(stage) + S::KBytes; };
++    const auto stage_ks     = [&](int stage) {
++        return reinterpret_cast<__half*>(stage_v(stage) + S::VBytes);
++    };
++    const auto stage_vs = [&](int stage) {
++        return reinterpret_cast<const __half*>(stage_v(stage) + S::VBytes + S::KScaleBytes);
++    };
++
++    const int kv_head  = static_cast<int>(blockIdx.x);
++    const int group    = static_cast<int>(blockIdx.y);
++    const int slot     = static_cast<int>(blockIdx.z) % slots;
++    const int batch    = MultiBatch ? static_cast<int>(blockIdx.z) / slots : 0;
++    const int tid      = static_cast<int>(threadIdx.x);
++    const int warp     = tid >> 5;
++    const int lane     = tid & 31;
++    const int rt       = warp >> 2;
++    const int quarter  = warp & 3;
++    const int gid      = lane >> 2;
++    const int lid      = lane & 3;
++    const int row0_cta = group * RT * 16;
++    const int row_base = row0_cta + rt * 16;
++
++    K8V4_ROWSPLIT_STAMP(0);
++    if (fill_slices > 0 && static_cast<int>(blockIdx.z) >= static_cast<int>(gridDim.z) - fill_slices) {
++        // research38c (NINFER_L2_FILL bit 64): z-slices past the slots warm the next GEMM's weights in L2, as
++        // the wide kernel's fill rows do: start after the attention CTAs' first requests, two lines in flight.
++        __nanosleep(1500);
++        const int fz          = static_cast<int>(blockIdx.z) - (static_cast<int>(gridDim.z) - fill_slices);
++        const std::uint32_t t = static_cast<std::uint32_t>(
++            ((fz * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y)) * static_cast<int>(gridDim.x) +
++             static_cast<int>(blockIdx.x)) * Threads + tid);
++        const std::uint32_t n =
++            static_cast<std::uint32_t>(fill_slices) * gridDim.x * gridDim.y * static_cast<std::uint32_t>(Threads);
++        std::uint32_t acc = 0U;
++#pragma unroll 1
++        for (int chunk = 0; chunk < 4; ++chunk) {
++            detail::L2FillLoads<2> l2_fill;
++            l2_fill.issue(fill, t + static_cast<std::uint32_t>(chunk) * 2U * n, n);
++            acc ^= l2_fill.v[0] ^ l2_fill.v[1];
++        }
++        if (fill.sink != nullptr) { *fill.sink = acc; }
++        return;
++    }
++    std::int64_t column_base = column_begin;
++    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
++    positions += column_base;
++    if constexpr (Tree) { tree_masks += column_base; }
++    if constexpr (MultiBatch) {
++        partial_acc +=
++            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * TokenTile * split_count;
++        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
++        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
++    }
++    const int row0 = row_base + gid;
++    const int row1 = row0 + 8;
++    int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
++    causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
++    causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
++
++    // Every load that depends on no other goes first: the block metadata, the first page ids of
++    // block-table row 0 (the table row is checked before they are used) and this warp's query rows.
++    __shared__ std::int32_t pages_s[32];
++    const int valid_raw          = Masked ? valid_columns[batch] : 0;
++    const std::int32_t first_pos = positions[0];
++    const std::int32_t last_pos  = positions[TokenTile - 1];
++    const int qabs0              = positions[token0];
++    const int qabs1              = positions[token1];
++    unsigned mask0 = 0U, mask1 = 0U;
++    if constexpr (Tree) {
++        mask0 = static_cast<unsigned>(tree_masks[token0]);
++        mask1 = static_cast<unsigned>(tree_masks[token1]);
++    }
++    const int table_row  = table_rows == nullptr ? 0 : table_rows[batch];
++    const int page_lines = min(32, table_stride);
++    const std::int32_t page_guess = tid < page_lines ? block_tables[tid] : 0;
++    constexpr int QRows = 16 * RT / S::Warps;
++    float qv[QRows][8];
++#pragma unroll
++    for (int i = 0; i < QRows; ++i) {
++        int q_head = 0, token = 0;
++        causal_small_t_tc_row_to_qt<Geometry>(row0_cta + warp + i * S::Warps, TokenTile, kv_head,
++                                              q_head, token);
++        k8v4_load_query_row(q + static_cast<std::int64_t>(D) * Geometry::QHeads * column_base +
++                                causal_q_index<Geometry>(q_head, 0, token),
++                            lane, qv[i]);
++    }
++
++    int valid_tokens = TokenTile;
++    if constexpr (Masked) {
++        const int remaining = valid_raw - column_begin;
++        valid_tokens        = remaining <= 0 ? 0 : min(remaining, TokenTile);
++    }
++    // The wide kernel's neutral split, for this CTA's rows.
++    const auto write_neutral = [&](int split) {
++        for (int r = tid; r < RT * 16; r += Threads) {
++            int q_head = 0, token = 0;
++            causal_small_t_tc_row_to_qt<Geometry>(row0_cta + r, TokenTile, kv_head, q_head, token);
++            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
++                -CUDART_INF_F;
++            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = 0.0F;
++        }
++        for (int index = tid; index < RT * 16 * D; index += Threads) {
++            const int r = index / D;
++            const int d = index - r * D;
++            int q_head = 0, token = 0;
++            causal_small_t_tc_row_to_qt<Geometry>(row0_cta + r, TokenTile, kv_head, q_head, token);
++            partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
++                0.0F;
++        }
++    };
++    // Where the wide kernel writes every split neutral, this CTA covers splits slot, slot + slots...
++    const auto write_all_neutral = [&]() {
++        for (int split = slot; split < split_count; split += slots) write_neutral(split);
++    };
++    if (valid_tokens == 0) {
++        write_all_neutral();
++        return;
++    }
++    if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) {
++        write_all_neutral();
++        return;
++    }
++    const int window = last_pos + 1;
++    const int active = causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
++    const int per_slot = div_up(active, slots);
++    const int s_begin  = slot * per_slot;
++    if (s_begin >= active) return;
++    const int s_end = min(s_begin + per_slot, active);
++    // Several splits per slot happen only when tiles outnumber splits; then every split before the
++    // last non-empty one has exactly `units` tiles, starting at its split_start.
++    const int units = div_up(div_up(window, Bc), active);
++    int total_tiles = 0;
++    for (int split = s_begin; split < s_end; ++split) {
++        const int blocks = k8v4_split_range<TokenTile, Bc>(window, split, active).key_blocks;
++        if (blocks == 0) write_neutral(split);
++        total_tiles += blocks;
++    }
++    if (total_tiles == 0) return;
++    K8V4_ROWSPLIT_STAMP(1);
++    const auto split_of = [&](int g) { return per_slot == 1 ? s_begin : s_begin + g / units; };
++    if (tid < page_lines) pages_s[tid] = page_guess;
++    __syncthreads();
++    K8V4_ROWSPLIT_STAMP(2);
++    const std::int32_t* block_table =
++        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
++    const auto page_of = [&](int page) {
++        return table_row == 0 && page < page_lines ? pages_s[page] : block_table[page];
++    };
++    // Copies tile g into stage g & 1. Codes of keys outside the tile's split are zero filled and so
++    // are their value scales, as the wide kernel's tiles; key scales come in whole (their scores
++    // are masked).
++    const auto issue = [&](int g) {
++        const int split            = split_of(g);
++        const K8V4SplitRange range = k8v4_split_range<TokenTile, Bc>(window, split, active);
++        const int stage            = g & 1;
++        const int k0               = range.first_tile + (g - (split - s_begin) * units) * Bc;
++        const int page             = page_of(k0 >> kPagedKVPageShift);
++        const int offset0          = k0 & kPagedKVPageMask;
++        std::uint8_t* const k      = stage_k(stage);
++        std::uint8_t* const v      = stage_v(stage);
++        const std::uint8_t* k_source =
++            cache_k + kv_cache_fp8_code_index<Geometry>(page, kv_head, 0, offset0);
++        const std::uint8_t* v_source =
++            cache_v + VC::template code_offset<Geometry>(page, kv_head, offset0);
++#pragma unroll
++        for (int i = 0; i < (Bc * 16 + Threads - 1) / Threads; ++i) {
++            const int chunk = tid + i * Threads;
++            if ((Bc * 16) % Threads == 0 || chunk < Bc * 16) {
++                const int key_l = chunk >> 4;
++                const int c     = chunk & 15;
++                const int key   = k0 + key_l;
++                const bool in   = key >= range.split_start && key < range.split_end;
++                cp_async_zfill<16, Cache::cg>(
++                    &k[(key_l * DB16 + causal_small_t_tc_swz(key_l, c * 8)) * 2],
++                    k_source + chunk * 16, in ? 16 : 0);
++                cp_async_zfill<16, Cache::cg>(
++                    v + (c >> 2) * S::QuarterBytes + k8v4_rowsplit_vrow(key_l) * kKVCacheInt8Group +
++                        (c & 3) * 16,
++                    v_source + chunk * 16, in ? 16 : 0);
++            }
++        }
++        if (tid < Bc / 8) {
++            cp_async<16>(stage_ks(stage) + tid * 8,
++                         cache_k_scale +
++                             kv_cache_fp8_scale_index<Geometry>(page, kv_head, offset0) + tid * 8);
++        }
++        for (int key_l = tid; key_l < Bc; key_l += Threads) {
++            const int key = k0 + key_l;
++            const bool in = key >= range.split_start && key < range.split_end;
++            cp_async_zfill<8>(
++                reinterpret_cast<std::uint8_t*>(const_cast<__half*>(stage_vs(stage))) +
++                    key_l * VC::kScaleBytes,
++                cache_v_scale + VC::template scale_offset<Geometry>(page, kv_head, offset0 + key_l),
++                in ? 8 : 0);
++        }
++    };
++    issue(0);
++    cp_commit();
++    if (total_tiles > 1) issue(1);
++    cp_commit();
++    K8V4_ROWSPLIT_STAMP(3);
++
++    // The query rows are rotated and quantized here while the tiles fly, as the prepare kernel
++    // would; the first loop barrier publishes them.
++#pragma unroll
++    for (int i = 0; i < QRows; ++i) {
++        const int r = warp + i * S::Warps;
++        std::uint8_t row_codes[8];
++        const float qs = k8v4_quantize_query_row(qv[i], lane, row_codes);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            causal_small_t_store_byte_swizzled(q_s, r, lane + 32 * j, D / 2, row_codes[j]);
++        }
++        if (lane == 0) q_scale_s[r] = qs;
++    }
++    int base0 = qabs0 + 1, base1 = qabs1 + 1;
++    if constexpr (Tree) {
++        base0 = first_pos;
++        base1 = first_pos;
++    }
++    K8V4_ROWSPLIT_STAMP(4);
++
++    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0F, l1 = 0.0F;
++    float acc[8][4];
++#pragma unroll
++    for (int j = 0; j < 8; ++j) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) acc[j][i] = 0.0F;
++    }
++    unsigned qf[QKKs][4];
++    float q_scale_r0 = 0.0F, q_scale_r1 = 0.0F;
++    const int b_rin  = lane & 7;
++    const int b_koff = ((lane >> 3) & 1) << 3;
++
++    for (int g = 0; g < total_tiles; ++g) {
++        if (g == 0) {
++            cp_wait<1>();
++        } else {
++            cp_wait<0>();
++        }
++        __syncthreads();
++        if (g == 0) { K8V4_ROWSPLIT_STAMP(5); }
++        const int stage            = g & 1;
++        const int split            = split_of(g);
++        const K8V4SplitRange range = k8v4_split_range<TokenTile, Bc>(window, split, active);
++        const int kb               = g - (split - s_begin) * units;
++        const int k0               = range.first_tile + kb * Bc;
++        if (g == 0) {
++            const auto* q_b16 = reinterpret_cast<const __nv_bfloat16*>(q_s);
++            const int a_mat   = lane >> 3;
++            const int a_row   = rt * 16 + (lane & 7) + ((a_mat & 1) << 3);
++            const int a_col   = (a_mat >> 1) << 3;
++#pragma unroll
++            for (int kk = 0; kk < QKKs; ++kk) {
++                ldmatrix_x4(qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3],
++                            smem_addr(&q_b16[a_row * DB16 +
++                                             causal_small_t_tc_swz(a_row, kk * 16 + a_col)]));
++            }
++            q_scale_r0 = q_scale_s[rt * 16 + gid];
++            q_scale_r1 = q_scale_s[rt * 16 + gid + 8];
++        }
++
++        // QK of this warp's 8 keys (score tile nt = quarter of the wide kernel).
++        float score[4] = {0.0F, 0.0F, 0.0F, 0.0F};
++        {
++            const auto* k_b16 = reinterpret_cast<const __nv_bfloat16*>(stage_k(stage));
++            const int brow    = quarter * 8 + b_rin;
++#pragma unroll
++            for (int kk = 0; kk < QKKs; ++kk) {
++                unsigned bf[2];
++                ldmatrix_x2(bf[0], bf[1],
++                            smem_addr(&k_b16[brow * DB16 +
++                                             causal_small_t_tc_swz(brow, kk * 16 + b_koff)]));
++                mma_fp8_e4m3(score[0], score[1], score[2], score[3], qf[kk][0], qf[kk][1],
++                             qf[kk][2], qf[kk][3], bf[0], bf[1]);
++            }
++        }
++        {
++            const __half* k_scale = stage_ks(stage);
++            const int keya        = quarter * 8 + 2 * lid;
++            const float ks0       = __half2float(k_scale[keya]);
++            const float ks1       = __half2float(k_scale[keya + 1]);
++            score[0] *= q_scale_r0 * ks0;
++            score[1] *= q_scale_r0 * ks1;
++            score[2] *= q_scale_r1 * ks0;
++            score[3] *= q_scale_r1 * ks1;
++            const int key0 = k0 + keya;
++            const int key1 = key0 + 1;
++            const bool in0 = key0 >= range.split_start && key0 < range.split_end;
++            const bool in1 = key1 >= range.split_start && key1 < range.split_end;
++            score[0] = in0 && k8v4_key_visible(key0, qabs0, base0, mask0)
++                           ? score[0] * attention_scale
++                           : -CUDART_INF_F;
++            score[1] = in1 && k8v4_key_visible(key1, qabs0, base0, mask0)
++                           ? score[1] * attention_scale
++                           : -CUDART_INF_F;
++            score[2] = in0 && k8v4_key_visible(key0, qabs1, base1, mask1)
++                           ? score[2] * attention_scale
++                           : -CUDART_INF_F;
++            score[3] = in1 && k8v4_key_visible(key1, qabs1, base1, mask1)
++                           ? score[3] * attention_scale
++                           : -CUDART_INF_F;
++        }
++        {
++            const float bm0 = warp_max<4>(fmaxf(score[0], score[1]), FullMask);
++            const float bm1 = warp_max<4>(fmaxf(score[2], score[3]), FullMask);
++            if (lid == 0) {
++                bmax_s[rt][quarter][gid]     = bm0;
++                bmax_s[rt][quarter][gid + 8] = bm1;
++            }
++        }
++        __syncthreads();
++        // Stage (g + 1) & 1 held tile g - 1, which every warp has finished.
++        if (g >= 1) {
++            if (g + 1 < total_tiles) issue(g + 1);
++            cp_commit();
++        }
++        const float nm0 = fmaxf(m0, fmaxf(fmaxf(bmax_s[rt][0][gid], bmax_s[rt][1][gid]),
++                                          fmaxf(bmax_s[rt][2][gid], bmax_s[rt][3][gid])));
++        const float nm1 =
++            fmaxf(m1, fmaxf(fmaxf(bmax_s[rt][0][gid + 8], bmax_s[rt][1][gid + 8]),
++                            fmaxf(bmax_s[rt][2][gid + 8], bmax_s[rt][3][gid + 8])));
++        const float alpha0 = m0 == -CUDART_INF_F ? 0.0F : exp2_approx((m0 - nm0) * Log2E);
++        const float alpha1 = m1 == -CUDART_INF_F ? 0.0F : exp2_approx((m1 - nm1) * Log2E);
++        score[0] = nm0 > -CUDART_INF_F && score[0] > -CUDART_INF_F
++                       ? exp2_approx((score[0] - nm0) * Log2E)
++                       : 0.0F;
++        score[1] = nm0 > -CUDART_INF_F && score[1] > -CUDART_INF_F
++                       ? exp2_approx((score[1] - nm0) * Log2E)
++                       : 0.0F;
++        score[2] = nm1 > -CUDART_INF_F && score[2] > -CUDART_INF_F
++                       ? exp2_approx((score[2] - nm1) * Log2E)
++                       : 0.0F;
++        score[3] = nm1 > -CUDART_INF_F && score[3] > -CUDART_INF_F
++                       ? exp2_approx((score[3] - nm1) * Log2E)
++                       : 0.0F;
++        tbuf_s[rt][quarter][lane] = make_float2(score[0] + score[1], score[2] + score[3]);
++        pbuf_s[rt][quarter >> 1][2 * (quarter & 1)][lane]     = k8v4_half2_bits(score[0], score[1]);
++        pbuf_s[rt][quarter >> 1][2 * (quarter & 1) + 1][lane] = k8v4_half2_bits(score[2], score[3]);
++        __syncthreads();
++        {
++            // The wide kernel's per-lane sum runs over its score tiles in key order.
++            const float2 t0 = tbuf_s[rt][0][lane];
++            const float2 t1 = tbuf_s[rt][1][lane];
++            const float2 t2 = tbuf_s[rt][2][lane];
++            const float2 t3 = tbuf_s[rt][3][lane];
++            float bl0       = 0.0F;
++            float bl1       = 0.0F;
++            bl0 += t0.x;
++            bl0 += t1.x;
++            bl0 += t2.x;
++            bl0 += t3.x;
++            bl1 += t0.y;
++            bl1 += t1.y;
++            bl1 += t2.y;
++            bl1 += t3.y;
++            bl0 = warp_sum<4>(bl0, FullMask);
++            bl1 = warp_sum<4>(bl1, FullMask);
++            l0  = __fmaf_rn(l0, alpha0, bl0);
++            l1  = __fmaf_rn(l1, alpha1, bl1);
++            m0  = nm0;
++            m1  = nm1;
++        }
++        unsigned pf[2][4];
++#pragma unroll
++        for (int k = 0; k < 2; ++k) {
++#pragma unroll
++            for (int j = 0; j < 4; ++j) pf[k][j] = pbuf_s[rt][k][j][lane];
++        }
++        if (__any_sync(FullMask, alpha0 != 1.0F || alpha1 != 1.0F)) {
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                acc[j][0] *= alpha0;
++                acc[j][1] *= alpha0;
++                acc[j][2] *= alpha1;
++                acc[j][3] *= alpha1;
++            }
++        }
++        // Value fragments of keys 16s + 8r + 2*lid (+1), dimensions 64q + 8*gid + j.
++        {
++            const std::uint8_t* vq = stage_v(stage) + quarter * S::QuarterBytes + gid * 8;
++            const __half* vs       = stage_vs(stage);
++            const __half half      = __float2half_rn(0.5F);
++            const __half2 bias     = __float2half2_rn(1152.0F);
++            uint2 raw[2][2][2];
++            __half2 scale2[2][2];
++#pragma unroll
++            for (int s = 0; s < 2; ++s) {
++#pragma unroll
++                for (int r = 0; r < 2; ++r) {
++                    const int key = 16 * s + 8 * r + 2 * lid;
++#pragma unroll
++                    for (int e = 0; e < 2; ++e) {
++                        raw[s][r][e] = load_vec<uint2>(
++                            vq + k8v4_rowsplit_vrow(key + e) * kKVCacheInt8Group);
++                        raw[s][r][e].x ^= 0x80808080U;
++                        raw[s][r][e].y ^= 0x80808080U;
++                    }
++                    scale2[s][r] =
++                        __halves2half2(__hmul(vs[key * kKVCacheInt8Groups + quarter], half),
++                                       __hmul(vs[(key + 1) * kKVCacheInt8Groups + quarter], half));
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++                unsigned vf[2][2];
++#pragma unroll
++                for (int s = 0; s < 2; ++s) {
++#pragma unroll
++                    for (int r = 0; r < 2; ++r) {
++                        const unsigned a    = j < 4 ? raw[s][r][0].x : raw[s][r][0].y;
++                        const unsigned b    = j < 4 ? raw[s][r][1].x : raw[s][r][1].y;
++                        const unsigned bits = k8v4_rowsplit_pair_bits(a, b, j & 3);
++                        const __half2 value =
++                            __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&bits), bias),
++                                    scale2[s][r]);
++                        vf[s][r] = *reinterpret_cast<const unsigned*>(&value);
++                    }
++                }
++                k8v4_pv_pair(acc[j], pf[0], pf[1], vf[0][0], vf[0][1], vf[1][0], vf[1][1]);
++            }
++        }
++
++        if (g == 0) { K8V4_ROWSPLIT_STAMP(6); }
++        if (kb + 1 == range.key_blocks) {
++            // The split is complete: statistics (identical in the four warps of a row tile) and
++            // the doubled numerators, then a fresh online softmax for the next split.
++            if (quarter == 0 && lid == 0) {
++                partial_m[causal_partial_stat_index<Geometry>(q_head0, token0, split, TokenTile)] = m0;
++                partial_l[causal_partial_stat_index<Geometry>(q_head0, token0, split, TokenTile)] = l0;
++                partial_m[causal_partial_stat_index<Geometry>(q_head1, token1, split, TokenTile)] = m1;
++                partial_l[causal_partial_stat_index<Geometry>(q_head1, token1, split, TokenTile)] = l1;
++            }
++            const int d0 = 64 * quarter + 16 * lid;
++            float* const out0 =
++                partial_acc + causal_partial_acc_index<Geometry>(q_head0, d0, token0, split, TokenTile);
++            float* const out1 =
++                partial_acc + causal_partial_acc_index<Geometry>(q_head1, d0, token1, split, TokenTile);
++#pragma unroll
++            for (int h = 0; h < 2; ++h) {
++#pragma unroll
++                for (int c = 0; c < 2; ++c) {
++                    // Dimensions d0 + 8h + 4c .. + 3 are accumulator column h of tiles 4c .. 4c + 3.
++                    store_vec(out0 + 8 * h + 4 * c,
++                              make_float4(2.0F * acc[4 * c][h], 2.0F * acc[4 * c + 1][h],
++                                          2.0F * acc[4 * c + 2][h], 2.0F * acc[4 * c + 3][h]));
++                    store_vec(out1 + 8 * h + 4 * c,
++                              make_float4(2.0F * acc[4 * c][2 + h], 2.0F * acc[4 * c + 1][2 + h],
++                                          2.0F * acc[4 * c + 2][2 + h], 2.0F * acc[4 * c + 3][2 + h]));
++                }
++            }
++            m0 = m1 = -CUDART_INF_F;
++            l0 = l1 = 0.0F;
++#pragma unroll
++            for (int j = 0; j < 8; ++j) {
++#pragma unroll
++                for (int i = 0; i < 4; ++i) acc[j][i] = 0.0F;
++            }
++        }
++    }
++    K8V4_ROWSPLIT_STAMP(7);
++}
++
++// ----------------------------------------------------------------------------------------------
++// research38b: one 16-row tile per CTA and eight warps that take the key tiles of a split in pairs.
++// Warp w scores keys 8(w & 3)..+7 of tile w >> 2 of the pair (QK over all 256 dimensions) and then
++// multiplies the P of both tiles, in key order, by value dimensions 32w..32w+31 (INT8 group w >> 1).
++// The online softmax of a pair runs exactly as two consecutive tiles of the wide kernel: tile B's
++// row maxima start from tile A's, the row sums are updated A then B, and the accumulator is
++// rescaled before each tile's PV product, so the split partials stay bit-identical.
++//
++// Value fragments: the MMA for slice tile j maps B column n to dimension 32w + 4n + j, so a lane's
++// four values of one key are one 32-bit word; the accumulator column 2*lid (+1) of tile j is then
++// dimension 32w + 8*lid + j (+4). A key row is 256 bytes with its 32-byte chunks rotated by
++// (key >> 1) & 3, so the four keys an instruction reads fall on four different bank octets.
++//
++// K and V of a tile are separate cp.async groups: the next pair's keys are requested once every
++// warp has scored, its values once every warp has finished PV.
++
++struct K8V4RowPairSchedule {
++    static constexpr int Warps        = 8;
++    static constexpr int Threads      = 32 * Warps;
++    static constexpr int Bc           = 32;
++    static constexpr int KBytes       = Bc * kCausalHeadDim;
++    static constexpr int VBytes       = Bc * kKVCacheInt8HeadDim;
++    static constexpr int KScaleBytes  = Bc * static_cast<int>(sizeof(__half));
++    static constexpr int VScaleBytes  = Bc * kKVCacheInt8Groups * static_cast<int>(sizeof(__half));
++    static constexpr int StageBytes   = KBytes + VBytes + KScaleBytes + VScaleBytes;
++    static constexpr int QBytes       = 16 * kCausalHeadDim;
++    static constexpr int DynamicBytes = 2 * StageBytes + QBytes;
++    static_assert(StageBytes % 16 == 0);
++};
++
++__device__ __forceinline__ int k8v4_rowpair_vchunk(int key, int chunk32) {
++    return chunk32 ^ ((key >> 1) & 3);
++}
++
++template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree>
++__launch_bounds__(K8V4RowPairSchedule::Threads, 2) __global__
++    void causal_attention_small_t_k8v4_rowpair_kernel(
++        const __nv_bfloat16* q, const std::int32_t* positions, const std::uint8_t* cache_k,
++        const std::uint8_t* cache_v, const __half* cache_k_scale, const std::uint8_t* cache_v_scale,
++        const std::int32_t* block_tables, const std::int32_t* valid_columns,
++        const std::int32_t* tree_masks, const std::int32_t* table_rows, std::int32_t table_stride,
++        std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
++        std::int32_t split_count, std::int32_t slots, float attention_scale, float* partial_acc,
++        float* partial_m, float* partial_l, ops::L2Fill fill = {}, std::int32_t fill_slices = 0) {
++    using S                     = K8V4RowPairSchedule;
++    constexpr int Threads       = S::Threads;
++    constexpr int Bc            = S::Bc;
++    constexpr int D             = kCausalHeadDim;
++    constexpr int DB16          = D / 2;
++    constexpr int QKKs          = D / 32;
++    constexpr float Log2E       = 1.4426950408889634074F;
++    constexpr unsigned FullMask = 0xffffffffU;
++    using VC                    = K8V4Value<true>;
++    static_assert(TokenTile * Geometry::GroupSize % 16 == 0);
++
++    extern __shared__ __align__(16) std::uint8_t arena[];
++    __shared__ float q_scale_s[16];
++    __shared__ float bmax_s[2][4][16];
++    __shared__ unsigned pbuf_s[2][2][4][32];
++    __shared__ float2 tbuf_s[2][4][32];
++    __shared__ std::int32_t pages_s[32];
++    std::uint8_t* const q_s = arena + 2 * S::StageBytes;
++    const auto stage_k      = [&](int stage) { return arena + stage * S::StageBytes; };
++    const auto stage_v      = [&](int stage) { return stage_k(stage) + S::KBytes; };
++    const auto stage_ks     = [&](int stage) {
++        return reinterpret_cast<__half*>(stage_v(stage) + S::VBytes);
++    };
++    const auto stage_vs = [&](int stage) { return stage_v(stage) + S::VBytes + S::KScaleBytes; };
++
++    const int kv_head  = static_cast<int>(blockIdx.x);
++    const int group    = static_cast<int>(blockIdx.y);
++    const int slot     = static_cast<int>(blockIdx.z) % slots;
++    const int batch    = MultiBatch ? static_cast<int>(blockIdx.z) / slots : 0;
++    const int tid      = static_cast<int>(threadIdx.x);
++    const int warp     = tid >> 5;
++    const int lane     = tid & 31;
++    const int tg       = warp >> 2;
++    const int quarter  = warp & 3;
++    const int gid      = lane >> 2;
++    const int lid      = lane & 3;
++    const int row_base = group * 16;
++    K8V4_ROWSPLIT_STAMP(0);
++    if (fill_slices > 0 && static_cast<int>(blockIdx.z) >= static_cast<int>(gridDim.z) - fill_slices) {
++        // research38c (NINFER_L2_FILL bit 64): z-slices past the slots warm the next GEMM's weights in L2, as
++        // the wide kernel's fill rows do: start after the attention CTAs' first requests, two lines in flight.
++        __nanosleep(1500);
++        const int fz          = static_cast<int>(blockIdx.z) - (static_cast<int>(gridDim.z) - fill_slices);
++        const std::uint32_t t = static_cast<std::uint32_t>(
++            ((fz * static_cast<int>(gridDim.y) + static_cast<int>(blockIdx.y)) * static_cast<int>(gridDim.x) +
++             static_cast<int>(blockIdx.x)) * Threads + tid);
++        const std::uint32_t n =
++            static_cast<std::uint32_t>(fill_slices) * gridDim.x * gridDim.y * static_cast<std::uint32_t>(Threads);
++        std::uint32_t acc = 0U;
++#pragma unroll 1
++        for (int chunk = 0; chunk < 4; ++chunk) {
++            detail::L2FillLoads<2> l2_fill;
++            l2_fill.issue(fill, t + static_cast<std::uint32_t>(chunk) * 2U * n, n);
++            acc ^= l2_fill.v[0] ^ l2_fill.v[1];
++        }
++        if (fill.sink != nullptr) { *fill.sink = acc; }
++        return;
++    }
++
++    std::int64_t column_base = column_begin;
++    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
++    positions += column_base;
++    if constexpr (Tree) { tree_masks += column_base; }
++    if constexpr (MultiBatch) {
++        partial_acc +=
++            static_cast<std::int64_t>(batch) * D * Geometry::QHeads * TokenTile * split_count;
++        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
++        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
++    }
++    const int row0 = row_base + gid;
++    const int row1 = row0 + 8;
++    int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
++    causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
++    causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
++
++    // Every load that depends on no other goes first.
++    const int valid_raw          = Masked ? valid_columns[batch] : 0;
++    const std::int32_t first_pos = positions[0];
++    const std::int32_t last_pos  = positions[TokenTile - 1];
++    const int qabs0              = positions[token0];
++    const int qabs1              = positions[token1];
++    unsigned mask0 = 0U, mask1 = 0U;
++    if constexpr (Tree) {
++        mask0 = static_cast<unsigned>(tree_masks[token0]);
++        mask1 = static_cast<unsigned>(tree_masks[token1]);
++    }
++    const int table_row           = table_rows == nullptr ? 0 : table_rows[batch];
++    const int page_lines          = min(32, table_stride);
++    const std::int32_t page_guess = tid < page_lines ? block_tables[tid] : 0;
++    float qv[2][8];
++#pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        int q_head = 0, token = 0;
++        causal_small_t_tc_row_to_qt<Geometry>(row_base + warp + 8 * i, TokenTile, kv_head, q_head,
++                                              token);
++        k8v4_load_query_row(q + static_cast<std::int64_t>(D) * Geometry::QHeads * column_base +
++                                causal_q_index<Geometry>(q_head, 0, token),
++                            lane, qv[i]);
++    }
++
++    int valid_tokens = TokenTile;
++    if constexpr (Masked) {
++        const int remaining = valid_raw - column_begin;
++        valid_tokens        = remaining <= 0 ? 0 : min(remaining, TokenTile);
++    }
++    const auto write_neutral = [&](int split) {
++        if (tid < 16) {
++            int q_head = 0, token = 0;
++            causal_small_t_tc_row_to_qt<Geometry>(row_base + tid, TokenTile, kv_head, q_head, token);
++            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] =
++                -CUDART_INF_F;
++            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = 0.0F;
++        }
++        for (int index = tid; index < 16 * D; index += Threads) {
++            const int r = index / D;
++            const int d = index - r * D;
++            int q_head = 0, token = 0;
++            causal_small_t_tc_row_to_qt<Geometry>(row_base + r, TokenTile, kv_head, q_head, token);
++            partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, TokenTile)] =
++                0.0F;
++        }
++    };
++    if (valid_tokens == 0 || first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) {
++        for (int split = slot; split < split_count; split += slots) write_neutral(split);
++        return;
++    }
++    const int window   = last_pos + 1;
++    const int active   = causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
++    const int per_slot = div_up(active, slots);
++    const int s_begin  = slot * per_slot;
++    if (s_begin >= active) return;
++    const int s_end = min(s_begin + per_slot, active);
++    // Several splits per slot happen only when tiles outnumber splits; then every split before the
++    // last non-empty one has exactly `units` tiles, starting at its split_start.
++    const int units = div_up(div_up(window, Bc), active);
++    int total_tiles = 0;
++    for (int split = s_begin; split < s_end; ++split) {
++        const int blocks = k8v4_split_range<TokenTile, Bc>(window, split, active).key_blocks;
++        if (blocks == 0) write_neutral(split);
++        total_tiles += blocks;
++    }
++    if (total_tiles == 0) return;
++    K8V4_ROWSPLIT_STAMP(1);
++    if (tid < page_lines) pages_s[tid] = page_guess;
++    __syncthreads();
++    const std::int32_t* block_table =
++        block_tables + static_cast<std::int64_t>(table_row) * table_stride;
++
++    // Copy slots of this thread in a tile: 16-byte chunks tid and tid + 256 of K and of V (key
++    // chunk >> 4, chunk c = chunk & 15 of its row), the value scales of key tid and the key scales
++    // of keys 8 tid .. 8 tid + 7.
++    std::uint32_t k_dst[2], v_dst[2];
++    int c_key[2];
++#pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        const int chunk = tid + i * Threads;
++        const int key_l = chunk >> 4;
++        const int c     = chunk & 15;
++        c_key[i]        = key_l;
++        k_dst[i]        = (key_l * DB16 + causal_small_t_tc_swz(key_l, c * 8)) * 2;
++        v_dst[i]        = key_l * D + (k8v4_rowpair_vchunk(key_l, c >> 1) << 5) + (c & 1) * 16;
++    }
++    // Tile t of the slot's stream goes to stage t & 1.
++    struct Tile {
++        int k0, start, end;
++    };
++    const auto tile_of = [&](int t) {
++        const int split            = per_slot == 1 ? s_begin : s_begin + t / units;
++        const K8V4SplitRange range = k8v4_split_range<TokenTile, Bc>(window, split, active);
++        return Tile{range.first_tile + (t - (split - s_begin) * units) * Bc, range.split_start,
++                    range.split_end};
++    };
++    const auto page_of = [&](int k0) {
++        const int pindex = k0 >> kPagedKVPageShift;
++        return table_row == 0 && pindex < page_lines ? pages_s[pindex] : block_table[pindex];
++    };
++    const auto issue_k = [&](int t) {
++        const Tile tile   = tile_of(t);
++        const int page    = page_of(tile.k0);
++        const int offset0 = tile.k0 & kPagedKVPageMask;
++        const std::uint8_t* source =
++            cache_k + kv_cache_fp8_code_index<Geometry>(page, kv_head, 0, offset0);
++        std::uint8_t* const k = stage_k(t & 1);
++#pragma unroll
++        for (int i = 0; i < 2; ++i) {
++            const int key = tile.k0 + c_key[i];
++            cp_async_zfill<16, Cache::cg>(k + k_dst[i], source + (tid + i * Threads) * 16,
++                                          key >= tile.start && key < tile.end ? 16 : 0);
++        }
++        if (tid < Bc / 8) {
++            cp_async<16>(stage_ks(t & 1) + tid * 8,
++                         cache_k_scale + kv_cache_fp8_scale_index<Geometry>(page, kv_head, offset0) +
++                             tid * 8);
++        }
++    };
++    const auto issue_v = [&](int t) {
++        const Tile tile   = tile_of(t);
++        const int page    = page_of(tile.k0);
++        const int offset0 = tile.k0 & kPagedKVPageMask;
++        const std::uint8_t* source =
++            cache_v + VC::template code_offset<Geometry>(page, kv_head, offset0);
++        std::uint8_t* const v = stage_v(t & 1);
++#pragma unroll
++        for (int i = 0; i < 2; ++i) {
++            const int key = tile.k0 + c_key[i];
++            cp_async_zfill<16, Cache::cg>(v + v_dst[i], source + (tid + i * Threads) * 16,
++                                          key >= tile.start && key < tile.end ? 16 : 0);
++        }
++        if (tid < Bc) {
++            const int key = tile.k0 + tid;
++            cp_async_zfill<8>(stage_vs(t & 1) + tid * VC::kScaleBytes,
++                              cache_v_scale +
++                                  VC::template scale_offset<Geometry>(page, kv_head, offset0 + tid),
++                              key >= tile.start && key < tile.end ? 8 : 0);
++        }
++    };
++    int issued_k = min(2, total_tiles);
++    int issued_v = issued_k;
++    for (int t = 0; t < issued_k; ++t) issue_k(t);
++    cp_commit();
++    for (int t = 0; t < issued_v; ++t) issue_v(t);
++    cp_commit();
++    K8V4_ROWSPLIT_STAMP(2);
++
++    // The query rows are rotated and quantized while the tiles fly.
++#pragma unroll
++    for (int i = 0; i < 2; ++i) {
++        const int r = warp + 8 * i;
++        std::uint8_t row_codes[8];
++        const float qs = k8v4_quantize_query_row(qv[i], lane, row_codes);
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            causal_small_t_store_byte_swizzled(q_s, r, lane + 32 * j, D / 2, row_codes[j]);
++        }
++        if (lane == 0) q_scale_s[r] = qs;
++    }
++    const int base0 = Tree ? first_pos : qabs0 + 1;
++    const int base1 = Tree ? first_pos : qabs1 + 1;
++    K8V4_ROWSPLIT_STAMP(3);
++
++    unsigned qf[QKKs][4];
++    float q_scale_r0 = 0.0F, q_scale_r1 = 0.0F;
++    const int b_row    = quarter * 8 + (lane & 7);
++    const int b_koff   = ((lane >> 3) & 1) << 3;
++    const int keya     = quarter * 8 + 2 * lid;
++    const int v_word   = 2 * lid * D + (k8v4_rowpair_vchunk(2 * lid, warp) << 5) + 4 * gid;
++    const int vs_index = 2 * lid * kKVCacheInt8Groups + (warp >> 1);
++    const __half half  = __float2half_rn(0.5F);
++    const __half2 bias = __float2half2_rn(1152.0F);
++
++    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0F, l1 = 0.0F;
++    float acc[4][4];
++#pragma unroll
++    for (int j = 0; j < 4; ++j) {
++#pragma unroll
++        for (int i = 0; i < 4; ++i) acc[j][i] = 0.0F;
++    }
++
++    // Row sums and PV of pair tile p for this warp's 32 dimensions.
++    const auto pv = [&](int p, int stage, float alpha0, float alpha1) {
++        {
++            // The wide kernel's per-lane sum runs over its score tiles in key order.
++            const float2 t0 = tbuf_s[p][0][lane];
++            const float2 t1 = tbuf_s[p][1][lane];
++            const float2 t2 = tbuf_s[p][2][lane];
++            const float2 t3 = tbuf_s[p][3][lane];
++            float bl0       = 0.0F;
++            float bl1       = 0.0F;
++            bl0 += t0.x;
++            bl0 += t1.x;
++            bl0 += t2.x;
++            bl0 += t3.x;
++            bl1 += t0.y;
++            bl1 += t1.y;
++            bl1 += t2.y;
++            bl1 += t3.y;
++            bl0 = warp_sum<4>(bl0, FullMask);
++            bl1 = warp_sum<4>(bl1, FullMask);
++            l0  = __fmaf_rn(l0, alpha0, bl0);
++            l1  = __fmaf_rn(l1, alpha1, bl1);
++        }
++        unsigned pf[2][4];
++#pragma unroll
++        for (int k = 0; k < 2; ++k) {
++#pragma unroll
++            for (int j = 0; j < 4; ++j) pf[k][j] = pbuf_s[p][k][j][lane];
++        }
++        if (__any_sync(FullMask, alpha0 != 1.0F || alpha1 != 1.0F)) {
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                acc[j][0] *= alpha0;
++                acc[j][1] *= alpha0;
++                acc[j][2] *= alpha1;
++                acc[j][3] *= alpha1;
++            }
++        }
++        const std::uint8_t* v = stage_v(stage) + v_word;
++        const __half* vs      = reinterpret_cast<const __half*>(stage_vs(stage)) + vs_index;
++        unsigned lo[2][2], hi[2][2];
++        __half2 scale2[2][2];
++#pragma unroll
++        for (int s = 0; s < 2; ++s) {
++#pragma unroll
++            for (int r = 0; r < 2; ++r) {
++                // Keys 16s + 8r + 2*lid and the next one share this lane's chunk rotation.
++                const int dk     = 16 * s + 8 * r;
++                const unsigned a = load_vec<unsigned>(v + dk * D) ^ 0x80808080U;
++                const unsigned b = load_vec<unsigned>(v + (dk + 1) * D) ^ 0x80808080U;
++                lo[s][r]         = __byte_perm(a, b, 0x5140U);
++                hi[s][r]         = __byte_perm(a, b, 0x7362U);
++                scale2[s][r]     = __halves2half2(__hmul(vs[dk * kKVCacheInt8Groups], half),
++                                                  __hmul(vs[(dk + 1) * kKVCacheInt8Groups], half));
++            }
++        }
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++            unsigned vf[2][2];
++#pragma unroll
++            for (int s = 0; s < 2; ++s) {
++#pragma unroll
++                for (int r = 0; r < 2; ++r) {
++                    const unsigned bits = __byte_perm(j < 2 ? lo[s][r] : hi[s][r], 0x64646464U,
++                                                      (j & 1) != 0 ? 0x4342U : 0x4140U);
++                    const __half2 value = __hmul2(
++                        __hsub2(*reinterpret_cast<const __half2*>(&bits), bias), scale2[s][r]);
++                    vf[s][r] = *reinterpret_cast<const unsigned*>(&value);
++                }
++            }
++            k8v4_pv_pair(acc[j], pf[0], pf[1], vf[0][0], vf[0][1], vf[1][0], vf[1][1]);
++        }
++    };
++
++    int g      = 0;
++    bool first = true;
++    for (int split = s_begin; split < s_end; ++split) {
++        const K8V4SplitRange range = k8v4_split_range<TokenTile, Bc>(window, split, active);
++        if (range.key_blocks == 0) continue;
++        for (int kb = 0; kb < range.key_blocks; kb += 2) {
++            const int n = min(2, range.key_blocks - kb);
++            // This pair's keys have landed (its values may still fly).
++            cp_wait<1>();
++            __syncthreads();
++            if (first) {
++                K8V4_ROWSPLIT_STAMP(4);
++                const auto* q_b16 = reinterpret_cast<const __nv_bfloat16*>(q_s);
++                const int a_mat   = lane >> 3;
++                const int a_row   = (lane & 7) + ((a_mat & 1) << 3);
++                const int a_col   = (a_mat >> 1) << 3;
++#pragma unroll
++                for (int kk = 0; kk < QKKs; ++kk) {
++                    ldmatrix_x4(qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3],
++                                smem_addr(&q_b16[a_row * DB16 +
++                                                 causal_small_t_tc_swz(a_row, kk * 16 + a_col)]));
++                }
++                q_scale_r0 = q_scale_s[gid];
++                q_scale_r1 = q_scale_s[gid + 8];
++                first      = false;
++            }
++            // QK of pair tile tg (score tile `quarter` of the wide kernel).
++            float score[4]    = {0.0F, 0.0F, 0.0F, 0.0F};
++            const bool scores = tg < n;
++            if (scores) {
++                const int stage   = (g + tg) & 1;
++                const int k0      = range.first_tile + (kb + tg) * Bc;
++                const auto* k_b16 = reinterpret_cast<const __nv_bfloat16*>(stage_k(stage));
++#pragma unroll
++                for (int kk = 0; kk < QKKs; ++kk) {
++                    unsigned bf[2];
++                    ldmatrix_x2(bf[0], bf[1],
++                                smem_addr(&k_b16[b_row * DB16 +
++                                                 causal_small_t_tc_swz(b_row, kk * 16 + b_koff)]));
++                    mma_fp8_e4m3(score[0], score[1], score[2], score[3], qf[kk][0], qf[kk][1],
++                                 qf[kk][2], qf[kk][3], bf[0], bf[1]);
++                }
++                const __half* k_scale = stage_ks(stage);
++                const float ks0       = __half2float(k_scale[keya]);
++                const float ks1       = __half2float(k_scale[keya + 1]);
++                score[0] *= q_scale_r0 * ks0;
++                score[1] *= q_scale_r0 * ks1;
++                score[2] *= q_scale_r1 * ks0;
++                score[3] *= q_scale_r1 * ks1;
++                const int key0 = k0 + keya;
++                const int key1 = key0 + 1;
++                const bool in0 = key0 >= range.split_start && key0 < range.split_end;
++                const bool in1 = key1 >= range.split_start && key1 < range.split_end;
++                score[0] = in0 && k8v4_key_visible(key0, qabs0, base0, mask0)
++                               ? score[0] * attention_scale
++                               : -CUDART_INF_F;
++                score[1] = in1 && k8v4_key_visible(key1, qabs0, base0, mask0)
++                               ? score[1] * attention_scale
++                               : -CUDART_INF_F;
++                score[2] = in0 && k8v4_key_visible(key0, qabs1, base1, mask1)
++                               ? score[2] * attention_scale
++                               : -CUDART_INF_F;
++                score[3] = in1 && k8v4_key_visible(key1, qabs1, base1, mask1)
++                               ? score[3] * attention_scale
++                               : -CUDART_INF_F;
++                const float bm0 = warp_max<4>(fmaxf(score[0], score[1]), FullMask);
++                const float bm1 = warp_max<4>(fmaxf(score[2], score[3]), FullMask);
++                if (lid == 0) {
++                    bmax_s[tg][quarter][gid]     = bm0;
++                    bmax_s[tg][quarter][gid + 8] = bm1;
++                }
++            }
++            __syncthreads();
++            // Every warp has scored: the key stages take the next pair.
++            for (; issued_k < min(g + n + 2, total_tiles); ++issued_k) issue_k(issued_k);
++            cp_commit();
++            // The pair's online-softmax steps, A then B, in every warp; each warp makes P of its tile.
++            const float na0 = fmaxf(m0, fmaxf(fmaxf(bmax_s[0][0][gid], bmax_s[0][1][gid]),
++                                              fmaxf(bmax_s[0][2][gid], bmax_s[0][3][gid])));
++            const float na1 =
++                fmaxf(m1, fmaxf(fmaxf(bmax_s[0][0][gid + 8], bmax_s[0][1][gid + 8]),
++                                fmaxf(bmax_s[0][2][gid + 8], bmax_s[0][3][gid + 8])));
++            const float aa0 = m0 == -CUDART_INF_F ? 0.0F : exp2_approx((m0 - na0) * Log2E);
++            const float aa1 = m1 == -CUDART_INF_F ? 0.0F : exp2_approx((m1 - na1) * Log2E);
++            float nb0 = na0, nb1 = na1, ab0 = 1.0F, ab1 = 1.0F;
++            if (n == 2) {
++                nb0 = fmaxf(na0, fmaxf(fmaxf(bmax_s[1][0][gid], bmax_s[1][1][gid]),
++                                       fmaxf(bmax_s[1][2][gid], bmax_s[1][3][gid])));
++                nb1 = fmaxf(na1, fmaxf(fmaxf(bmax_s[1][0][gid + 8], bmax_s[1][1][gid + 8]),
++                                       fmaxf(bmax_s[1][2][gid + 8], bmax_s[1][3][gid + 8])));
++                ab0 = na0 == -CUDART_INF_F ? 0.0F : exp2_approx((na0 - nb0) * Log2E);
++                ab1 = na1 == -CUDART_INF_F ? 0.0F : exp2_approx((na1 - nb1) * Log2E);
++            }
++            if (scores) {
++                const float nm0 = tg == 0 ? na0 : nb0;
++                const float nm1 = tg == 0 ? na1 : nb1;
++                score[0]        = nm0 > -CUDART_INF_F && score[0] > -CUDART_INF_F
++                                      ? exp2_approx((score[0] - nm0) * Log2E)
++                                      : 0.0F;
++                score[1]        = nm0 > -CUDART_INF_F && score[1] > -CUDART_INF_F
++                                      ? exp2_approx((score[1] - nm0) * Log2E)
++                                      : 0.0F;
++                score[2]        = nm1 > -CUDART_INF_F && score[2] > -CUDART_INF_F
++                                      ? exp2_approx((score[2] - nm1) * Log2E)
++                                      : 0.0F;
++                score[3]        = nm1 > -CUDART_INF_F && score[3] > -CUDART_INF_F
++                                      ? exp2_approx((score[3] - nm1) * Log2E)
++                                      : 0.0F;
++                tbuf_s[tg][quarter][lane] = make_float2(score[0] + score[1], score[2] + score[3]);
++                pbuf_s[tg][quarter >> 1][2 * (quarter & 1)][lane] =
++                    k8v4_half2_bits(score[0], score[1]);
++                pbuf_s[tg][quarter >> 1][2 * (quarter & 1) + 1][lane] =
++                    k8v4_half2_bits(score[2], score[3]);
++            }
++            // This pair's values (the group before the next keys) have landed.
++            cp_wait<1>();
++            __syncthreads();
++            pv(0, g & 1, aa0, aa1);
++            if (n == 2) pv(1, (g + 1) & 1, ab0, ab1);
++            m0 = nb0;
++            m1 = nb1;
++            g += n;
++            if (issued_v < total_tiles) {
++                // Every warp has finished PV: the value stages take the next pair.
++                __syncthreads();
++                for (; issued_v < min(g + 2, total_tiles); ++issued_v) issue_v(issued_v);
++                cp_commit();
++            }
++        }
++        K8V4_ROWSPLIT_STAMP(5);
++        // The split is complete: statistics (identical in all warps) and the doubled numerators.
++        if (warp == 0 && lid == 0) {
++            partial_m[causal_partial_stat_index<Geometry>(q_head0, token0, split, TokenTile)] = m0;
++            partial_l[causal_partial_stat_index<Geometry>(q_head0, token0, split, TokenTile)] = l0;
++            partial_m[causal_partial_stat_index<Geometry>(q_head1, token1, split, TokenTile)] = m1;
++            partial_l[causal_partial_stat_index<Geometry>(q_head1, token1, split, TokenTile)] = l1;
++        }
++        const int d0 = 32 * warp + 8 * lid;
++        float* const out0 =
++            partial_acc + causal_partial_acc_index<Geometry>(q_head0, d0, token0, split, TokenTile);
++        float* const out1 =
++            partial_acc + causal_partial_acc_index<Geometry>(q_head1, d0, token1, split, TokenTile);
++#pragma unroll
++        for (int h = 0; h < 2; ++h) {
++            store_vec(out0 + 4 * h, make_float4(2.0F * acc[0][h], 2.0F * acc[1][h],
++                                                2.0F * acc[2][h], 2.0F * acc[3][h]));
++            store_vec(out1 + 4 * h, make_float4(2.0F * acc[0][2 + h], 2.0F * acc[1][2 + h],
++                                                2.0F * acc[2][2 + h], 2.0F * acc[3][2 + h]));
++        }
++        m0 = m1 = -CUDART_INF_F;
++        l0 = l1 = 0.0F;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++#pragma unroll
++            for (int i = 0; i < 4; ++i) acc[j][i] = 0.0F;
++        }
++    }
++    K8V4_ROWSPLIT_STAMP(7);
++}
++
++} // namespace ninfer::ops
+-- 
+2.34.1
+
