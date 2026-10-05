@@ -1,0 +1,10 @@
+Measurement tools for speculative decoding on one GPU.
+
+The scripts in engine-patches/ modify source files of Cinference
+(https://github.com/satellitedown/cinference), which is derived from NInfer by
+Neroued and its contributors (https://github.com/Neroued/ninfer). Both are
+distributed under the Apache License, Version 2.0. The patches contain short
+excerpts of that source as match anchors.
+
+fidelity/ref_bf16.py and fidelity/ref_var.py use the Hugging Face transformers
+Qwen3.5 modules (Apache License, Version 2.0) at run time.
