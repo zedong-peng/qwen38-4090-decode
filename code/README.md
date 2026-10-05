@@ -18,13 +18,15 @@ only. The engine patches target the Cinference `ada-dflash2` tree
 |---|---|
 | `specbench.py` | Runs the 480 Spec-Bench first turns against any OpenAI-compatible server. Concurrency 1, greedy, thinking off, one excluded warmup. Writes per-prompt rows: tokens, client-side decode window, verify steps, output hash. |
 | `sb_paired.py BASE.json RUN.json` | Paired per-prompt comparison with prompt-bootstrap 95% intervals on ms/round, tokens/step and tok/s. |
+| `sb_balanced.py A:r0.json B:r1.json ...` | Drift-balanced A/B over a run sequence such as A B B A B A A B: least-squares fit of ms/round with linear and quadratic drift, reported with a prompt bootstrap and a run-level t interval. |
 | `ids_cmp.py`, `ids_prefix.py` | Greedy agreement of two token dumps: identical requests, common prefix, median first divergence. |
 
 Protocol that made 0.3% measurable:
 1. **Forced text.** With `NINFER_FORCE_TOKENS=REF.ids.jsonl` (engine patch below), every configuration walks the
    reference's tokens. Round time is then compared on identical text, and near-tie flips no longer change content.
-2. **A B A B on one GPU.** Keep the other GPU's load constant and run no builds on the box, not even niced ones.
-   A→C and B→D measure the drift; it is often 0.1–0.3%.
+2. **Alternate on one GPU.** Keep the other GPU's load constant and run no builds on the box, not even niced ones.
+   Discard one warm-up run (a run that starts on an idle, cool GPU reads fast). Same-config drift is 0.05–0.6% per
+   job, so prefer A B B A B A A B and `sb_balanced.py`, which removes linear and quadratic drift.
 3. **`sb_paired.py` for the intervals.** Use nsys per-call medians (`profiling/kern_grep.py`) to explain the result.
 
 ## fidelity/: quality against an FP32-compute reference
