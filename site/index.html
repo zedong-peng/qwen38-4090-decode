@@ -1,0 +1,337 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Qwen3.8-27B at 322 tokens per second on one RTX 4090</title><meta name="description" content="How Qwen3.8-27B reaches 322 tok/s on Spec-Bench on a single RTX 4090 with speculative decoding: fewer bytes per round, more tokens per round, and DRAM kept busy, at better-than-release quality."><style>
+:root{--bg:#fdfdfb;--fg:#1d1d1f;--mut:#5f6368;--rule:#e3e3df;--card:#f4f4f0;--acc1:#bcd3ea;--acc2:#6c9bd1;--acc3:#1f5aa6;
+--warm:#e0913a;--fill:#f2c38a;--idle:#d6d6d0;--gray:#a5a5a0;--ink:#333;--band:#f1f1ec;--link:#1f5aa6}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141518;--fg:#e8e8e6;--mut:#a0a3a8;--rule:#2c2e33;
+--card:#1c1e22;--acc1:#2f4a6b;--acc2:#4f7fbf;--acc3:#86b4ee;--warm:#e8a35a;--fill:#8a6234;--idle:#3a3c40;--gray:#6d6f73;
+--ink:#ddd;--band:#1b1d21;--link:#8ab8f0}}
+:root[data-theme="dark"]{--bg:#141518;--fg:#e8e8e6;--mut:#a0a3a8;--rule:#2c2e33;--card:#1c1e22;--acc1:#2f4a6b;--acc2:#4f7fbf;
+--acc3:#86b4ee;--warm:#e8a35a;--fill:#8a6234;--idle:#3a3c40;--gray:#6d6f73;--ink:#ddd;--band:#1b1d21;--link:#8ab8f0}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.65 Charter,"Bitstream Charter","Sitka Text",Cambria,Georgia,serif}
+main{max-width:720px;margin:0 auto;padding:48px 16px 96px}
+h1,h2,h3,.kicker,.byline,.links,figcaption,.tnote,table,.tldr h2,nav{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",
+"Helvetica Neue",Arial,sans-serif}
+h1{font-size:2.2rem;line-height:1.18;letter-spacing:-.01em;margin:.2em 0 .4em}
+h2{font-size:1.35rem;margin:2.4em 0 .6em;letter-spacing:-.005em}
+.kicker{text-transform:uppercase;letter-spacing:.08em;font-size:.75rem;color:var(--mut);margin:0}
+.dek{font-size:1.15rem;color:var(--mut);margin:.2em 0 1em}
+.byline{font-size:.9rem;color:var(--mut);margin:0}.byline a{color:inherit;text-decoration:none;border-bottom:1px solid var(--rule)}
+.links{margin:.8em 0 0;display:flex;gap:10px;flex-wrap:wrap}
+.links a{font-size:.85rem;border:1px solid var(--rule);border-radius:999px;padding:3px 12px;text-decoration:none;color:var(--fg)}
+a{color:var(--link)}
+.tldr{background:var(--card);border-radius:10px;padding:14px 22px 6px;margin:28px 0}
+.tldr h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:.4em 0 .2em}
+.tldr li{margin:.45em 0}
+ul,ol{padding-left:1.3em}
+li{margin:.3em 0}
+li>ul{margin:.2em 0}
+.steps>li{margin:.7em 0}
+.eq{text-align:center;font-size:1.05rem;margin:1.1em 0}
+code{white-space:nowrap;font:.86em ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--card);padding:1px 4px;border-radius:4px}
+pre{font:.8rem/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--card);padding:12px 14px;border-radius:8px;
+overflow-x:auto;white-space:pre-wrap;word-break:break-word}
+pre.cmd{white-space:pre}
+figure{margin:30px 0 34px}
+figure svg{width:100%;height:auto;display:block}
+figcaption{font-size:.84rem;line-height:1.5;color:var(--mut);margin-top:8px}
+@media (min-width:1000px){figure.wide{margin-left:-80px;margin-right:-80px}}
+.tbl{overflow-x:auto;margin:18px 0 26px}
+table{border-collapse:collapse;font-size:.84rem;width:100%;line-height:1.4}
+th,td{padding:6px 8px;border-bottom:1px solid var(--rule);text-align:right;vertical-align:top}
+th:first-child,td:first-child{text-align:left}
+table.neg td,table.neg th{text-align:left}
+thead th{font-weight:600;border-bottom:1.5px solid var(--fg)}
+.tnote{font-size:.8rem;color:var(--mut);margin:.5em 0 0}
+.note{font-size:.92rem;color:var(--mut)}
+svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;fill:var(--fg)}
+.t-label{font-size:14px}.t-small{font-size:12px;fill:var(--mut)}.t-value{font-size:14px;font-weight:600}
+.t-axis{font-size:12px;fill:var(--mut)}.t-in{font-size:12.5px;fill:#fff;font-weight:500}.t-head{font-size:13px;font-weight:600}.t-num{font-size:11px;font-weight:700;fill:#fff}
+.c-acc1{fill:var(--acc1)}.c-acc2{fill:var(--acc2)}.c-acc3{fill:var(--acc3)}.c-warm{fill:var(--warm)}.c-gray{fill:var(--gray)}
+.c-idle{fill:var(--idle)}.c-fill{fill:var(--fill)}.c-ink{fill:var(--ink)}.op{opacity:.55}
+.grid{stroke:var(--rule);stroke-width:1}.legend{fill:var(--bg);stroke:var(--rule)}.band{fill:var(--band)}
+.bar-line{stroke:var(--gray);stroke-width:1.5;stroke-dasharray:5 4}
+.path{stroke:var(--ink);stroke-width:1.3;fill:none}
+.step{stroke:var(--mut);stroke-width:1.6;fill:none}
+@media (max-width:560px){body{font-size:16px}h1{font-size:1.7rem}.t-label{font-size:16px}.t-small,.t-axis{font-size:14px}}
+</style></head><body><main><header class="hero">
+  <p class="kicker">Inference · Speculative decoding · RTX 4090</p>
+  <h1>Qwen3.8-27B at 322 tokens per second on one RTX 4090</h1>
+  <p class="dek">Batch-1 speculative decoding on a consumer GPU is a memory-bandwidth problem. We cut the bytes each
+  verify round reads, raised the tokens each round accepts, and kept DRAM busy between kernels. The quantized model
+  ends up closer to the full-precision model than the official release.</p>
+  <p class="byline"><a href="https://zedong-peng.github.io/">Zedong Peng</a> · October 2026</p>
+  <nav class="links"><a href="#reproduce">Code &amp; data</a><a href="#negative">What did not work</a><a href="#citation">Cite</a></nav>
+</header>
+
+<aside class="tldr">
+  <h2>Summary</h2>
+  <ul>
+    <li>On Spec-Bench (480 prompts, greedy, batch 1, 256 new tokens), Qwen3.8-27B decodes at <b>322.2 tok/s</b>
+      on a single RTX 4090. The stock engine with the released weights runs the same benchmark at 177.8 tok/s
+      (1.81×). All of these numbers come from one session on one card.</li>
+    <li>About half of the gain is engine and half is model. On the released weights, our engine is
+      1.38× faster than the stock one: 16-node verify trees accept 29% more tokens per round than the stock 7-token
+      chain at the same round time, and the kernel work shortens rounds by 6%. Our quantized weights and fine-tuned drafter add
+      1.32× on top: rounds are 20% shorter and accept 5% more tokens.</li>
+    <li>Quality improved rather than degraded. Against an FP32 reference, our quantized model has lower KL
+      (0.0619 vs 0.0668) and lower perplexity (3.21 vs 3.29) than the official
+      release, with equal top-1 agreement. Greedy speculative decoding returns exactly the quantized model's own
+      output, so it adds no error of its own.</li>
+    <li>There were three levers: fewer bytes per round, more tokens per round, and less time with DRAM idle. The last
+      10% came from a dozen changes of 0.4–2% each. We could only see those with forced-text A/B tests.</li>
+  </ul>
+</aside>
+
+<figure id="fig-ladder" class=""><svg viewBox="0 0 760 272" role="img" aria-label="Spec-Bench-480 tok/s ladder" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"><line x1="16.0" x2="16.0" y1="28" y2="246" class="grid"/><text x="16.0" y="262.0" class="t-axis" text-anchor="middle" >0</text><line x1="97.2" x2="97.2" y1="28" y2="246" class="grid"/><text x="97.2" y="262.0" class="t-axis" text-anchor="middle" >50</text><line x1="178.5" x2="178.5" y1="28" y2="246" class="grid"/><text x="178.5" y="262.0" class="t-axis" text-anchor="middle" >100</text><line x1="259.7" x2="259.7" y1="28" y2="246" class="grid"/><text x="259.7" y="262.0" class="t-axis" text-anchor="middle" >150</text><line x1="341.0" x2="341.0" y1="28" y2="246" class="grid"/><text x="341.0" y="262.0" class="t-axis" text-anchor="middle" >200</text><line x1="422.2" x2="422.2" y1="28" y2="246" class="grid"/><text x="422.2" y="262.0" class="t-axis" text-anchor="middle" >250</text><line x1="503.5" x2="503.5" y1="28" y2="246" class="grid"/><text x="503.5" y="262.0" class="t-axis" text-anchor="middle" >300</text><text x="580.0" y="262.0" class="t-axis" text-anchor="start" >tok/s</text><text x="16.0" y="24.0" class="t-label" text-anchor="start" >Stock Cinference-4090, release weights, 7-token chain</text><rect x="16" y="30" width="288.9" height="24" rx="3" class="c-gray"/><text x="312.9" y="47.0" class="t-value" text-anchor="start" >177.8</text><text x="358.9" y="47.0" class="t-small" text-anchor="start" >4.03 tok/round · 22.7 ms</text><text x="16.0" y="82.0" class="t-label" text-anchor="start" >Our engine, release weights, defaults (16-node verify tree)</text><rect x="16" y="88" width="372.9" height="24" rx="3" class="c-acc1"/><text x="396.9" y="105.0" class="t-value" text-anchor="start" >229.5</text><text x="442.9" y="105.0" class="t-small" text-anchor="start" >5.18 tok/round · 22.6 ms</text><text x="16.0" y="140.0" class="t-label" text-anchor="start" >Our engine, release weights, all engine changes</text><rect x="16" y="146" width="398.1" height="24" rx="3" class="c-acc2"/><text x="422.1" y="163.0" class="t-value" text-anchor="start" >245.0</text><text x="468.1" y="163.0" class="t-small" text-anchor="start" >5.18 tok/round · 21.1 ms</text><text x="16.0" y="198.0" class="t-label" text-anchor="start" >Our engine + our weights (quantization, drafter)</text><rect x="16" y="204" width="523.5" height="24" rx="3" class="c-acc3"/><text x="547.5" y="221.0" class="t-value" text-anchor="start" >322.2</text><text x="593.5" y="221.0" class="t-small" text-anchor="start" >5.43 tok/round · 16.9 ms</text></svg><figcaption><b>Figure 1.</b> Spec-Bench-480 decode throughput on one RTX 4090: 480 prompts, greedy, batch 1, at most 256 new tokens. All bars were measured in one session on one card. The middle two bars keep the released weights and isolate the engine; the last bar adds our quantized model and fine-tuned drafter. tok/round is the mean number of tokens accepted per verify round. The engine/model split is not unique: engine changes save a roughly fixed time per round, which is a larger share of the final model's shorter rounds.</figcaption></figure>
+
+<section id="problem">
+<h2>The problem: one 24 GB card, one user</h2>
+
+<p>At batch size 1, every forward pass reads every weight once. Qwen3.8-27B at about 4 bits per weight is 13–14 GB,
+and the 4090 streams 0.93–1.0 TB/s from DRAM in practice. That caps plain autoregressive decoding near 70 tokens per
+second. We measured 46 tok/s in llama.cpp and 54 in Cinference.</p>
+
+<p>Speculative decoding changes the unit of work. A small drafter proposes a tree of 15 candidate tokens. The target
+model scores all 16 positions in one forward pass, which still reads the weights once, and keeps the longest branch
+that matches its own greedy choices, plus one token of its own. If a round accepts <i>τ</i> tokens on average:</p>
+
+<p class="eq">tok/s = <i>τ</i> / <i>t</i><sub>round</sub>,&nbsp;&nbsp;&nbsp;
+<i>t</i><sub>round</sub> ≈ bytes<sub>round</sub> / bandwidth + <i>t</i><sub>small kernels</sub> + <i>t</i><sub>idle</sub></p>
+
+<p>So there are three things to work on: the bytes a round reads, the tokens it accepts, and the time DRAM spends not
+streaming. Everything below is one of the three.</p>
+
+<p>The model is a hybrid: 48 Gated DeltaNet (linear-attention) layers and 16 full-attention layers, hidden size 5,120.
+The drafter is DFlash2, which reads the target's hidden states and proposes a whole block of tokens at once. The engine
+is Cinference, a descendant of NInfer, in jram4's port to Ada (sm_89). We merged upstream's verify trees into that
+port and added about 50 commits. The card is one RTX 4090 at its 450 W limit, on PCIe Gen3 with CUDA 12.8.</p>
+
+<figure id="fig-anatomy" class=""><svg viewBox="0 0 760 184" role="img" aria-label="verify round anatomy" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"><text x="140.0" y="36.0" class="t-label" text-anchor="end" >2026-10-03</text><text x="140.0" y="51.0" class="t-small" text-anchor="end" >release weights</text><rect x="150.0" y="14" width="437.8" height="34" class="c-acc3"/><text x="368.9" y="36.0" class="t-in" text-anchor="middle" >18.5</text><rect x="587.8" y="14" width="33.6" height="34" class="c-acc2"/><rect x="621.4" y="14" width="68.6" height="34" class="c-warm"/><text x="655.7" y="36.0" class="t-in" text-anchor="middle" >2.9</text><text x="698.0" y="36.0" class="t-value" text-anchor="start" >22.8 ms</text><text x="140.0" y="96.0" class="t-label" text-anchor="end" >2026-10-06</text><text x="140.0" y="111.0" class="t-small" text-anchor="end" >final</text><rect x="150.0" y="74" width="334.1" height="34" class="c-acc3"/><text x="317.0" y="96.0" class="t-in" text-anchor="middle" >14.1</text><rect x="484.1" y="74" width="20.4" height="34" class="c-acc2"/><rect x="504.5" y="74" width="41.3" height="34" class="c-warm"/><rect x="545.8" y="74" width="8.4" height="34" class="c-idle"/><text x="562.2" y="96.0" class="t-value" text-anchor="start" >17.1 ms</text><rect x="14" y="140" width="12" height="12" class="c-acc3"/><text x="31.0" y="151.0" class="t-small" text-anchor="start" >weight GEMMs  18.50 → 14.12</text><rect x="220.1" y="140" width="12" height="12" class="c-acc2"/><text x="237.1" y="151.0" class="t-small" text-anchor="start" >LM-head screens  1.42 → 0.86</text><rect x="432.5" y="140" width="12" height="12" class="c-warm"/><text x="449.5" y="151.0" class="t-small" text-anchor="start" >small kernels  2.90 → 1.75</text><rect x="632.3" y="140" width="12" height="12" class="c-idle"/><text x="649.3" y="151.0" class="t-small" text-anchor="start" >idle  0.36</text></svg><figcaption><b>Figure 2.</b> GPU time per verify round in ms, from nsys traces of a code prompt. Top: the first trace of our tuned engine with the released weights. Its idle time was not measured separately and is folded into the other segments. Bottom: the final configuration. Weight GEMMs include the drafter's projections. nsys adds a few percent to every kernel.</figcaption></figure>
+
+<p>Figure 2 shows where a round goes. In the first trace of our tuned engine (top bar), about 19.9 of 22.8 ms were
+weight streaming: target GEMMs, drafter projections and the LM head. The rest went to hundreds of small kernels, such
+as norms, the recurrent GDN update and attention. Those kernels are latency-bound and leave DRAM idle while they run.
+Hopper can overlap one kernel's tail with the next kernel's start (programmatic dependent launch); Ada cannot, so every
+kernel boundary is a small bubble.</p>
+</section>
+
+<section id="bytes">
+<h2>Fewer bytes, better quality</h2>
+
+<p>The released container quantizes the target with round-to-nearest at 4 and 5 bits. Before changing it, we pinned
+down what "no worse" means. The reference is FP32 compute over the BF16 checkpoint, streamed layer by layer on the same
+card. We score 46,059 next-token predictions in 44 windows of 2,048 tokens, half Wikipedia prose and half
+CPython source, none of it overlapping any calibration data. We track three numbers: KL<sub>64</sub> (KL from the
+reference to the candidate on the reference's top-64 tokens, which carry 98% of its mass), top-1 agreement and
+perplexity. A change ships only if every number, on prose and on code, is at least as good as the release's.</p>
+
+<p>The release turned out to leave a lot on the table. GPTQ with act-order and a per-group clip search, at the
+release's own bit allocation, cuts KL<sub>64</sub> from 0.0668 to 0.0421. Everything after that spends this headroom
+on bytes (Figure 3):</p>
+
+<ol class="steps">
+<li><b>All projections at Q4, with 8-bit group scales.</b> This saves 1.8 GB per round. Larger calibration sets (96,
+then 384 windows) won back about a third of the KL that all-Q4 cost.</li>
+<li><b>3 bits where they are cheap.</b> Sensitivity is very uneven: late MLP down projections cost 6× more KL per byte
+saved than early ones, and code is 4× more sensitive than prose. MLP gate/up in layers 0–31 and down in layers 0–15
+now run at Q3. They stay in the existing Q4 container as codes restricted to [−4, 3] and are repacked into 3-bit tiles
+at load, so no new file format was needed. The Q4 copy stays resident for prefill (see Limitations).</li>
+<li><b>End-to-end scale tuning.</b> With the integer codes frozen, we train only the group scales, a per-row offset and
+the RMSNorm gains (4.6 M parameters) to match the BF16 model's output distribution on held-out text, in the spirit of
+EfficientQAT's E2E-QP. The engine's exact KV-cache codec runs inside the training loop. Held-out KL drops 10.5%, most
+of it on code.</li>
+<li><b>A cheaper cache and state.</b> KV-cache values move from NVFP4 to INT8. Keys stay FP8, after a Hadamard
+rotation. Against a BF16 cache, INT8 values measure as lossless, where NVFP4 had cost about 0.0015 KL and 0.002 top-1,
+and verify attention gets faster too. The recurrent GDN state is stored in FP16 between rounds.</li>
+</ol>
+
+<figure id="fig-quality" class=""><svg viewBox="0 0 760 420" role="img" aria-label="KL versus bytes per round" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"><line x1="108.8" x2="108.8" y1="20" y2="370" class="grid"/><text x="108.8" y="388.0" class="t-axis" text-anchor="middle" >11.5</text><line x1="205.9" x2="205.9" y1="20" y2="370" class="grid"/><text x="205.9" y="388.0" class="t-axis" text-anchor="middle" >12.0</text><line x1="302.9" x2="302.9" y1="20" y2="370" class="grid"/><text x="302.9" y="388.0" class="t-axis" text-anchor="middle" >12.5</text><line x1="400.0" x2="400.0" y1="20" y2="370" class="grid"/><text x="400.0" y="388.0" class="t-axis" text-anchor="middle" >13.0</text><line x1="497.1" x2="497.1" y1="20" y2="370" class="grid"/><text x="497.1" y="388.0" class="t-axis" text-anchor="middle" >13.5</text><line x1="594.1" x2="594.1" y1="20" y2="370" class="grid"/><text x="594.1" y="388.0" class="t-axis" text-anchor="middle" >14.0</text><line x1="691.2" x2="691.2" y1="20" y2="370" class="grid"/><text x="691.2" y="388.0" class="t-axis" text-anchor="middle" >14.5</text><line x1="70" x2="730" y1="331.1" y2="331.1" class="grid"/><text x="62.0" y="335.1" class="t-axis" text-anchor="end" >0.04</text><line x1="70" x2="730" y1="233.9" y2="233.9" class="grid"/><text x="62.0" y="237.9" class="t-axis" text-anchor="end" >0.05</text><line x1="70" x2="730" y1="136.7" y2="136.7" class="grid"/><text x="62.0" y="140.7" class="t-axis" text-anchor="end" >0.06</text><line x1="70" x2="730" y1="39.4" y2="39.4" class="grid"/><text x="62.0" y="43.4" class="t-axis" text-anchor="end" >0.07</text><text x="400.0" y="410.0" class="t-axis" text-anchor="middle" >target weight bytes read per verify round (GB, from the bit allocation)</text><text x="16.0" y="195.0" class="t-axis" text-anchor="middle" transform="rotate(-90 16 195.0)">KL64 vs FP32</text><line x1="70" x2="730" y1="70.7" y2="70.7" class="bar-line"/><text x="400.0" y="63.7" class="t-small" text-anchor="middle" >release KL (the bar)</text><defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="c-ink"/></marker></defs><line x1="665.9" y1="81.7" x2="665.9" y2="300.0" class="path" marker-end="url(#arr)"/><line x1="656.1" y1="306.0" x2="326.3" y2="137.8" class="path" marker-end="url(#arr)"/><line x1="306.1" y1="129.3" x2="255.1" y2="112.0" class="path" marker-end="url(#arr)"/><line x1="234.2" y1="105.3" x2="181.5" y2="89.4" class="path" marker-end="url(#arr)"/><line x1="163.0" y1="93.8" x2="144.0" y2="111.7" class="path" marker-end="url(#arr)"/><line x1="136.0" y1="108.3" x2="136.0" y2="129.7" class="path" marker-end="url(#arr)"/><circle cx="665.9" cy="70.7" r="9" class="c-gray"/><text x="665.9" y="74.7" class="t-num" text-anchor="middle" >1</text><circle cx="665.9" cy="311.0" r="9" class="c-acc2"/><text x="665.9" y="315.0" class="t-num" text-anchor="middle" >2</text><circle cx="316.5" cy="132.8" r="9" class="c-acc2"/><text x="316.5" y="136.8" class="t-num" text-anchor="middle" >3</text><circle cx="244.7" cy="108.5" r="9" class="c-acc2"/><text x="244.7" y="112.5" class="t-num" text-anchor="middle" >4</text><circle cx="170.9" cy="86.2" r="9" class="c-acc2"/><text x="170.9" y="90.2" class="t-num" text-anchor="middle" >5</text><circle cx="136.0" cy="119.3" r="9" class="c-acc3"/><text x="136.0" y="123.3" class="t-num" text-anchor="middle" >6</text><rect x="89.1" y="174.1" width="361.0" height="118" rx="6" class="legend"/><text x="99.1" y="190.1" class="t-small" text-anchor="start" >1  release (RTN Q4/Q5)</text><text x="99.1" y="208.1" class="t-small" text-anchor="start" >2  GPTQ act-order + clip, release bits</text><text x="99.1" y="226.1" class="t-small" text-anchor="start" >3  all-Q4, 8-bit scales</text><text x="99.1" y="244.1" class="t-small" text-anchor="start" >4  Q3 gate/up 0-15</text><text x="99.1" y="262.1" class="t-small" text-anchor="start" >5  E2E scales, Q3 gate/up 0-31</text><text x="99.1" y="280.1" class="t-small" text-anchor="start" >6  E2E v5, Q3 down 0-15, INT8 V; final (FP16 GDN state)</text></svg><figcaption><b>Figure 3.</b> Engine KL<sub>64</sub> against an FP32 reference, plotted against the target's weight bytes per round (computed from the bit allocation; the drafter and LM heads are excluded). GPTQ buys quality at the release's own size, and each later step spends some of it on bytes. The final model reads 19% fewer target bytes than the release at lower KL. Top-1 agreement, not KL, ended up being the binding constraint.</figcaption></figure>
+
+<div class="tbl"><table><thead><tr><th></th><th>KL<sub>64</sub> prose</th><th>KL<sub>64</sub> code</th><th>KL<sub>64</sub></th><th>top-1</th><th>PPL</th></tr></thead><tbody><tr><td>release (RTN Q4/Q5)</td><td>0.0290</td><td>0.1095</td><td>0.0668</td><td>0.9250</td><td>3.294</td></tr><tr><td>ours</td><td><b>0.0265</b></td><td><b>0.1018</b></td><td><b>0.0619</b></td><td><b>0.9250</b></td><td><b>3.213</b></td></tr></tbody></table><p class="tnote">46,059 predictions; FP32 reference perplexity 3.146 (prose 5.39, code 1.714). Lower KL and PPL are better. Top-1: 42,606 vs 42,605 agreements.</p></div>
+
+<p>Quality is also a speed variable. A noisier target agrees less often with a drafter distilled from the BF16
+model. An RTN all-Q4 target accepted 5–7% fewer tokens per round than the release, which cancelled most of its byte
+savings. So every quantization step was judged on round time and tokens per round together, never on bytes alone.</p>
+</section>
+
+<section id="tokens">
+<h2>More tokens per round</h2>
+
+<p>The cheapest win was already in upstream's code: a 16-node verify tree accepts 20% more tokens per round than a
+16-token chain at the same cost. The drafter itself was trained to propose blocks of 8, and we ask it for 16. A LoRA
+fine-tune on 8,000 sequences generated by the quantized target gave +2.3% tok/s. Higher rank, more epochs, soft labels
+and new data all landed at the same place.</p>
+
+<p>Measured teacher-forced on a chain, that fine-tune raised acceptance by 6.8%. Measured in the engine, tokens per
+round rose only 1.4%. The tree recovers most of what a weak chain loses, so chain metrics overstate drafter changes
+about threefold. Every drafter decision after that was measured in the engine.</p>
+
+<p>Two smaller fixes followed. The drafter scores only a 131,072-token shortlist of the 248,320-token vocabulary, and
+a target token outside the shortlist ends the draft. Re-ranking the shortlist with the target's own outputs cut those
+misses from 0.96% to 0.35% of tokens, worth 2% more tokens per round. And because the drafter can never change the
+output, only acceptance, its precision is a free parameter: Q4 and Q3 drafter projections paid for themselves once they
+ran on kernels that stream at full bandwidth.</p>
+
+<p>Wider trees do not pay on this card. Replaying recorded trees offline, a 32-node tree accepts 11% more tokens. But
+32-column GEMMs cost 12–39% more per shape, because the activations no longer fit the 16-column tiles.</p>
+</section>
+
+<section id="dram">
+<h2>Keeping DRAM busy</h2>
+
+<p>Today a round takes 16.9 ms, and the GPU streams weights for all but about 2 ms of it (Figure 2, bottom).
+Getting there took work at three levels.</p>
+
+<p><b>Streaming kernels.</b> Small-<i>T</i> GEMM schedules tuned for Ada, single launches that cover both input
+projections of a layer, and evict-first hints on weight loads bring the weight GEMMs to 930–1,000 GB/s. The largest,
+the Q4 gate/up projection, streams 100 MB in 98 µs. The 248k × 5,120 LM head is read through a 3-bit copy that keeps
+32 candidates per position, and only those are rescored exactly. That screen runs at 927 GB/s, the card's measured
+streaming rate, and its outputs were identical on all 480 prompts. The drafter's proposal head uses the same trick.</p>
+
+<p><b>L2 fills.</b> A latency-bound kernel is DRAM-idle time, and the obvious ways to use it fail on Ada.
+<code>prefetch.global.L2</code> does not populate L2, and prefetching from a side stream slows whatever kernel it lands
+next to. What works is giving each latency-bound kernel a few extra CTAs. After the kernel's own loads are issued,
+they pull the first megabytes of the <i>next</i> GEMM's weights into L2 with ordinary cached loads (Figure 4).</p>
+
+<figure id="fig-fill" class=""><svg viewBox="0 0 760 222" role="img" aria-label="L2 fill schematic" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"><text x="150.0" y="16.0" class="t-head" text-anchor="start" >Without fill</text><text x="140.0" y="42.0" class="t-label" text-anchor="end" >kernels</text><text x="140.0" y="57.0" class="t-small" text-anchor="end" >on the SMs</text><rect x="150.0" y="26" width="229.99999999999997" height="26" class="c-acc3"/><text x="265.0" y="44.0" class="t-in" text-anchor="middle" >GEMM A</text><rect x="380.0" y="26" width="69.0" height="26" class="c-warm"/><text x="414.5" y="44.0" class="t-in" text-anchor="middle" >norm</text><rect x="449.0" y="26" width="229.99999999999997" height="26" class="c-acc3"/><text x="564.0" y="44.0" class="t-in" text-anchor="middle" >GEMM B (starts cold)</text><text x="140.0" y="76.0" class="t-label" text-anchor="end" >DRAM</text><text x="140.0" y="91.0" class="t-small" text-anchor="end" >weight stream</text><rect x="150.0" y="62" width="229.99999999999997" height="14" class="c-acc3 op"/><rect x="380.0" y="62" width="69.0" height="14" class="c-idle"/><text x="414.5" y="92.0" class="t-small" text-anchor="middle" >DRAM idle</text><rect x="449.0" y="62" width="229.99999999999997" height="14" class="c-acc3 op"/><text x="150.0" y="118.0" class="t-head" text-anchor="start" >With fill</text><text x="140.0" y="144.0" class="t-label" text-anchor="end" >kernels</text><text x="140.0" y="159.0" class="t-small" text-anchor="end" >on the SMs</text><rect x="150.0" y="128" width="229.99999999999997" height="26" class="c-acc3"/><text x="265.0" y="146.0" class="t-in" text-anchor="middle" >GEMM A</text><rect x="380.0" y="128" width="71.3" height="26" class="c-warm"/><text x="415.6" y="146.0" class="t-in" text-anchor="middle" >norm</text><rect x="451.29999999999995" y="128" width="197.79999999999998" height="26" class="c-acc3"/><text x="550.2" y="146.0" class="t-in" text-anchor="middle" >GEMM B (head already in L2)</text><text x="140.0" y="178.0" class="t-label" text-anchor="end" >DRAM</text><text x="140.0" y="193.0" class="t-small" text-anchor="end" >weight stream</text><rect x="150.0" y="164" width="229.99999999999997" height="14" class="c-acc3 op"/><rect x="380.0" y="164" width="71.3" height="14" class="c-fill"/><rect x="451.29999999999995" y="164" width="197.79999999999998" height="14" class="c-acc3 op"/><text x="415.6" y="194.0" class="t-small" text-anchor="middle" >extra CTAs of the norm load B&#x27;s first MBs into L2</text><line x1="649.0999999999999" x2="679.0" y1="141" y2="141" class="path" marker-end="url(#arr2)"/><line x1="679.0" x2="649.0999999999999" y1="141" y2="141" class="path" marker-end="url(#arr2)"/><text x="664.0" y="124.0" class="t-small" text-anchor="middle" >saved</text><defs><marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="c-ink"/></marker></defs></svg><figcaption><b>Figure 4.</b> L2 fills, schematic and not to scale. A latency-bound kernel such as an RMSNorm leaves DRAM idle for a few microseconds. Extra CTAs in the same launch, issued after the kernel's own loads, read the first megabytes of the next GEMM's weights into L2 (the 4090 has 72 MB). The GEMM then starts warm. Results are bit-identical, because the fill only loads data.</figcaption></figure>
+
+<p>Fills on five kernel types cut round time by about 0.5%, bit-exact. The accounting was subtle in two ways. First,
+size matters: doubling the fills made rounds slower, because the stretches they ride on were already full. Second,
+deleting a small kernel also deletes its fill window. Our faster attention kernel at first showed no gain, because the
+old kernel had been carrying the fill for the next projection. Folding the RMSNorms into neighbouring GEMMs removed 80
+launches per round and saved no time at all, for the same reason.</p>
+
+<p><b>Small kernels.</b> The GDN convolution moved into the input projection's epilogue (−0.4%, bit-exact). Verify
+attention was rewritten to split rows across warps and CTAs: 17 µs became 7 µs at the median Spec-Bench context, and
+it reproduces the old kernel's split partials bit for bit, so it costs nothing in fidelity. A chunked (WY-form)
+recurrent update takes 6 µs instead of 12–20. That one is not bit-exact: it misrounds 0.02% of outputs by one BF16
+ulp, against 0.01% for the staged kernel it replaced.</p>
+
+<p><b>One CMake property.</b> The engine compiled every CUDA file as relocatable device code
+(<code>-rdc=true</code>), although nothing calls across translation units. Compiled whole-program, 541 of 2,801 kernels
+use fewer registers. The gate/up GEMM drops from 84 registers to 72, which lets three 256-thread CTAs share an SM
+instead of two. That is −0.5% round time with identical outputs. It also explained an earlier negative result: an
+epilogue fusion that had lost 1.5% to the same register cliff.</p>
+</section>
+
+<section id="measuring">
+<h2>Measuring 0.3%</h2>
+
+<p>Late in the project most wins were 0.3–1% of round time, and speculative decoding makes effects that small hard to
+see. A change that is not bit-exact flips a few near-tie tokens. From the first flip on, the generated text differs,
+and different text has different acceptance. A perturbation we knew to be null read as +0.44% tokens per round. Four
+practices made small effects measurable:</p>
+
+<ol>
+<li><b>Forced text.</b> The engine can replace its greedy choice with a reference token at each position. Every
+configuration then walks the same 480 texts, and each round costs exactly what it would anyway. Validate the
+instrument first: forcing a configuration onto its own reference must reproduce its outputs. Our first version
+reproduced 0 of 482 because of an off-by-one, which would have passed for a plausible 3% drafter regression.</li>
+<li><b>Alternate configurations on one GPU.</b> Repeats of the same configuration drift by 0.05–0.6% within a job,
+which is as large as the effects. The SM clock steps from 2,715 to 2,685 MHz as the card warms, and a run that starts
+on an idle GPU reads fast. We kept builds off the box (a niced rebuild once cost 0.9%), held the other GPU's load
+constant and discarded a warm-up run. In the end we ordered runs A B B A B A A B, which cancels linear and quadratic
+drift.</li>
+<li><b>Paired per-prompt bootstrap.</b> Comparing the same prompt across runs cancels prompt difficulty, giving
+intervals 5–13× tighter than unpaired ones. Next to it we report the run-level interval from the drift fit, which is
+the honest one.</li>
+<li><b>Explain every result.</b> Each end-to-end number was checked against nsys per-call kernel times. Host-side
+costs came from unprofiled logs, because tracing inflates them several-fold.</li>
+</ol>
+
+<figure id="fig-progress" class=""><svg viewBox="0 0 760 300" role="img" aria-label="progress over four days" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"><rect x="56.0" y="18" width="342.0" height="224" class="band"/><text x="227.0" y="260.0" class="t-axis" text-anchor="middle" >Oct 3</text><text x="474.0" y="260.0" class="t-axis" text-anchor="middle" >Oct 4</text><rect x="550.0" y="18" width="152.0" height="224" class="band"/><text x="626.0" y="260.0" class="t-axis" text-anchor="middle" >Oct 5</text><text x="721.0" y="260.0" class="t-axis" text-anchor="middle" >Oct 6</text><line x1="56" x2="740" y1="242.0" y2="242.0" class="grid"/><text x="48.0" y="246.0" class="t-axis" text-anchor="end" >230</text><line x1="56" x2="740" y1="197.2" y2="197.2" class="grid"/><text x="48.0" y="201.2" class="t-axis" text-anchor="end" >250</text><line x1="56" x2="740" y1="152.4" y2="152.4" class="grid"/><text x="48.0" y="156.4" class="t-axis" text-anchor="end" >270</text><line x1="56" x2="740" y1="107.6" y2="107.6" class="grid"/><text x="48.0" y="111.6" class="t-axis" text-anchor="end" >290</text><line x1="56" x2="740" y1="62.8" y2="62.8" class="grid"/><text x="48.0" y="66.8" class="t-axis" text-anchor="end" >310</text><line x1="56" x2="740" y1="18.0" y2="18.0" class="grid"/><text x="48.0" y="22.0" class="t-axis" text-anchor="end" >330</text><text x="14.0" y="130.0" class="t-axis" text-anchor="middle" transform="rotate(-90 14 130.0)">Spec-Bench tok/s</text><path d="M75.0,225.0 L113.0,225.0 L113.0,188.2 L151.0,188.2 L151.0,176.6 L189.0,176.6 L189.0,158.9 L227.0,158.9 L227.0,154.0 L265.0,154.0 L265.0,140.1 L303.0,140.1 L303.0,130.7 L341.0,130.7 L341.0,119.2 L379.0,119.2 L379.0,103.6 L417.0,103.6 L417.0,88.3 L455.0,88.3 L455.0,82.3 L493.0,82.3 L493.0,77.4 L531.0,77.4 L531.0,65.9 L569.0,65.9 L569.0,63.0 L607.0,63.0 L607.0,60.1 L645.0,60.1 L645.0,58.1 L683.0,58.1 L683.0,41.7 L721.0,41.7 L721.0,33.9" class="step"/><circle cx="75.0" cy="225.0" r="5" class="c-gray"><title>release weights on our engine branch, two-level LM head: 237.6 tok/s</title></circle><circle cx="113.0" cy="188.2" r="5" class="c-acc3"><title>GPTQ all-Q4 target: 254.0 tok/s</title></circle><circle cx="151.0" cy="176.6" r="5" class="c-acc3"><title>96 + 96 calibration windows: 259.2 tok/s</title></circle><circle cx="189.0" cy="158.9" r="5" class="c-warm"><title>Q5 drafter MLP: 267.1 tok/s</title></circle><circle cx="227.0" cy="154.0" r="5" class="c-acc3"><title>8-bit group scales: 269.3 tok/s</title></circle><circle cx="265.0" cy="140.1" r="5" class="c-warm"><title>drafter fine-tuned for 16-node trees: 275.5 tok/s</title></circle><circle cx="303.0" cy="130.7" r="5" class="c-warm"><title>proposal shortlist re-ranked: 279.7 tok/s</title></circle><circle cx="341.0" cy="119.2" r="5" class="c-acc2"><title>3-bit verify-head screen: 284.8 tok/s</title></circle><circle cx="379.0" cy="103.6" r="5" class="c-acc2"><title>chunked GDN record, tree temperature: 291.8 tok/s</title></circle><circle cx="417.0" cy="88.3" r="5" class="c-warm"><title>Q4 drafter on fast GEMM routes: 298.6 tok/s</title></circle><circle cx="455.0" cy="82.3" r="5" class="c-acc3"><title>Q3 gate/up, layers 0-15: 301.3 tok/s</title></circle><circle cx="493.0" cy="77.4" r="5" class="c-warm"><title>drafter conv projections Q4: 303.5 tok/s</title></circle><circle cx="531.0" cy="65.9" r="5" class="c-acc3"><title>end-to-end scale tuning, Q3 gate/up 0-31: 308.6 tok/s</title></circle><circle cx="569.0" cy="63.0" r="5" class="c-warm"><title>drafter MLP Q3: 309.9 tok/s</title></circle><circle cx="607.0" cy="60.1" r="5" class="c-acc3"><title>E2E v5, Q3 down 0-15, INT8 V cache: 311.2 tok/s</title></circle><circle cx="645.0" cy="58.1" r="5" class="c-acc2"><title>3-bit proposal-head screen: 312.1 tok/s</title></circle><circle cx="683.0" cy="41.7" r="5" class="c-acc2"><title>conv epilogue, FP16 GDN state, L2 fills: 319.4 tok/s</title></circle><circle cx="721.0" cy="33.9" r="5" class="c-acc2"><title>row-pair attention, whole-program build: 322.9 tok/s</title></circle><text x="77.0" y="215.0" class="t-value" text-anchor="start" >237.6</text><text x="711.0" y="23.9" class="t-value" text-anchor="end" >322.9</text><circle cx="71" cy="282" r="5" class="c-acc3"/><text x="80.0" y="286.0" class="t-small" text-anchor="start" >quantization</text><circle cx="189" cy="282" r="5" class="c-warm"/><text x="198.0" y="286.0" class="t-small" text-anchor="start" >drafter and tree</text><circle cx="335" cy="282" r="5" class="c-acc2"/><text x="344.0" y="286.0" class="t-small" text-anchor="start" >kernels and engine</text></svg><figcaption><b>Figure 5.</b> Every adopted change, in order, from the release weights on our engine branch to the final configuration. Each point is one Spec-Bench-480 run made when the change was adopted; drift between sessions is about ±0.5%, so the last point (322.9) and the same-session value in Figure 1 (322.2) differ by that much. Hover over a point for the change it adds.</figcaption></figure>
+</section>
+
+<section id="quality">
+<h2>Checking the path that actually runs</h2>
+
+<p>The fidelity check above scores text through the <i>prefill</i> path. A speculative decoder spends its life
+elsewhere, in 16-token verify passes that read and write recurrent state between rounds, and some changes, such as
+FP16 state storage, exist only there. So we also measured the decode path directly. We run forced decoding on
+Spec-Bench prompts and dump the final hidden state at every accepted position. We then apply the BF16 head offline,
+exactly as the reference does, and score against an FP32 reference over the same text. Over about 40,000 positions,
+FP16 state moved KL<sub>64</sub> from 0.02125 to 0.02079 and perplexity from 1.1942 to 1.1930.</p>
+
+<p>The same tool exposed a bias in quality bars. Any perturbation that is not bit-exact loses 10–25 top-1 agreements
+out of about 46,000, whatever its size: rounding the state to 5 mantissa bits cost fewer than rounding it to FP16.
+Near a tie, the engine agrees with the reference more often than chance, because the two computations are close, and
+added noise of any size re-randomizes those ties. A rule like "top-1 must not drop" therefore rejects every harmless
+change. We used non-inferiority against the release instead and treated the top-1 headroom as a budget that each
+non-bit-exact change spends.</p>
+</section>
+
+<section id="negative">
+<h2>What did not work</h2>
+<div class="tbl"><table class="neg"><thead><tr><th>idea</th><th>result</th><th>why</th></tr></thead><tbody><tr><td>Trellis quantization (EXL3-style)</td><td>not adopted</td><td>Matching our scalar quality needs ≈3.75 bits per weight, at most 9% fewer bytes, and the decoder is slower.</td></tr><tr><td>Entropy-coded weights</td><td>closed</td><td>Decoding needs ≈2 T codes/s; the GPU decodes 1.5–1.65 T/s.</td></tr><tr><td>32-node verify trees</td><td>+11% tokens, +12–39% GEMM time</td><td>The activations outgrow the 16-column tiles.</td></tr><tr><td>Prefetching weights from a side stream</td><td>2–3% slower</td><td>It slows the co-scheduled kernel (1.7 → 16 µs), and the graph joins eat the gain.</td></tr><tr><td>GDN or attention work on a second stream</td><td>±0</td><td>The kernels share DRAM and stretch each other one for one.</td></tr><tr><td>RMSNorms folded into GEMM epilogues</td><td>±0</td><td>Removing the norm also removes the L2-fill window it carried.</td></tr><tr><td>Larger L2 fills</td><td>0.2–0.3% slower</td><td>The stretches they ride on are already full.</td></tr><tr><td>Four CTAs per SM for gate/up</td><td>4 µs slower per call</td><td>More CTAs mean more activation reloads and more L2 contention.</td></tr><tr><td>More drafter fine-tuning</td><td>±0</td><td>Higher rank, more epochs, soft labels and new data all saturate after one run.</td></tr><tr><td>Q3 GDN projections, Q5 MLP down</td><td>0.8% slower</td><td>Those kernels lose bandwidth; only Q3 MLP layers turn bytes into time.</td></tr><tr><td>2-bit LM-head screen</td><td>rejected</td><td>Top-1 recall is 0.987.</td></tr><tr><td>FP32 residual stream</td><td>top-1 unchanged</td><td>The top-1 loss comes from BF16 projection inputs and outputs, not the residual.</td></tr><tr><td>SM-balanced grids, NUMA pinning, split CUDA graphs</td><td>±0</td><td></td></tr></tbody></table></div>
+</section>
+
+<section id="suite">
+<h2>Other workloads</h2>
+<p>Spec-Bench contexts are short: the median verify step sees 236 cached tokens. The suite below adds structured output
+and prompts up to 32K tokens. The llama.cpp and vLLM columns are community recipes for this model as we could run them
+on this box, with the same client; we did not tune them further.</p>
+<div class="tbl"><table><thead><tr><th>workload</th><th>llama.cpp DFlash2 recipe*</th><th>vLLM DFlash2 recipe*</th><th>stock Cinference</th><th>our engine, release weights</th><th>ours</th></tr></thead><tbody><tr><td>JSON (77-token prompt)</td><td>121.0</td><td>266.2</td><td>249.9</td><td>312.6</td><td><b>401.2</b></td></tr><tr><td>code (69)</td><td>121.8</td><td>296.9</td><td>259.0</td><td>376.7</td><td><b>691.4</b></td></tr><tr><td>prose (34)</td><td>68.6</td><td>121.3</td><td>114.2</td><td>149.2</td><td><b>194.5</b></td></tr><tr><td>1,024-token answer</td><td>110.8</td><td>254.0</td><td>206.4</td><td>263.1</td><td><b>433.9</b></td></tr><tr><td>2K-token prompt</td><td>91.1</td><td>151.1</td><td>157.9</td><td>222.0</td><td><b>264.7</b></td></tr><tr><td>11K-token prompt</td><td>78.0</td><td>157.1</td><td>135.0</td><td>162.7</td><td><b>209.7</b></td></tr><tr><td>32K-token prompt</td><td>86.5</td><td>131.7</td><td>133.6</td><td>176.0</td><td><b>207.2</b></td></tr><tr><td>26K-token copy task</td><td>113.9</td><td>320.8</td><td>223.5</td><td>522.7</td><td><b>666.7</b></td></tr></tbody></table><p class="tnote">Decode tok/s as seen by a streaming client, median of 3, batch 1, greedy. * Measured 2026-10-03 with the same client on the same box; the others in the same session as Figure 1. Ours ran with a 49,152-token KV cache (see Limitations), the others with 65,536; rerunning our engine with release weights at 49,152 reproduced its column within 0.1 tok/s. Single prompts, so one near-tie can move a cell by several percent.</p></div>
+<p>The gain over the stock engine ranges from 1.55× to 2.98×. It is largest where the drafter is most often right:
+copying from context (12.7 tokens per round) and code (11.4). It is smallest on the 11K- and 32K-token feature and review prompts. There a
+round takes 18–20 ms instead of 17, because verify attention reads the whole cache, and rounds accept fewer than 4.2
+tokens.</p>
+</section>
+
+<section id="limits">
+<h2>Limitations</h2>
+<ul>
+<li>Batch size 1 and greedy decoding only. The two-level LM head returns no dense logits, so sampling needs the dense
+path.</li>
+<li>One machine type: an RTX 4090 at 450 W on PCIe Gen3. Most kernel decisions are specific to sm_89.</li>
+<li>Most Spec-Bench contexts are short. On 11K- and 32K-token prompts the gain over the stock engine falls from 1.81×
+to 1.55× (see the suite).</li>
+<li>Memory. The 3-bit planes, the 8-bit scale planes and the two LM-head screens are decode-only copies, about 4 GiB in
+all, held next to the Q4 weights that prefill still reads. The final configuration starts with a 57,344-token KV cache
+but not with 65,536, where the released weights on the same engine leave 2.75 GiB free. Prefill kernels that read the
+3-bit planes would remove the duplicate; we have not written them.</li>
+<li>The quality bar covers English prose and Python only.</li>
+<li>Comparisons with other engines use their published recipes, not our tuning.</li>
+</ul>
+</section>
+
+<section id="reproduce">
+<h2>Code and data</h2>
+<p>The engine changes are a series of small patches on the Cinference Ada port, each research feature behind an
+environment flag that is off by default. The tools for forced-text A/Bs, prefill and decode-path fidelity, nsys round
+accounting and the microbenchmarks are self-contained. Release details are pending. The configuration behind Figure 1 (the suite used a 49,152-token cache):</p>
+<pre class="cmd">NINFER_TWO_LEVEL_HEAD=1 NINFER_HEAD_SCREEN=3 NINFER_SCREEN_TILED=1 \
+NINFER_PROPOSAL_SCREEN=3 NINFER_TREE_TEMPERATURE=1.25 \
+NINFER_LS8=1 NINFER_Q3_SHADOW=1 NINFER_Q3_TILED=1 NINFER_DRAFT_CONV_Q4=1 \
+NINFER_KV_VI8=1 NINFER_GDN_STATE_F16=1 NINFER_GDN_CHUNKED_RECORD=1 \
+NINFER_CONV_EPILOGUE=1 NINFER_ATTN_ROWSPLIT=3 \
+NINFER_L2_FILL=121 NINFER_L2_FILL_NORM_KB=1536 NINFER_L2_FILL_POST_KB=768 \
+NINFER_L2_FILL_GATED_KB=768 NINFER_L2_FILL_RECORD_KB=2048 \
+NINFER_L2_FILL_ATTN_KB=4096 \
+ninfer-serve MODEL.ninfer --spec dflash2 --draft-tokens 15 --lm-head-draft \
+  --verify-tree --kv-dtype k8v4 --max-context 32768 --kv-capacity 32768 \
+  --max-concurrency 1 --prefill-chunk 1024 --temperature 0 --no-thinking \
+  --no-prefix-reuse</pre>
+</section>
+
+<section id="ack">
+<h2>Acknowledgments</h2>
+<p>This builds directly on NInfer (Neroued), Cinference (satellitedown) and jram4's Ada port; on DFlash2 (z-lab); on
+Spec-Bench (Xia et al.); and on the community llama.cpp and vLLM recipes for this model, which were our starting
+point.</p>
+<p class="note">A note on process: an AI coding agent (Claude Code) ran this project autonomously on the box for four
+days. It designed and ran the experiments, wrote the kernels and kept the research log, while the author set the
+goals, constraints and quality bar. Every number here comes from logged runs.</p>
+</section>
+
+<section id="citation">
+<h2>Citation</h2>
+<pre class="bib">@misc{peng2026qwen38rtx4090,
+  author = {Zedong Peng},
+  title  = {Qwen3.8-27B at 322 Tokens per Second on One RTX 4090},
+  year   = {2026},
+  month  = {oct},
+  note   = {Blog post}
+}</pre>
+</section>
+</main></body></html>
