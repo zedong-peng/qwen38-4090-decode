@@ -1,0 +1,24 @@
+{
+ "corpus_id": "fid-v1",
+ "streams": [
+  {
+   "id": "wiki",
+   "domain": "prose",
+   "path": "wiki100k.txt"
+  },
+  {
+   "id": "code",
+   "domain": "code",
+   "path": "cpython-difflib.py"
+  }
+ ],
+ "modes": {
+  "quick": [
+   "wiki"
+  ],
+  "full": [
+   "wiki",
+   "code"
+  ]
+ }
+}

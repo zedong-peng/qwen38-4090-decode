@@ -18,14 +18,22 @@ bit-exact and about 0.5% faster than the default `-rdc=true` build.
 
 ## Base
 
-The series applies on top of a local merge commit. To recreate it:
+The series applies on `base.diff`, which takes `jram4/ninfer-4090` at `70ebb1290dc7abe246c20696a24d21f77faee8d4` to
+our local merge commit:
+- `cbf7b7e` ("feat: sample MTP drafts with exact rejection correction") reverted. It conflicts with upstream's own
+  sparse-proposal and tree logic.
+- `satellitedown/cinference` at `383e5dbbaf927b562b11d7d48dbe4d10c1bf39bd` merged in, which brings verify trees,
+  prompt-lookup chains and the DFlash2 kernel passes. The merge conflicts in eight files; `base.diff` carries our
+  resolution.
 
-1. Start from `jram4/ninfer-4090` at `70ebb1290dc7abe246c20696a24d21f77faee8d4`.
-2. Revert `cbf7b7e` ("feat: sample MTP drafts with exact rejection correction"). It conflicts with upstream's own
-   sparse-proposal and tree logic.
-3. Merge `satellitedown/cinference` at `383e5dbbaf927b562b11d7d48dbe4d10c1bf39bd`, which brings verify trees,
-   prompt-lookup chains and the DFlash2 kernel passes.
-4. Apply the series with `git am *.patch`.
+```bash
+git checkout 70ebb1290dc7abe246c20696a24d21f77faee8d4
+git apply --index base.diff && git commit -m "Base: Cinference 383e5db merged into jram4 70ebb12, cbf7b7e reverted"
+git am *.patch
+```
+
+The result has the same tree as the source of the binary behind our numbers. ../../REPRODUCE.md has the build and run
+steps.
 
 Patch 0001 holds the Ada fixes the merge needs: E2M1 decode by FP16 bit placement, an mbarrier `test_wait`
 fallback, and NVFP4 stubs that fail closed.

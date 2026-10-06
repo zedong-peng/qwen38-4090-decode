@@ -77,7 +77,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--questions", required=True); ap.add_argument("--base-url", required=True)
     ap.add_argument("--label", required=True); ap.add_argument("--out", required=True)
-    ap.add_argument("--model", default="default"); ap.add_argument("--engine", default="other")
+    ap.add_argument("--model", default="qwen3.8-27b"); ap.add_argument("--engine", default="other")
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--per-category", type=int, default=0); ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--config", action="append", default=[], help="KEY=VALUE recorded in the metadata")

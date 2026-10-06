@@ -66,6 +66,11 @@ Idempotent source patchers (`python3 patch_x.py REPO`), all default off:
 - `patch_hidden_dump.py`: `NINFER_HIDDEN_DUMP=FILE` writes the prompt ids and the accepted path's head inputs of every
   verify round. Run it with `--no-cuda-graph`.
 
+## weights/: making the re-quantized container
+
+weights/README.md walks through the pipeline behind the Hugging Face container, step by step, with the scripts and the
+calibration and training windows.
+
 ## engine-series/: the engine commits
 
 53 `git format-patch` commits: the Ada port fixes and the research knobs, each default off, with its measured

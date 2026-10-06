@@ -290,8 +290,8 @@ read the 3-bit planes would remove the duplicate; we have not written them.</li>
 <li>The quality bar covers English prose and Python only.</li>
 <li>The other engines ran their published recipes without further tuning. We did not score their 4-bit builds
 with our fidelity harness, which runs inside our engine. vLLM ran with at most 2 sequences (8 runs out of memory at
-CUDA-graph capture on this card), a 4.8 GB KV pool and a 49,152-token context, the same context as our final
-configuration.</li>
+CUDA-graph capture on this card), a 4.8 GB KV pool and a 49,152-token context, the context our final configuration used for the single prompts
+(Spec-Bench prompts are short; our Spec-Bench runs used 32,768).</li>
 </ul>
 </section>
 
@@ -301,8 +301,10 @@ configuration.</li>
 Weights: <a href="https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090">huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090</a>.
 The engine changes are a series of 53 small patches on the Cinference Ada port, each research feature behind an
 environment flag that is off by default. The tools for forced-text A/Bs, prefill and decode-path fidelity, nsys round
-accounting, the microbenchmarks and the data behind every figure on this page are in the repository. The
-configuration behind our final Spec-Bench numbers:</p>
+accounting, the microbenchmarks and the data behind every figure on this page are in the repository.
+<a href="https://github.com/zedong-peng/qwen38-4090-decode/blob/master/REPRODUCE.md">REPRODUCE.md</a> goes step by step
+from a fresh clone to each Spec-Bench number: our engine on the official weights and on ours, and the vLLM and llama.cpp
+recipes. The configuration behind our final numbers:</p>
 <pre class="cmd">{{v:run_cmd}}</pre>
 </section>
 

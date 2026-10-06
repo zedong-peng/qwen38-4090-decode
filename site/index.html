@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Qwen3.8-27B on one RTX 4090</title>
+<link rel="canonical" href="https://zedongpeng.com/blog/2026/qwen38-4090-decode/">
+<script>/* On zedongpeng.com this file is shown inside the blog post (site navbar and footer); open it there. */
+if (window.top === window.self && location.pathname === "/assets/html/qwen38-4090-decode.html") location.replace("/blog/2026/qwen38-4090-decode/" + location.hash);</script>
 <meta name="description" content="Batch-1 speculative decoding of Qwen3.8-27B on one RTX 4090: 245 tok/s on the official weights and 322 with re-quantized ones, against 200 for vLLM and 102 for llama.cpp on the same card.">
 <style>:root{--bg:#fdfdfb;--fg:#1d1d1f;--mut:#5f6368;--rule:#e3e3df;--card:#f4f4f0;--card2:#ecece6;
 --acc1:#bcd3ea;--acc2:#6c9bd1;--acc3:#1f5aa6;--warm:#e0913a;--fill:#f2c38a;--idle:#e4e4de;--gray:#a5a5a0;--ink:#333;
@@ -483,8 +486,8 @@ read the 3-bit planes would remove the duplicate; we have not written them.</li>
 <li>The quality bar covers English prose and Python only.</li>
 <li>The other engines ran their published recipes without further tuning. We did not score their 4-bit builds
 with our fidelity harness, which runs inside our engine. vLLM ran with at most 2 sequences (8 runs out of memory at
-CUDA-graph capture on this card), a 4.8 GB KV pool and a 49,152-token context, the same context as our final
-configuration.</li>
+CUDA-graph capture on this card), a 4.8 GB KV pool and a 49,152-token context, the context our final configuration used for the single prompts
+(Spec-Bench prompts are short; our Spec-Bench runs used 32,768).</li>
 </ul>
 </section>
 
@@ -494,8 +497,10 @@ configuration.</li>
 Weights: <a href="https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090">huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090</a>.
 The engine changes are a series of 53 small patches on the Cinference Ada port, each research feature behind an
 environment flag that is off by default. The tools for forced-text A/Bs, prefill and decode-path fidelity, nsys round
-accounting, the microbenchmarks and the data behind every figure on this page are in the repository. The
-configuration behind our final Spec-Bench numbers:</p>
+accounting, the microbenchmarks and the data behind every figure on this page are in the repository.
+<a href="https://github.com/zedong-peng/qwen38-4090-decode/blob/master/REPRODUCE.md">REPRODUCE.md</a> goes step by step
+from a fresh clone to each Spec-Bench number: our engine on the official weights and on ours, and the vLLM and llama.cpp
+recipes. The configuration behind our final numbers:</p>
 <pre class="cmd">NINFER_TWO_LEVEL_HEAD=1 NINFER_HEAD_SCREEN=3 NINFER_SCREEN_TILED=1 \
 NINFER_PROPOSAL_SCREEN=3 NINFER_TREE_TEMPERATURE=1.25 \
 NINFER_LS8=1 NINFER_Q3_SHADOW=1 NINFER_Q3_TILED=1 NINFER_DRAFT_CONV_Q4=1 \
