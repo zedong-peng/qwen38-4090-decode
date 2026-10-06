@@ -6,8 +6,8 @@ and where to start next.
 
 ## Timeline
 
-Five days on one machine (4× RTX 4090, two of them ours), Oct 2–6, 2026. An AI coding agent ran the experiments and
-kept a research log of about 3,800 lines; the milestones below come from it. Within-day numbers come from different
+One machine (4× RTX 4090, two of them ours). Baselines on Oct 2, then four days of research, Oct 3–6, 2026, in which an
+AI coding agent ran the experiments and kept a research log of about 3,800 lines; the milestones below come from it. Within-day numbers come from different
 sessions, so treat differences under 1% between days as noise.
 
 | day | what happened | Spec-Bench-480, tok/s |
