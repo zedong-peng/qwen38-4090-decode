@@ -2,42 +2,30 @@
   <p class="kicker">Inference · Speculative decoding · RTX 4090</p>
   <h1>Qwen3.8-27B on one RTX 4090</h1>
   <p class="sub"><b>{{v:releng_tps0}}</b> tokens per second on the official weights. <b>{{v:final_tps0}}</b> with better ones.</p>
-  <p class="dek">Batch-1 speculative decoding on a consumer GPU is a memory-bandwidth problem. On the official weights,
-  our engine is {{v:engine_x}}× faster than the stock one. Re-quantizing the model, so that it ends up closer to full
-  precision than the official release, takes it to {{v:speedup}}×.</p>
+  <p class="dek">On the same card and benchmark, at batch size 1, vLLM decodes {{v:vllm_tps0}} tokens per second and
+  llama.cpp {{v:llama_tps0}}. Part I is the engine, run on the official release weights. Part II re-quantizes the model
+  so that it ends up closer to full precision than that release. Part III is about measuring differences of 0.3%.</p>
   <p class="byline"><a href="https://zedong-peng.github.io/">Zedong Peng</a> · October 2026</p>
   <nav class="links"><a href="#part1">Engine</a><a href="#part2">Weights</a><a href="#part3">Measurement</a><a href="#negative">What did not work</a><a href="https://github.com/zedong-peng/qwen38-4090-decode">Code</a><a href="https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090">Model</a></nav>
 </header>
 
 <figure data-fig="race" class="wide">
-<figcaption>Real decoding on one RTX 4090, replayed in your browser with its recorded timing. Each tape segment is one
-verify round, and its width is the number of tokens that round produced. The first lane decodes one token per
-forward pass. The other three use speculative decoding: the stock engine with a 7-token draft chain, our engine on
-the same official weights, and our engine with our re-quantized weights and fine-tuned drafter. Each prompt is the
-median prompt of its Spec-Bench category, ranked by tokens per round. The text can differ between lanes: different
-weights, or kernels of different shapes, break near-ties differently.</figcaption>
+<figcaption>Real decoding on one RTX 4090, replayed with its recorded timing from each lane's first token (this post is
+about decode speed; llama.cpp's first token takes about 0.55 s, the others' under 0.2 s). Each tape segment is one
+verify round, and its width is the number of tokens that round produced. The first lane decodes one token per forward pass; the
+others use speculative decoding, with the engines and weights of {{ref:board}}. Each prompt is the median prompt of its
+Spec-Bench category by our tokens per round. Lanes can produce different text: different weights, or kernels of
+different shapes, break near-ties differently.</figcaption>
 </figure>
 
-<aside class="tldr">
-  <h2>Summary</h2>
-  <ul>
-    <li><b>On the official weights</b>, our engine decodes Spec-Bench (480 prompts, greedy, batch 1) at
-      <b>{{v:releng_tps}} tok/s</b>, against {{v:stock_tps}} for the stock engine ({{v:engine_x}}×). Verify trees
-      accept 29% more tokens per round at the same round time, and kernel work makes rounds 6% shorter.</li>
-    <li><b>With our weights</b> it reaches <b>{{v:final_tps}} tok/s</b> ({{v:speedup}}×). Against an FP32 reference,
-      the re-quantized model has lower KL ({{v:kl_final}} vs {{v:kl_rel}}) and lower perplexity ({{v:ppl_final}} vs
-      {{v:ppl_rel}}) than the official release, with equal top-1 agreement. It reads 19% fewer target-weight bytes per round,
-      and accepts 5% more tokens per round.</li>
-    <li>All numbers in the comparison come from one session on one card. Most of the late gains were 0.3–1% each, and
-      we could only see them with forced-text, drift-balanced A/B tests.</li>
-  </ul>
-</aside>
-
-<figure data-fig="plane">
-<figcaption>Two ways to go faster. Throughput is tokens per round divided by time per round, so every dashed ray
-from the origin is a line of constant tok/s. The verify tree moves straight up (more tokens, same round time). Kernel
-work and fewer bytes move left. Switch to <i>By task type</i> to see the six Spec-Bench task groups: round time hardly
-depends on the task, while tokens per round ranges from 3 to 9. Hover over points and arrows for details.</figcaption>
+<figure data-fig="board">
+<figcaption>Decode speed by engine, all measured {{v:session}} on one RTX 4090 with the same streaming client (batch 1,
+greedy, thinking off). Spec-Bench is 480 prompts with 256 output tokens each. The single prompts add structured output and
+contexts up to 32K tokens; each is the median of 3 runs, and one near-tie can move a bar by several percent. Every
+engine runs a public 4-bit build of the official Qwen3.8-27B checkpoint with a DFlash2 drafter: llama.cpp a4d880f with
+unsloth's UD-Q4_K_XL and up to {{v:llama_n}} drafts; vLLM 0.27.1 with sidnaZ's single-user RTX 4090 recipe
+(AutoRound W4A16, 7 drafts); Cinference-4090, the engine we started from, and our engine, both on the NInfer release
+container. The last bar adds our weights. Hover over a bar for tokens per round and round time.</figcaption>
 </figure>
 
 <section id="problem">
@@ -56,27 +44,35 @@ choice, so the drafter can change speed but never the output. If a round accepts
 <i>t</i><sub>round</sub> ≈ bytes<sub>round</sub> / bandwidth + <i>t</i><sub>small kernels</sub> + <i>t</i><sub>idle</sub></p>
 
 <p>So there are three things to work on: the tokens a round accepts, the bytes it reads, and the time DRAM spends not
-streaming. {{ref:plane}} is the map: up is more tokens, left is shorter rounds.</p>
+streaming. {{ref:plane}} is the map of this post: up is more tokens, left is shorter rounds.</p>
+
+<figure data-fig="plane">
+<figcaption>Tokens per round against time per round on Spec-Bench; each dashed ray is a line of constant tok/s. From
+Cinference-4090, the verify tree moves straight up, and kernel work and fewer bytes move left. The diamonds are the
+other engines: vLLM's 7-draft chain accepts {{v:vllm_tau}} tokens per round in {{v:vllm_ms}} ms, llama.cpp
+{{v:llama_tau}} in {{v:llama_ms}} ms, and our final configuration {{v:final_tau}} in {{v:round_ms}} ms. <i>By task
+type</i> splits our configurations into the six Spec-Bench task groups: round time hardly depends on the task, while
+tokens per round ranges from 3 to 9. Hover over points and arrows for details.</figcaption>
+</figure>
 
 <p>The model is a hybrid: 48 Gated DeltaNet (linear-attention) layers and 16 full-attention layers, hidden size 5,120.
 The drafter is DFlash2, which reads the target's hidden states and proposes a whole block of tokens at once. The
 engine is Cinference, a descendant of NInfer, in jram4's port to Ada (sm_89). We merged upstream's verify trees into
-that port and added about 50 commits. The card is one RTX 4090 at its 450 W limit, on PCIe Gen3 with CUDA 12.8.</p>
+that port and added 53 commits. The card is one RTX 4090 at its 450 W limit, on PCIe Gen3 with CUDA 12.8.</p>
 </section>
 
 <div class="part" id="part1"><span class="pn">Part I</span><h2>The engine, on the official weights</h2></div>
 
 <p>Everything in this part runs the released container unchanged: target and drafter weights byte for byte as
-published. On Spec-Bench the stock engine runs at {{v:stock_tps}} tok/s, our engine's defaults at {{v:reldef_tps}}, and
-our engine with every change in this part at {{v:releng_tps}}.</p>
+published. It covers the first two arrows in {{ref:plane}}.</p>
 
 <h3>More tokens per round: verify trees</h3>
 
 <p>The cheapest win was already in upstream's code. Instead of one chain of drafts, the drafter's per-position
 candidates are grown best-first into a 16-node tree, and the target verifies the whole tree in one pass with a tree
 attention mask. A 16-node tree accepts 20% more tokens per round than a 16-token chain at the same cost. Against the
-stock engine's 7-token chain, our defaults accept 29% more tokens per round at the same round time, even though each
-round now verifies 16 positions instead of 8.</p>
+7-token chain of Cinference-4090, our defaults accept {{v:tree_tau_n}}% more tokens per round at the same round time,
+even though each round now verifies 16 positions instead of 8.</p>
 
 <figure data-fig="tree" class="wide">
 <figcaption>Real verify trees, from a dump of the final configuration on the same four prompts. Each bar in the strip
@@ -134,7 +130,7 @@ few microseconds. Extra CTAs in the same launch read the first megabytes of the 
 has 72 MB), so the GEMM starts warm. Results are bit-identical, because the fill only loads data.</figcaption>
 </figure>
 
-<p>Fills on five kernel types cut round time by about 0.5%, bit-exact. The accounting was subtle in two ways. First,
+<p>Fills on five kernel types cut round time by about 0.5%. The accounting was subtle in two ways. First,
 size matters: doubling the fills made rounds slower, because the stretches they ride on were already full. Second,
 deleting a small kernel also deletes its fill window. Our faster attention kernel at first showed no gain, because
 the old kernel had been carrying the fill for the next projection. Folding the RMSNorms into neighbouring GEMMs
@@ -175,8 +171,8 @@ ships only if every number, on prose and on code, is at least as good as the rel
 <h3>GPTQ, then spend the headroom</h3>
 
 <p>The release quantizes the target with round-to-nearest at 4 and 5 bits, and that leaves a lot on the table. GPTQ
-with act-order and a per-group clip search, at the release's own bit allocation, cuts KL<sub>64</sub> from 0.0668 to
-0.0421. Everything after that spends this headroom on bytes:</p>
+with act-order and a per-group clip search, at the release's own bit allocation, cuts KL<sub>64</sub> by more than a
+third. Everything after that spends this headroom on bytes:</p>
 
 <ol class="steps">
 <li><b>All projections at Q4, with 8-bit group scales.</b> This saves 1.8 GB per round. Larger calibration sets (96,
@@ -201,12 +197,8 @@ Bytes are not time: the GDN projections' 3-bit routes lost bandwidth, so only th
 speed.</figcaption>
 </figure>
 
-<figure data-fig="quality">
-<figcaption>Engine KL<sub>64</sub> against an FP32 reference, plotted against the target's weight bytes per round,
-computed from the bit allocation (the drafter and LM heads are excluded). GPTQ buys quality at the release's own size,
-and each later step spends some of it on bytes. The final model reads 19% fewer target bytes than the release at
-lower KL. Hover over a point or a list item. Top-1 agreement, not KL, ended up being the binding constraint.</figcaption>
-</figure>
+<p>Step by step, the final model reads 19% fewer target bytes per round than the release, at lower KL and
+perplexity:</p>
 
 {{table:quality}}
 
@@ -224,8 +216,8 @@ that was measured in the engine.</p>
 
 <p>The drafter scores only a 131,072-token shortlist of the 248,320-token vocabulary, and a target token outside the
 shortlist ends the draft. Re-ranking the shortlist with the target's own outputs cut those misses from 0.96% to 0.35%
-of tokens, worth 2% more tokens per round. And because the drafter can never change the output, only acceptance, its
-precision is a free parameter. Q4 and Q3 drafter projections paid for themselves once they ran on kernels that stream
+of tokens, worth 2% more tokens per round. The drafter's own precision is a free parameter, since it can only
+change acceptance. Q4 and Q3 drafter projections paid for themselves once they ran on kernels that stream
 at full bandwidth.</p>
 
 <h3>Checking the path that actually runs</h3>
@@ -269,44 +261,15 @@ costs came from unprofiled logs, because tracing inflates them several-fold.</li
 </ol>
 
 <figure data-fig="drift">
-<figcaption>The last adopted change, measured: an 8 MB versus a 4 MB L2 fill before verify attention. Eight runs in
-the order A B B A B A A B on one GPU, each a full forced-text Spec-Bench pass. Over the eight runs the card drifts
-by about 0.2%, more than the effect. Because the order is orthogonal to linear and quadratic drift, both analyses give
-the same estimate (B is 0.16% faster), but a two-sample interval that ignores the drift is about twice as wide as one
-from a fit that removes it. Switch to <i>Drift removed</i> to see the fit: the configurations separate into two tight
-lines.</figcaption>
+<figcaption>The last adopted change, measured: an 8 MB versus a 4 MB L2 fill before verify attention, in eight
+forced-text Spec-Bench runs. Over the eight runs the card drifts by about 0.2%, more than the effect. Both analyses
+estimate B to be 0.16% faster, but the interval that ignores the drift is about twice as wide as the one from the
+drift fit. <i>Drift removed</i> shows the fit: the two configurations separate into two tight lines.</figcaption>
 </figure>
-
-<figure data-fig="progress">
-<figcaption>Every adopted change, in order, from the official weights on our engine branch (with the two-level LM
-head) to the final configuration. Each point is one Spec-Bench-480 run made when the change was adopted. Drift
-between sessions is about ±0.5%, so the last point (322.9) and the same-session value in {{ref:plane}} ({{v:final_tps}})
-differ by that much. Hover over the legend to see each kind of change's steps.</figcaption>
-</figure>
-
-<section id="suite">
-<h2>Other workloads</h2>
-<p>Spec-Bench contexts are short: the median verify step sees 236 cached tokens. The suite below adds structured output
-and prompts up to 32K tokens. The llama.cpp and vLLM bars are community recipes for this model as we could run them
-on this box, with the same client; we did not tune them further.</p>
-
-<figure data-fig="suite">
-<figcaption>Decode tok/s as seen by a streaming client, median of 3, batch 1, greedy, one prompt per workload.
-* llama.cpp and vLLM were measured on 2026-10-03 with the same client on the same box; the other three bars in the
-same session as the Spec-Bench numbers. † Our engine with defaults on the official weights. Our final configuration
-ran with a 49,152-token KV cache (see Limitations), the others with 65,536. Rerunning our engine on the official
-weights at 49,152 reproduced its bars within 0.1 tok/s. Single prompts, so one near-tie can move a bar by several
-percent.</figcaption>
-</figure>
-
-<p>The gain over the stock engine ranges from 1.55× to 2.98×. It is largest where the drafter is most often right:
-copying from context (12.7 tokens per round) and code (11.4). It is smallest on the 11K- and 32K-token feature and
-review prompts. There a round takes 18–20 ms instead of 17, because verify attention reads the whole cache, and rounds
-accept fewer than 4.2 tokens.</p>
-</section>
 
 <section id="negative">
 <h2>What did not work</h2>
+<p>Besides the dead ends described above:</p>
 {{table:negative}}
 </section>
 
@@ -315,15 +278,20 @@ accept fewer than 4.2 tokens.</p>
 <ul>
 <li>Batch size 1 and greedy decoding only. The two-level LM head returns no dense logits, so sampling needs the dense
 path.</li>
-<li>One machine type: an RTX 4090 at 450 W on PCIe Gen3. Most kernel decisions are specific to sm_89.</li>
-<li>Most Spec-Bench contexts are short. On 11K- and 32K-token prompts the gain over the stock engine falls from 1.81×
-to 1.55×.</li>
+<li>One machine type. Most kernel decisions are specific to the 4090 (sm_89).</li>
+<li>Most Spec-Bench contexts are short: the median verify step sees 236 cached tokens. On the 11K- and 32K-token
+prompts of {{ref:board}}, verify attention reads the whole cache, rounds take {{v:long_ms}} ms instead of
+{{v:round_ms}} and accept fewer tokens, and the gain over Cinference-4090 falls from {{v:speedup}}× to
+{{v:long_x_stock}}× (over vLLM, to {{v:long_x_vllm}}×).</li>
 <li>Memory. The 3-bit planes, the 8-bit scale planes and the two LM-head screens are decode-only copies, about 4 GiB
 in all, held next to the Q4 weights that prefill still reads. The final configuration starts with a 57,344-token KV
 cache but not with 65,536, where the official weights on the same engine leave 2.75 GiB free. Prefill kernels that
 read the 3-bit planes would remove the duplicate; we have not written them.</li>
 <li>The quality bar covers English prose and Python only.</li>
-<li>Comparisons with other engines use their published recipes, not our tuning.</li>
+<li>The other engines ran their published recipes without further tuning. We did not score their 4-bit builds
+with our fidelity harness, which runs inside our engine. vLLM ran with at most 2 sequences (8 runs out of memory at
+CUDA-graph capture on this card), a 4.8 GB KV pool and a 49,152-token context, the same context as our final
+configuration.</li>
 </ul>
 </section>
 
@@ -334,7 +302,7 @@ Weights: <a href="https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090">hug
 The engine changes are a series of 53 small patches on the Cinference Ada port, each research feature behind an
 environment flag that is off by default. The tools for forced-text A/Bs, prefill and decode-path fidelity, nsys round
 accounting, the microbenchmarks and the data behind every figure on this page are in the repository. The
-configuration behind the Spec-Bench numbers (the suite used a 49,152-token cache):</p>
+configuration behind our final Spec-Bench numbers:</p>
 <pre class="cmd">{{v:run_cmd}}</pre>
 </section>
 

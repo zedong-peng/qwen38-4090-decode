@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Race data for the write-up: per-chunk (= per verify round) arrival times and texts from race_capture.py, with
+"""Race data for the write-up: per-round arrival times and texts from race_capture.py, with
 tokens per chunk from re-tokenizing the streamed text (token start offsets inside each chunk's character span).
 usage: blog_race.py TOKENIZER.json OUT.json LABEL=FILE ..."""
 import json, sys
 from tokenizers import Tokenizer
 tok = Tokenizer.from_file(sys.argv[1])
+MERGE_S = 0.002
 out = {}
 for arg in sys.argv[3:]:
     lab, f = arg.split("=", 1)
     d = json.load(open(f))
     rows = []
     for r in d["rows"]:
+        # llama.cpp streams one SSE event per token: events that arrive within MERGE_S of the previous one belong to the
+        # same verify round (rounds are >= 8 ms apart on every engine here)
+        merged = []
+        for t, x in r["chunks"]:
+            if merged and t - merged[-1][2] < MERGE_S:
+                merged[-1][1] += x; merged[-1][2] = t
+            else:
+                merged.append([t, x, t])
+        r["chunks"] = [[t, x] for t, x, _ in merged]
         txt = "".join(c[1] for c in r["chunks"])
         enc = tok.encode(txt, add_special_tokens=False)
         starts = [o[0] for o in enc.offsets]

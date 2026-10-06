@@ -6,7 +6,7 @@ FIGS.plane = (fig) => {
   const W = 760, H = 460, l = 62, r = 116, t = 18, b = 52;
   const svg = svgRoot(W, H, "tokens per round versus milliseconds per round");
   let mode = "overall", dom = null, stop = () => {};
-  const DOMS = { overall: [15.5, 24, 3.6, 5.9], tasks: [15.5, 24, 2.8, 9.6] };
+  const DOMS = P.doms || { overall: [15.5, 24, 3.6, 5.9], tasks: [15.5, 24, 2.8, 9.6] };
   const ctl = h("div", { class: "fig-controls" },
     seg([["overall", "Spec-Bench overall"], ["tasks", "By task type"]], mode, (m) => go(m), "view"));
   mount(fig, ctl, svg);
@@ -81,6 +81,26 @@ FIGS.plane = (fig) => {
         st.lines.forEach((tx, j) => s("tspan", { x: mx + st.dx, dy: j ? 15 : 0, text: tx }, lab));
       }
       void ln;
+    }
+    // other engines: reference points, not part of our path
+    if (mode === "overall") for (const c of P.others || []) {
+      const off = c.ms > x1, cx = off ? W - r + 12 : sx(c.ms), cy = sy(c.tau), rr = 9;
+      const shape = off ? `M${cx - rr},${cy - rr} L${cx + rr},${cy} L${cx - rr},${cy + rr} Z`
+        : `M${cx},${cy - rr} L${cx + rr},${cy} L${cx},${cy + rr} L${cx - rr},${cy} Z`;
+      const dot = s("path", { d: shape, class: "pt-other e-" + c.key }, svg);
+      if (off) {
+        // off the chart to the right: marker and label sit in the right margin
+        const lab = s("text", { x: cx + 14, y: cy - 12, class: "t-small" }, svg);
+        s("tspan", { x: cx + 14, dy: 0, class: "t-strong", text: c.short }, lab);
+        s("tspan", { x: cx + 14, dy: 15, text: `${fmt(c.tps, 1)} tok/s` }, lab);
+        s("tspan", { x: cx + 14, dy: 15, text: `${fmt(c.ms, 1)} ms →` }, lab);
+        hover(dot, () => `<b>${escH(c.label)}</b><br>${fmt(c.tau, 2)} tokens/round · ${fmt(c.ms, 1)} ms/round<br><b>${fmt(c.tps, 1)} tok/s</b> on Spec-Bench-480`);
+        continue;
+      }
+      hover(dot, () => `<b>${escH(c.label)}</b><br>${fmt(c.tau, 2)} tokens/round · ${fmt(c.ms, 1)} ms/round<br><b>${fmt(c.tps, 1)} tok/s</b> on Spec-Bench-480`);
+      const lab = s("text", { x: cx + c.lx, y: cy + c.ly, class: "t-label", "text-anchor": c.anchor || "start" }, svg);
+      s("tspan", { x: cx + c.lx, dy: 0, class: "t-strong", text: `${fmt(c.tps, 1)} tok/s` }, lab);
+      s("tspan", { x: cx + c.lx, dy: 16, class: "t-small", text: c.short }, lab);
     }
     pts.forEach((c) => {
       const [cx, cy] = pos(c);

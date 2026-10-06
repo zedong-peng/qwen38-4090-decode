@@ -1,0 +1,556 @@
+{
+ "sb": {
+  "sb-final-a": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 313.88,
+    "tau": 5.215,
+    "ms": 16.62
+   },
+   "translation": {
+    "n": 80,
+    "tps": 291.8,
+    "tau": 4.973,
+    "ms": 17.04
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 275.75,
+    "tau": 4.687,
+    "ms": 17.0
+   },
+   "qa": {
+    "n": 80,
+    "tps": 247.03,
+    "tau": 4.179,
+    "ms": 16.92
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 532.75,
+    "tau": 8.919,
+    "ms": 16.74
+   },
+   "rag": {
+    "n": 80,
+    "tps": 353.96,
+    "tau": 5.961,
+    "ms": 16.84
+   },
+   "overall": {
+    "n": 480,
+    "tps": 322.32,
+    "tau": 5.427,
+    "ms": 16.84
+   }
+  },
+  "sb-final-b": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 313.22,
+    "tau": 5.215,
+    "ms": 16.65
+   },
+   "translation": {
+    "n": 80,
+    "tps": 291.27,
+    "tau": 4.973,
+    "ms": 17.07
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 275.46,
+    "tau": 4.687,
+    "ms": 17.01
+   },
+   "qa": {
+    "n": 80,
+    "tps": 247.38,
+    "tau": 4.179,
+    "ms": 16.89
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 533.31,
+    "tau": 8.919,
+    "ms": 16.72
+   },
+   "rag": {
+    "n": 80,
+    "tps": 354.78,
+    "tau": 5.961,
+    "ms": 16.8
+   },
+   "overall": {
+    "n": 480,
+    "tps": 322.34,
+    "tau": 5.427,
+    "ms": 16.84
+   }
+  },
+  "sb-rel-eng": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 238.16,
+    "tau": 4.984,
+    "ms": 20.93
+   },
+   "translation": {
+    "n": 80,
+    "tps": 220.61,
+    "tau": 4.829,
+    "ms": 21.89
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 209.21,
+    "tau": 4.469,
+    "ms": 21.36
+   },
+   "qa": {
+    "n": 80,
+    "tps": 192.5,
+    "tau": 4.064,
+    "ms": 21.11
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 398.57,
+    "tau": 8.304,
+    "ms": 20.83
+   },
+   "rag": {
+    "n": 80,
+    "tps": 266.84,
+    "tau": 5.685,
+    "ms": 21.31
+   },
+   "overall": {
+    "n": 480,
+    "tps": 245.18,
+    "tau": 5.181,
+    "ms": 21.13
+   }
+  },
+  "sb-rel-def": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 225.78,
+    "tau": 5.05,
+    "ms": 22.36
+   },
+   "translation": {
+    "n": 80,
+    "tps": 207.48,
+    "tau": 4.836,
+    "ms": 23.31
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 197.19,
+    "tau": 4.479,
+    "ms": 22.72
+   },
+   "qa": {
+    "n": 80,
+    "tps": 178.71,
+    "tau": 4.039,
+    "ms": 22.6
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 370.74,
+    "tau": 8.266,
+    "ms": 22.29
+   },
+   "rag": {
+    "n": 80,
+    "tps": 248.9,
+    "tau": 5.641,
+    "ms": 22.67
+   },
+   "overall": {
+    "n": 480,
+    "tps": 229.84,
+    "tau": 5.185,
+    "ms": 22.56
+   }
+  },
+  "sb-stock": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 169.9,
+    "tau": 3.827,
+    "ms": 22.53
+   },
+   "translation": {
+    "n": 80,
+    "tps": 168.49,
+    "tau": 3.899,
+    "ms": 23.14
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 156.33,
+    "tau": 3.561,
+    "ms": 22.78
+   },
+   "qa": {
+    "n": 80,
+    "tps": 143.2,
+    "tau": 3.237,
+    "ms": 22.6
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 266.71,
+    "tau": 5.986,
+    "ms": 22.44
+   },
+   "rag": {
+    "n": 80,
+    "tps": 196.01,
+    "tau": 4.463,
+    "ms": 22.77
+   },
+   "overall": {
+    "n": 480,
+    "tps": 177.89,
+    "tau": 4.027,
+    "ms": 22.63
+   }
+  },
+  "sb-llama-n4": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 95.74,
+    "tau": 3.333,
+    "ms": 34.81
+   },
+   "translation": {
+    "n": 80,
+    "tps": 93.75,
+    "tau": 3.164,
+    "ms": 33.75
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 91.84,
+    "tau": 3.204,
+    "ms": 34.89
+   },
+   "qa": {
+    "n": 80,
+    "tps": 84.98,
+    "tau": 2.92,
+    "ms": 34.36
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 121.24,
+    "tau": 4.309,
+    "ms": 35.54
+   },
+   "rag": {
+    "n": 80,
+    "tps": 101.82,
+    "tau": 3.611,
+    "ms": 35.47
+   },
+   "overall": {
+    "n": 480,
+    "tps": 97.81,
+    "tau": 3.414,
+    "ms": 34.91
+   }
+  },
+  "sb-llama-n7": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 99.21,
+    "tau": 3.961,
+    "ms": 39.92
+   },
+   "translation": {
+    "n": 80,
+    "tps": 94.99,
+    "tau": 3.603,
+    "ms": 37.93
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 91.7,
+    "tau": 3.645,
+    "ms": 39.75
+   },
+   "qa": {
+    "n": 80,
+    "tps": 83.29,
+    "tau": 3.289,
+    "ms": 39.49
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 144.31,
+    "tau": 5.994,
+    "ms": 41.53
+   },
+   "rag": {
+    "n": 80,
+    "tps": 110.66,
+    "tau": 4.455,
+    "ms": 40.26
+   },
+   "overall": {
+    "n": 480,
+    "tps": 102.22,
+    "tau": 4.09,
+    "ms": 40.01
+   }
+  },
+  "sb-vllm-k7": {
+   "mt_bench": {
+    "n": 80,
+    "tps": 195.05
+   },
+   "translation": {
+    "n": 80,
+    "tps": 212.15
+   },
+   "summarization": {
+    "n": 80,
+    "tps": 177.08
+   },
+   "qa": {
+    "n": 80,
+    "tps": 161.87
+   },
+   "math_reasoning": {
+    "n": 80,
+    "tps": 289.76
+   },
+   "rag": {
+    "n": 80,
+    "tps": 214.75
+   },
+   "overall": {
+    "n": 480,
+    "tps": 200.3,
+    "tau": 4.065,
+    "ms": 20.29
+   }
+  }
+ },
+ "suite": {
+  "ss-vllm-k7": {
+   "json": {
+    "tps": 264.0,
+    "tau": 5.31
+   },
+   "code": {
+    "tps": 294.9,
+    "tau": 5.94
+   },
+   "prose": {
+    "tps": 120.6,
+    "tau": 2.43
+   },
+   "sustained_decode": {
+    "tps": 252.6,
+    "tau": 5.12
+   },
+   "short_refactor": {
+    "tps": 150.1,
+    "tau": 3.13
+   },
+   "medium_feature": {
+    "tps": 156.0,
+    "tau": 3.4
+   },
+   "long_review": {
+    "tps": 130.7,
+    "tau": 3.12
+   },
+   "context_copy": {
+    "tps": 316.9,
+    "tau": 7.3
+   }
+  },
+  "ss-llama-n4": {
+   "json": {
+    "tps": 121.3,
+    "tau": 4.28
+   },
+   "code": {
+    "tps": 121.2,
+    "tau": 4.38
+   },
+   "prose": {
+    "tps": 68.8,
+    "tau": 2.36
+   },
+   "sustained_decode": {
+    "tps": 110.8,
+    "tau": 3.95
+   },
+   "short_refactor": {
+    "tps": 92.4,
+    "tau": 3.31
+   },
+   "medium_feature": {
+    "tps": 78.6,
+    "tau": 2.83
+   },
+   "long_review": {
+    "tps": 86.8,
+    "tau": 3.28
+   },
+   "context_copy": {
+    "tps": 114.6,
+    "tau": 4.37
+   }
+  },
+  "ss-llama-n7": {
+   "json": {
+    "tps": 141.9,
+    "tau": 5.7
+   },
+   "code": {
+    "tps": 144.6,
+    "tau": 6.02
+   },
+   "prose": {
+    "tps": 64.0,
+    "tau": 2.5
+   },
+   "sustained_decode": {
+    "tps": 126.9,
+    "tau": 5.25
+   },
+   "short_refactor": {
+    "tps": 93.5,
+    "tau": 3.8
+   },
+   "medium_feature": {
+    "tps": 76.5,
+    "tau": 3.16
+   },
+   "long_review": {
+    "tps": 87.4,
+    "tau": 3.73
+   },
+   "context_copy": {
+    "tps": 127.2,
+    "tau": 5.36
+   }
+  },
+  "ss-stock": {
+   "json": {
+    "tps": 249.9,
+    "tau": 5.7
+   },
+   "code": {
+    "tps": 259.0,
+    "tau": 5.82
+   },
+   "prose": {
+    "tps": 114.3,
+    "tau": 2.59
+   },
+   "sustained_decode": {
+    "tps": 206.6,
+    "tau": 4.7
+   },
+   "short_refactor": {
+    "tps": 158.1,
+    "tau": 3.66
+   },
+   "medium_feature": {
+    "tps": 135.0,
+    "tau": 3.2
+   },
+   "long_review": {
+    "tps": 133.6,
+    "tau": 3.25
+   },
+   "context_copy": {
+    "tps": 223.7,
+    "tau": 5.48
+   }
+  },
+  "ss-rel-eng": {
+   "json": {
+    "tps": 349.1,
+    "tau": 7.08
+   },
+   "code": {
+    "tps": 390.1,
+    "tau": 8.13
+   },
+   "prose": {
+    "tps": 143.7,
+    "tau": 3.03
+   },
+   "sustained_decode": {
+    "tps": 284.3,
+    "tau": 6.02
+   },
+   "short_refactor": {
+    "tps": 211.5,
+    "tau": 4.52
+   },
+   "medium_feature": {
+    "tps": 173.1,
+    "tau": 3.85
+   },
+   "long_review": {
+    "tps": 169.9,
+    "tau": 4.09
+   },
+   "context_copy": {
+    "tps": 508.2,
+    "tau": 11.48
+   }
+  },
+  "ss-final": {
+   "json": {
+    "tps": 400.6,
+    "tau": 7.04
+   },
+   "code": {
+    "tps": 690.2,
+    "tau": 11.38
+   },
+   "prose": {
+    "tps": 194.1,
+    "tau": 3.26
+   },
+   "sustained_decode": {
+    "tps": 433.4,
+    "tau": 7.31
+   },
+   "short_refactor": {
+    "tps": 264.4,
+    "tau": 4.52
+   },
+   "medium_feature": {
+    "tps": 209.6,
+    "tau": 3.79
+   },
+   "long_review": {
+    "tps": 207.6,
+    "tau": 4.13
+   },
+   "context_copy": {
+    "tps": 666.9,
+    "tau": 12.68
+   }
+  }
+ },
+ "vllm_counters": {
+  "vllm:spec_decode_num_drafts": 20260.0,
+  "vllm:spec_decode_num_draft_tokens": 141820.0,
+  "vllm:spec_decode_num_accepted_tokens": 62087.0
+ },
+ "vllm_tau": 4.064511352418559
+}
