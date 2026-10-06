@@ -1,5 +1,10 @@
 # Qwen3.8-27B speculative decoding on one RTX 4090
 
+**Write-up:** [zedong-peng.github.io/assets/html/qwen38-4090-decode.html](https://zedong-peng.github.io/assets/html/qwen38-4090-decode.html) · **Weights:** [zedongpeng/Qwen3.8-27B-NInfer-4090](https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090)
+
+245 tok/s on the official weights (1.38× the stock engine) and 322 tok/s with re-quantized weights that are closer to
+full precision than the official release (1.81×), on Spec-Bench, batch 1, greedy, one RTX 4090.
+
 The write-up, engine patches and measurement tools from a four-day speed study: Qwen3.8-27B with a DFlash2 drafter,
 batch 1, greedy, on a single RTX 4090.
 

@@ -6,7 +6,7 @@
   our engine is {{v:engine_x}}× faster than the stock one. Re-quantizing the model, so that it ends up closer to full
   precision than the official release, takes it to {{v:speedup}}×.</p>
   <p class="byline"><a href="https://zedong-peng.github.io/">Zedong Peng</a> · October 2026</p>
-  <nav class="links"><a href="#part1">Engine</a><a href="#part2">Weights</a><a href="#part3">Measurement</a><a href="#negative">What did not work</a><a href="#reproduce">Code</a></nav>
+  <nav class="links"><a href="#part1">Engine</a><a href="#part2">Weights</a><a href="#part3">Measurement</a><a href="#negative">What did not work</a><a href="https://github.com/zedong-peng/qwen38-4090-decode">Code</a><a href="https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090">Model</a></nav>
 </header>
 
 <figure data-fig="race" class="wide">
@@ -329,10 +329,12 @@ read the 3-bit planes would remove the duplicate; we have not written them.</li>
 
 <section id="reproduce">
 <h2>Code and data</h2>
-<p>The engine changes are a series of small patches on the Cinference Ada port, each research feature behind an
+<p>Code: <a href="https://github.com/zedong-peng/qwen38-4090-decode">github.com/zedong-peng/qwen38-4090-decode</a>.
+Weights: <a href="https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090">huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090</a>.
+The engine changes are a series of 53 small patches on the Cinference Ada port, each research feature behind an
 environment flag that is off by default. The tools for forced-text A/Bs, prefill and decode-path fidelity, nsys round
-accounting and the microbenchmarks are self-contained. Release details are pending. The configuration behind the
-Spec-Bench numbers (the suite used a 49,152-token cache):</p>
+accounting, the microbenchmarks and the data behind every figure on this page are in the repository. The
+configuration behind the Spec-Bench numbers (the suite used a 49,152-token cache):</p>
 <pre class="cmd">{{v:run_cmd}}</pre>
 </section>
 

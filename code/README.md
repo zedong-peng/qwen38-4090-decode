@@ -68,7 +68,7 @@ Idempotent source patchers (`python3 patch_x.py REPO`), all default off:
 
 ## engine-series/: the engine commits
 
-49 `git format-patch` commits: the Ada port fixes and research knobs 1–35, each default off, with its measured
+53 `git format-patch` commits: the Ada port fixes and the research knobs, each default off, with its measured
 effect in the commit message. engine-series/README.md describes the base to apply them on.
 
 ## License
