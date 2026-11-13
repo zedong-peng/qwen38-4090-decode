@@ -182,7 +182,7 @@ more KL per byte saved than early ones, and code is 4× more sensitive than pros
 in layers 0–15 now run at Q3. They stay in the existing Q4 container as codes restricted to [−4, 3] and are repacked
 into 3-bit tiles at load, so no new file format was needed. The Q4 copy stays resident for prefill (see
 Limitations).</li>
-<li><b>End-to-end scale tuning.</b> With the integer codes frozen, we train only the group scales, a per-row offset
+<li><b>End-to-end scale tuning.</b> With the integer codes frozen, we train only one scale offset per output row
 and the RMSNorm gains (4.6 M parameters) to match the BF16 model's output distribution on held-out text, in the
 spirit of EfficientQAT's E2E-QP. The engine's exact KV-cache codec runs inside the training loop. Held-out KL drops
 10.5%, most of it on code.</li>
@@ -226,7 +226,7 @@ at full bandwidth.</p>
 elsewhere, in 16-token verify passes that read and write recurrent state between rounds, and some changes, such as
 FP16 state storage, exist only there. So we also measured the decode path directly. We run forced decoding on
 Spec-Bench prompts and dump the final hidden state at every accepted position. We then apply the BF16 head offline,
-exactly as the reference does, and score against an FP32 reference over the same text. Over about 40,000 positions,
+exactly as the reference does, and score against a reference pass of the BF16 checkpoint over the same text. Over about 40,000 positions,
 FP16 state moved KL<sub>64</sub> from 0.02125 to 0.02079 and perplexity from 1.1942 to 1.1930.</p>
 
 <p>The same tool exposed a bias in quality bars. Any perturbation that is not bit-exact loses 10–25 top-1 agreements
@@ -284,8 +284,8 @@ prompts of {{ref:board}}, verify attention reads the whole cache, rounds take {{
 {{v:round_ms}} and accept fewer tokens, and the gain over Cinference-4090 falls from {{v:speedup}}× to
 {{v:long_x_stock}}× (over vLLM, to {{v:long_x_vllm}}×).</li>
 <li>Memory. The 3-bit planes, the 8-bit scale planes and the two LM-head screens are decode-only copies, about 4 GiB
-in all, held next to the Q4 weights that prefill still reads. The final configuration starts with a 57,344-token KV
-cache but not with 65,536, where the official weights on the same engine leave 2.75 GiB free. Prefill kernels that
+in all, held next to the Q4 weights that prefill still reads. The final configuration starts with a {{v:ctx_ok}}-token KV
+cache but not with {{v:ctx_oom}}, where the official weights on the same engine leave {{v:rel_free_gib}} GiB free. Prefill kernels that
 read the 3-bit planes would remove the duplicate; we have not written them.</li>
 <li>The quality bar covers English prose and Python only.</li>
 <li>The other engines ran their published recipes without further tuning. We did not score their 4-bit builds

@@ -4,9 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Qwen3.8-27B on one RTX 4090</title>
-<link rel="canonical" href="https://zedongpeng.com/blog/2026/qwen38-4090-decode/">
-<script>/* On zedongpeng.com this file is shown inside the blog post (site navbar and footer); open it there. */
-if (window.top === window.self && location.pathname === "/assets/html/qwen38-4090-decode.html") location.replace("/blog/2026/qwen38-4090-decode/" + location.hash);</script>
 <meta name="description" content="Batch-1 speculative decoding of Qwen3.8-27B on one RTX 4090: 245 tok/s on the official weights and 322 with re-quantized ones, against 200 for vLLM and 102 for llama.cpp on the same card.">
 <style>:root{--bg:#fdfdfb;--fg:#1d1d1f;--mut:#5f6368;--rule:#e3e3df;--card:#f4f4f0;--card2:#ecece6;
 --acc1:#bcd3ea;--acc2:#6c9bd1;--acc3:#1f5aa6;--warm:#e0913a;--fill:#f2c38a;--idle:#e4e4de;--gray:#a5a5a0;--ink:#333;
@@ -27,8 +24,8 @@ if (window.top === window.self && location.pathname === "/assets/html/qwen38-409
 html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
 body{margin:0;background:var(--bg);color:var(--fg);font:17px/1.65 Charter,"Bitstream Charter","Sitka Text",Cambria,Georgia,serif}
 main{max-width:720px;margin:0 auto;padding:56px 16px 96px}
-h1,h2,h3,.kicker,.byline,.links,figcaption,.tnote,table,.tldr h2,nav,.fig-controls,.legend-row,.tip,.meter,.race-tapes,
-.race-card,.tree-info,.part,.qp-list,.noscript,.hint{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif}
+h1,h2,h3,.kicker,.byline,.links,figcaption,.tnote,table,nav,.fig-controls,.legend-row,.tip,.meter,.race-tapes,
+.race-card,.tree-info,.part,.noscript,.hint{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif}
 h1{font-size:2.5rem;line-height:1.1;letter-spacing:-.02em;margin:.25em 0 .2em}
 .sub{font:500 1.45rem/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;letter-spacing:-.01em;margin:0 0 .6em}
 .sub b{color:var(--acc3)}
@@ -44,9 +41,6 @@ h3{font-size:1.08rem;margin:1.8em 0 .4em}
 .links a{font-size:.85rem;border:1px solid var(--rule);border-radius:999px;padding:3px 12px;text-decoration:none;color:var(--fg)}
 .links a:hover{border-color:var(--acc2)}
 a{color:var(--link)}
-.tldr{background:var(--card);border-radius:12px;padding:14px 22px 8px;margin:28px 0}
-.tldr h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:var(--mut);margin:.4em 0 .2em}
-.tldr li{margin:.5em 0}
 ul,ol{padding-left:1.3em}
 li{margin:.3em 0}
 .steps>li{margin:.7em 0}
@@ -83,15 +77,13 @@ button.lg-item{cursor:pointer}button.lg-item:hover{color:var(--fg)}
 .sw{display:inline-block;width:11px;height:11px;border-radius:2px}.sw.round{border-radius:50%}
 /* svg text and marks */
 svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Helvetica Neue",Arial,sans-serif;fill:var(--fg)}
-.t-label{font-size:14px}.t-small{font-size:12px;fill:var(--mut)}.t-value,.t-strong{font-weight:600}.t-strong{fill:var(--fg)}
-.t-axis{font-size:12px;fill:var(--mut)}.t-in{font-size:12.5px;fill:#fff;font-weight:500}.t-num{font-size:11px;font-weight:700;fill:#fff}
+.t-label{font-size:14px}.t-small{font-size:12px;fill:var(--mut)}.t-strong{font-weight:600}.t-strong{fill:var(--fg)}
+.t-axis{font-size:12px;fill:var(--mut)}.t-in{font-size:12.5px;fill:#fff;font-weight:500}
 .t-iso{font-size:11px;fill:var(--mut)}.t-step{font-size:12.5px;font-weight:600;fill:var(--fg)}.t-phase{font-size:11px;fill:var(--mut)}
 .t-tok{font:12px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:var(--fg)}
 .t-cell{font-size:12.5px;font-weight:600;fill:var(--fg)}.t-cell2{font-size:11px;fill:var(--mut)}
-.c-acc1{fill:var(--acc1)}.c-acc2{fill:var(--acc2)}.c-acc3{fill:var(--acc3)}.c-warm{fill:var(--warm)}.c-gray{fill:var(--gray)}
-.c-idle{fill:var(--idle)}.c-fill{fill:var(--fill)}.c-ink{fill:var(--ink)}.op{opacity:.55}
+.c-fill{fill:var(--fill)}.c-ink{fill:var(--ink)}.op{opacity:.55}
 .grid{stroke:var(--rule);stroke-width:1}.tick{stroke:var(--mut)}.band{fill:var(--band)}
-.bar-line{stroke:var(--gray);stroke-width:1.5;stroke-dasharray:5 4}
 .path{stroke:var(--ink);stroke-width:1.3;fill:none;transition:opacity .4s}
 .step{stroke:var(--mut);stroke-width:1.6;fill:none}
 .hit{fill:transparent;stroke:transparent;stroke-width:16;cursor:crosshair}
@@ -161,11 +153,6 @@ border-radius:8px;padding:10px 12px;max-height:150px;overflow-y:auto}
 .m-mark{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--fg)}
 .m-mark span{position:absolute;left:5px;top:-15px;font-size:.68rem;white-space:nowrap;color:var(--mut)}
 .m-note{margin:.5em 0 .1em;color:var(--mut);line-height:1.45}
-/* quality path */
-.qp{transition:opacity .4s}.qp.hl circle{stroke:var(--fg);stroke-width:2.5}
-.ok-zone{fill:var(--good);opacity:.06}
-.qp-list{font-size:.8rem;margin:8px 0 0;columns:2;column-gap:28px;padding-left:1.4em}
-.qp-list li{margin:.15em 0;break-inside:avoid;cursor:default}
 /* drift */
 .run-a{fill:var(--warm)}.run-b{fill:var(--acc3)}
 .drift{fill:none;stroke-width:1.5;stroke-dasharray:4 3}.drift.a{stroke:var(--warm)}.drift.b{stroke:var(--acc3)}
@@ -189,7 +176,6 @@ details{margin:12px 0}summary{cursor:pointer;font:600 .9rem -apple-system,BlinkM
   .tape-axis{margin:0 78px 0 0}
   .race-grid{grid-template-columns:1fr}.race-text{height:110px}
   .m-row{grid-template-columns:1fr 70px}.m-bar{grid-column:1/-1;grid-row:2}
-  .qp-list{columns:1}
   .svg-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -16px;padding:0 16px}
   .svg-wrap svg{min-width:640px}
   figure.wide .svg-wrap svg{min-width:760px}
@@ -380,7 +366,7 @@ more KL per byte saved than early ones, and code is 4× more sensitive than pros
 in layers 0–15 now run at Q3. They stay in the existing Q4 container as codes restricted to [−4, 3] and are repacked
 into 3-bit tiles at load, so no new file format was needed. The Q4 copy stays resident for prefill (see
 Limitations).</li>
-<li><b>End-to-end scale tuning.</b> With the integer codes frozen, we train only the group scales, a per-row offset
+<li><b>End-to-end scale tuning.</b> With the integer codes frozen, we train only one scale offset per output row
 and the RMSNorm gains (4.6 M parameters) to match the BF16 model's output distribution on held-out text, in the
 spirit of EfficientQAT's E2E-QP. The engine's exact KV-cache codec runs inside the training loop. Held-out KL drops
 10.5%, most of it on code.</li>
@@ -423,7 +409,7 @@ at full bandwidth.</p>
 elsewhere, in 16-token verify passes that read and write recurrent state between rounds, and some changes, such as
 FP16 state storage, exist only there. So we also measured the decode path directly. We run forced decoding on
 Spec-Bench prompts and dump the final hidden state at every accepted position. We then apply the BF16 head offline,
-exactly as the reference does, and score against an FP32 reference over the same text. Over about 40,000 positions,
+exactly as the reference does, and score against a reference pass of the BF16 checkpoint over the same text. Over about 40,000 positions,
 FP16 state moved KL<sub>64</sub> from 0.02125 to 0.02079 and perplexity from 1.1942 to 1.1930.</p>
 
 <p>The same tool exposed a bias in quality bars. Any perturbation that is not bit-exact loses 10–25 top-1 agreements
@@ -1212,7 +1198,6 @@ FIGS.tree = (fig) => {
     ctx.innerHTML = `<span class="mut">${escH(before)}</span><span class="acc">${escH(accText)}</span><span class="bon">${escH(r.bonus || "")}</span>`;
     ctx.scrollTop = ctx.scrollHeight;
   }
-  function lastTok(t) { const m = t.match(/(\s*\S+|\s+)$/); return m ? m[0] : t.slice(-6); }
   function clip(t, n) { return t.length > n ? t.slice(0, Math.max(1, n - 1)) + "…" : t; }
   ri = q0(0);
   draw();

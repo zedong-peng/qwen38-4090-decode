@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Calibration sets beyond c192: N_WIKI wikitext-2 train windows + N_CODE windows of CPython stdlib source. The module list
-starts with make_calib3.py's twenty-three (so its windows are a prefix of these) and appends more stdlib modules until the
+starts with the twenty-three of the earlier c192 set (so that set's windows are a prefix of these) and appends more stdlib modules until the
 code stream is long enough; none is difflib (the eval code stream).
 usage: make_calib4.py OUT.windows.bin N_WIKI N_CODE"""
 import os, struct, sys, sysconfig

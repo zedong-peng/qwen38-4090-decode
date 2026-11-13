@@ -4,8 +4,8 @@ These are the tools behind the Qwen3.8-27B + DFlash2 speed study in the write-up
 questions:
 
 1. **Is B faster than A?** This covers changes as small as 0.3%, including changes that alter the generated text.
-2. **Did the change cost quality?** Measured against an FP32-compute reference, on both the prefill path and the
-   decode (verify) path.
+2. **Did the change cost quality?** Measured against the BF16 checkpoint's own distributions, on both the prefill
+   path and the decode (verify) path.
 3. **Where does a decode round spend its time?** Read from nsys traces.
 
 The Python tools need only numpy (plus torch and transformers for the reference); the Spec-Bench client uses the stdlib
@@ -29,15 +29,18 @@ Protocol that made 0.3% measurable:
    job, so prefer A B B A B A A B and `sb_balanced.py`, which removes linear and quadratic drift.
 3. **`sb_paired.py` for the intervals.** Use nsys per-call medians (`profiling/kern_grep.py`) to explain the result.
 
-## fidelity/: quality against an FP32-compute reference
+## fidelity/: quality against the unquantized checkpoint
 
 | tool | what it does |
 |---|---|
-| `ref_bf16.py MODEL_DIR WINDOWS.bin OUT` | Reference distributions: the BF16 checkpoint layer-streamed through the transformers `qwen3_5` modules on one 24 GB GPU, FP32 logits. Writes the top-64 per scored column. |
+| `ref_bf16.py MODEL_DIR WINDOWS.bin OUT` | Reference distributions: the BF16 checkpoint layer-streamed through the transformers `qwen3_5` modules on one 24 GB GPU, BF16 activations and FP32 logits. Writes the top-64 per scored column. |
 | `ref_var.py` | The same for windows of different lengths. |
 | `fidelity.py WINDOWS.bin REF CAND [report.json]` | KL64 (KL(ref‖cand) on the reference's top-64 support, with the candidate's exact logits), top-1 agreement and PPL, per domain. |
 | `top1_flips.py REF BASE CAND...` | Top-1 agreements gained and lost against a base. Shows when a top-1 change is noise. |
 | `dfid.py` | **Decode-path fidelity.** Scores a forced run's verify-path head inputs (`NINFER_HIDDEN_DUMP`) against `ref_var.py` on the same text. |
+
+The prefill numbers in the write-up use a third reference, `../weights/fq_eval.py --mode ref`: the same layer
+streaming with FP32 activations, in the same record format. `ref_var.py` is the reference of the decode-path numbers.
 
 Why `dfid.py` exists: a prefill-based scorer never runs the verify forward. Per-round numerics are invisible to it,
 for example GDN state stored in FP16, or a norm folded into a GEMM epilogue.
@@ -61,9 +64,11 @@ nsys inflates host-side time severalfold, so price host costs from unprofiled re
 
 ## engine-patches/: research hooks for Cinference
 
-Idempotent source patchers (`python3 patch_x.py REPO`), all default off:
+Idempotent source patchers (`python3 patch_x.py REPO`), all default off. They are patches 0005, 0032 and 0049 of
+engine-series/ as scripts, for a Cinference tree without the series (each applies to upstream Cinference at `383e5db`). A tree built from the
+series already has them.
 - `patch_force_tokens.py`: `NINFER_FORCE_TOKENS=FILE` forces the greedy tree walk onto reference ids, for forced-text
-  A/Bs.
+  A/Bs. The reference ids are a `NINFER_TOKEN_DUMP` file, which patch 0015 of the series writes.
 - `patch_score_dump.py`: `NINFER_SCORE_DUMP=PREFIX` and `NINFER_SCORE_REF=REF.topk.bin` make the perplexity scorer
   write the top-64 and the at-reference logits.
 - `patch_hidden_dump.py`: `NINFER_HIDDEN_DUMP=FILE` writes the prompt ids and the accepted path's head inputs of every
@@ -81,4 +86,4 @@ effect in the commit message. engine-series/README.md describes the base to appl
 
 ## License
 
-Apache-2.0 (see LICENSE). The engine patches modify Apache-2.0 code from NInfer and Cinference; see NOTICE.
+Apache-2.0 (see ../LICENSE). The engine patches modify Apache-2.0 code from NInfer and Cinference; see NOTICE.

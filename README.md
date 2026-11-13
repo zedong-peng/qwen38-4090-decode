@@ -1,6 +1,6 @@
 # Qwen3.8-27B speculative decoding on one RTX 4090
 
-**Write-up:** [zedongpeng.com/blog/2026/qwen38-4090-decode](https://zedongpeng.com/blog/2026/qwen38-4090-decode/) · **Weights:** [zedongpeng/Qwen3.8-27B-NInfer-4090](https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090)
+**Post:** [zedongpeng.com/blog/2026/qwen38-4090-decode](https://zedongpeng.com/blog/2026/qwen38-4090-decode/) · **Weights:** [zedongpeng/Qwen3.8-27B-NInfer-4090](https://huggingface.co/zedongpeng/Qwen3.8-27B-NInfer-4090)
 
 On Spec-Bench (batch 1, greedy) on one RTX 4090: 245.2 tok/s on the official release weights and 322.3 tok/s with
 re-quantized weights that are closer to full precision than that release. vLLM's community recipe for this card
@@ -8,14 +8,14 @@ decodes 200.3 tok/s on the same benchmark and llama.cpp's 102.2 tok/s.
 
 | path | contents |
 |---|---|
-| `site/` | The write-up as one self-contained HTML page (`index.html`, works offline) with eight interactive figures. `build.py` inlines `article.html`, `style.css`, `js/*.js` and the data in `data.json` and `data/` (recorded decoding streams, verify-tree dumps, nsys round timelines, the engine comparison). |
+| `site/` | The full write-up as one self-contained HTML page (`index.html`, open it locally; the post above is a shorter version) with eight interactive figures. `build.py` inlines `article.html`, `style.css`, `js/*.js` and the data in `data.json` and `data/` (recorded decoding streams, verify-tree dumps, nsys round timelines, the engine comparison). |
 | `REPRODUCE.md` | Build the engine, download either container and rerun Spec-Bench: 245 tok/s on the official weights, 322 on ours. Also the vLLM and llama.cpp recipes we compared against. |
 | `code/engine-series/`, `code/reproduce/` | `base.diff` plus 53 patches on the Cinference `ada-dflash2` tree. Every research feature sits behind an environment flag that is off by default; `serve.sh` starts each measured configuration. |
 | `NOTES.md` | For whoever picks this up: the timeline, the lessons that cost the most, and where to start next. |
 | `code/weights/` | How the re-quantized weights were made: GPTQ, 3-bit layers, end-to-end scale tuning, drafter fine-tuning and conversion, with the scripts, calibration data and arguments we ran. |
-| `code/specbench/`, `code/fidelity/`, `code/profiling/`, `code/microbench/` | Forced-text and drift-balanced A/Bs, prefill and decode-path fidelity against an FP32 reference, nsys round accounting, and kernel microbenchmarks. See `code/README.md`. |
+| `code/specbench/`, `code/fidelity/`, `code/profiling/`, `code/microbench/` | Forced-text and drift-balanced A/Bs, prefill and decode-path fidelity against the unquantized checkpoint, nsys round accounting, and kernel microbenchmarks. See `code/README.md`. |
 | `code/site-data/`, `code/release/` | Scripts that turn raw runs into the page's data; the Hugging Face model card and the container-provenance sanitizer. |
 
 Rebuild the page: `cd site && python3 build.py`.
 
-Code is Apache-2.0 (see `code/LICENSE` and `code/NOTICE`), following the upstream NInfer / Cinference license.
+Code is Apache-2.0 (see `LICENSE` and `code/NOTICE`), following the upstream NInfer / Cinference license.

@@ -46,7 +46,7 @@ class Weights:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir"); ap.add_argument("windows"); ap.add_argument("out")
-    ap.add_argument("--batch", type=int, default=4); ap.add_argument("--vocab-rows", type=int, default=0)
+    ap.add_argument("--batch", type=int, default=4); ap.add_argument("--vocab-rows", type=int, default=248077)
     ap.add_argument("--device", default="cuda:0")
     a = ap.parse_args()
     dev = torch.device(a.device)

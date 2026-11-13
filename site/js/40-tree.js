@@ -113,7 +113,6 @@ FIGS.tree = (fig) => {
     ctx.innerHTML = `<span class="mut">${escH(before)}</span><span class="acc">${escH(accText)}</span><span class="bon">${escH(r.bonus || "")}</span>`;
     ctx.scrollTop = ctx.scrollHeight;
   }
-  function lastTok(t) { const m = t.match(/(\s*\S+|\s+)$/); return m ? m[0] : t.slice(-6); }
   function clip(t, n) { return t.length > n ? t.slice(0, Math.max(1, n - 1)) + "…" : t; }
   ri = q0(0);
   draw();

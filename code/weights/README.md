@@ -93,7 +93,7 @@ Spec-Bench source). The target answers them greedily (≤ 512 tokens); the engin
 epoch (61 minutes).
 
 ```bash
-python draft_ft_prompts.py $O/prompts-8k.jsonl 8000          # reads the four datasets from data/draft-ft/src
+python draft_ft_prompts.py $O/prompts-8k.jsonl 8000          # reads the four datasets below from data/draft-ft/src
 # a server on a quantized target (we used an earlier all-Q4 GPTQ container; any close one works):
 bash ../reproduce/serve.sh ours MODEL.ninfer 8080 &
 python draft_ft_generate.py http://127.0.0.1:8080 $O/prompts-8k.jsonl $O/gen.jsonl 512
@@ -102,6 +102,16 @@ python draft_ft_features.py http://127.0.0.1:8080 $O/gen.jsonl $O/dump $O/index.
 python draft_ft_train.py --data $O --drafter $DRAFT --target $SRC --out $O/run1 --block 16 --epochs 1 \
   --eval-every 1000 --eval-seqs 200                          # merged BF16 drafter in $O/run1/drafter
 ```
+
+`draft_ft_prompts.py` reads one file of each dataset (Hugging Face datasets, `main`), kept at its path in the
+dataset under `data/draft-ft/src/NAME/`:
+
+| NAME | dataset | file |
+|---|---|---|
+| `ultrachat` | `HuggingFaceH4/ultrachat_200k` | `data/train_sft-00000-of-00003-a3ecf92756993583.parquet` |
+| `gsm8k` | `openai/gsm8k` | `main/train-00000-of-00001.parquet` |
+| `magicoder` | `ise-uiuc/Magicoder-OSS-Instruct-75K` | `data-oss_instruct-decontaminated.jsonl` |
+| `codealpaca` | `sahil2801/CodeAlpaca-20k` | `code_alpaca_20k.json` |
 
 ## 5. Drafter GPTQ
 
@@ -120,7 +130,12 @@ python merge_dcodes.py $O/dcodes-q4 $O/dcodes-q3 $O/dcodes-q4q3mlp mlp.gate_proj
 
 The drafter proposes from a 131,072-token shortlist. The released ranking comes from a generic corpus and misses 0.95%
 of the target's output tokens, mostly markdown. `shortlist_mix.py` mixes in the target's own output frequencies from the
-fine-tune responses (λ = 0.5; held-out misses 0.35%). The result is `data/mix05.counts.i64`.
+fine-tune responses (λ = 0.5; held-out misses 0.35%). The result is `data/mix05.counts.i64`. We ran it over four
+index files, 15,972 sequences: the two halves of run1's data and of a second round of 8,000 prompts. With one file:
+
+```bash
+cd $ENGINE && python /path/to/code/weights/shortlist_mix.py mix05.counts.i64 $O/index.jsonl --lambda 0.5
+```
 
 ## 7. Convert
 

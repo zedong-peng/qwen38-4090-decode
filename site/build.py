@@ -192,6 +192,8 @@ V = {
     "long_x_vllm": f"{min(ratio('final', 'vllm', w) for w in LONG):.2f}",
     "tree_tau_n": f"{abs(100 * (P1['tau'] / P0['tau'] - 1)):.0f}",
     "session": "in one session",
+    "ctx_ok": f"{D['memory']['final_ctx_max_tested']:,}", "ctx_oom": f"{D['memory']['final_ctx_oom']:,}",
+    "rel_free_gib": f"{D['memory']['release_free_at_65536_gib']:.2f}",
 }
 _fs = next(e for e in BOARD["engines"] if e["key"] == "final")["suite"]
 _lm = [1000 * _fs[w]["tau"] / _fs[w]["tps"] for w in LONG if _fs[w].get("tau")]
@@ -259,16 +261,12 @@ js += "\nfor (const f of document.querySelectorAll('figure[data-fig]')) { const 
       "if (fn) try { fn(f); } catch (e) { console.error(f.dataset.fig, e); } }\n"
 data_js = "window.__DATA__=" + json.dumps(DATA, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/") + ";"
 title = re.sub(r"<[^>]+>", "", re.search(r"<h1>(.*?)</h1>", art, re.S)[1]).strip()
-POST_URL = "https://zedongpeng.com/blog/2026/qwen38-4090-decode/"
 page = f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)}</title>
-<link rel="canonical" href="{POST_URL}">
-<script>/* On zedongpeng.com this file is shown inside the blog post (site navbar and footer); open it there. */
-if (window.top === window.self && location.pathname === "/assets/html/qwen38-4090-decode.html") location.replace("/blog/2026/qwen38-4090-decode/" + location.hash);</script>
 <meta name="description" content="Batch-1 speculative decoding of Qwen3.8-27B on one RTX 4090: {V['releng_tps0']} tok/s on the official weights and {V['final_tps0']} with re-quantized ones, against {V['vllm_tps0']} for vLLM and {V['llama_tps0']} for llama.cpp on the same card.">
 <style>{css}</style>
 </head>

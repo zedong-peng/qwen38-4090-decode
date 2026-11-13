@@ -41,4 +41,4 @@ fallback, and NVFP4 stubs that fail closed.
 ## License
 
 The engine is Apache-2.0: NInfer (Neroued) → Cinference (satellitedown) → the jram4 Ada port. These patches are
-modifications of that code under the same license; see ../LICENSE and ../NOTICE.
+modifications of that code under the same license; see ../../LICENSE and ../NOTICE.
