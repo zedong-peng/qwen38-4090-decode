@@ -1,22 +1,22 @@
-"""qwen3_8_27b with externally chosen target codes (tools/fq_eval.py --save-codes).
+"""qwen3_8_27b with externally chosen target codes (fq_eval.py --save-codes).
 
 Target layer projections import codes from --source gptq=DIR. GPTQ_VARIANT selects formats:
 official (the release's Q4/Q5 split), q4down (official with Q4 MLP down) or allq4. The embedding and
 head stay Q8 absmax, GDN a/b BF16. DRAFTER_FORMAT (q8 default, the released container's choice;
 q6, q5, q4) sets the DFlash2 drafter projections except its fused attention query/key/value input,
-which stays Q8 (its only native form). With --source dcodes=DIR (tools/draft_gptq.py) those drafter
+which stays Q8 (its only native form). With --source dcodes=DIR (draft_gptq.py) those drafter
 projections import their codes from DIR in DRAFTER_FORMAT instead of being rounded here.
 DRAFTER_KEEP_Q8 (comma-separated name suffixes, e.g. feature_projection,/attention/output) keeps
 those drafter projections Q8 whatever DRAFTER_FORMAT says; DRAFTER_Q4 (same syntax) rounds those to Q4.
 GPTQ_Q4_GROUPS (gdn_vz,gdn_out,attn_gv,attn_out,down) and GPTQ_Q4_LAYERS (e.g. 0-31) switch further
 parents to Q4 on top of the official split. GPTQ_Q3_LAYERS (e.g. 0-15) with --source q3=DIR (a Q3-grid store,
-tools/fq_eval.py --recipe allq3) imports those layers' GPTQ_Q3_ROLES (default mlp gate,up) from DIR, still as
+fq_eval.py --recipe allq3) imports those layers' GPTQ_Q3_ROLES (default mlp gate,up) from DIR, still as
 Q4 objects: their codes lie in [-4, 3], which the engine's NINFER_Q3_SHADOW=1 repacks into Q3 planes.
 GPTQ_Q3_SPEC (e.g. "mlp/gate,mlp/up:0-15;gdn/query,gdn/key:0-31") gives per-role layer ranges instead; a
 half-grid store (odd codes) works the same way.
-GPTQ_Q5_SPEC (same syntax, e.g. "mlp/down:32-47;gdn/value,gdn/z:32-63") with --source q5=DIR (tools/fq_eval.py
+GPTQ_Q5_SPEC (same syntax, e.g. "mlp/down:32-47;gdn/value,gdn/z:32-63") with --source q5=DIR (fq_eval.py
 --recipe allq5) makes those objects Q5 and imports their codes from DIR (bit rebalancing: Q5 where Q4 costs the most KL).
-usage: python -m tools.convert ... --recipe W/tools/gptq_recipe.py --source gptq=DIR
+usage: python -m tools.convert ... --recipe /path/to/gptq_recipe.py --source gptq=DIR   (cwd = the engine tree)
 """
 import os
 

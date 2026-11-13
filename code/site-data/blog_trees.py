@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Verify trees for the write-up from NINFER_TREE_DUMP + NINFER_TOKEN_DUMP (same parsing and best-first growth as
-tools/tree_sim.py at the deployed budget N = 15 and tree temperature). Each round: the 15 drafted nodes (parent, depth,
+"""Verify trees for the write-up from NINFER_TREE_DUMP + NINFER_TOKEN_DUMP (the selector's best-first
+growth replayed at the deployed budget N = 15 and tree temperature). Each round: the 15 drafted nodes (parent, depth,
 token text), which of them the target accepted, and the target's own bonus token. The replay must match the run's
 own per-round acceptance (next root - this root); rounds where it does not are reported and dropped.
 usage: blog_trees.py DUMPDIR TOKENIZER.json OUT.json [TEMP=1.25] [FIRST_REQ=2]"""

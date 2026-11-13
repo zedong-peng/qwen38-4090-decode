@@ -6,8 +6,8 @@ appends to FILE, for batch row 0:
 - at a request's first prefill chunk: i32 1, i32 P, i32 prompt_ids[P];
 - per verify round, after the accept: i32 2, i32 frontier (before the accept), i32 count, bf16 [count][hidden],
   the final-normed head inputs of the accepted path (count = accepted drafts + 1).
-Column c of a round predicts the token at sequence position frontier + 1 + c. tools/dfid.py turns the dumps into
-logits with the checkpoint's head and scores them against tools/ref_var.py on the same text.
+Column c of a round predicts the token at sequence position frontier + 1 + c. ../fidelity/dfid.py turns the dumps into
+logits with the checkpoint's head and scores them against ../fidelity/ref_var.py on the same text.
 Run with --no-cuda-graph: the host code of a captured round runs once.
 usage: patch_hidden_dump.py REPO"""
 import os, sys

@@ -15,7 +15,7 @@ proposal shortlist re-ranked by the target's own outputs (data/mix05.counts.i64)
 Inputs: [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) at `1d4bf0f` (BF16, 52 GB) and
 [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) at `50307d4`. Hardware: one 24 GB GPU and at
 least 64 GB of free host RAM (GPTQ on 768 windows keeps 34 GB of calibration activations on the host; E2E peaks at 64 GB).
-Python: torch with CUDA, safetensors, tokenizers, numpy, pyarrow. The converter and the engine come from the engine
+Python: torch with CUDA, transformers (its `qwen3_5` modules), safetensors, tokenizers, numpy, pyarrow. The converter and the engine come from the engine
 build in ../../REPRODUCE.md (`tools/convert` in that tree).
 
 Everything below runs from this directory. Shorthands:

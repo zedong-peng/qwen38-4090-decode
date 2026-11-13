@@ -20,7 +20,7 @@ of a Cinference scoring dump, in its record format.
           reproduces a target on the calibration tokens (sym: the FP MLP on the quantized stream's MLP input;
           asym: the FP layer's output on the FP stream minus the quantized stream's residual, i.e. the whole layer
           output matches the FP model); 1 in 20 calibration windows is held out and the best held-out step is kept.
-usage: fq_eval.py MODEL_DIR WINDOWS.bin OUT --mode ref|rtn|gptq [--recipe official|allq4]
+usage: fq_eval.py MODEL_DIR WINDOWS.bin OUT --mode ref|rtn|gptq|codes|exl3 [--recipe official|allq4|q4down|allq3|allq5]
                   [--calib calib.windows.bin] [--ref REF.topk.bin] [--save-codes DIR]"""
 import argparse, copy, json, os, shutil, struct, time
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
@@ -138,9 +138,9 @@ KEEP_U = [False, None]  # --mlp-ap: gptq() leaves the continuous pre-rounding co
 
 
 def gptq(w, H, qmin, qmax, group=64, block=128, damp=0.01):
+    """qmin/qmax: per-row tensors. Returns the dequantized FP32 weight, int8 codes, FP16 scales."""
     if ACT_ORDER:
         return gptq_act_order(w, H, qmin, qmax, group, block, damp)
-    """qmin/qmax: per-row tensors. Returns the dequantized FP32 weight, int8 codes, FP16 scales."""
     W = w.float().clone(); n, k = W.shape
     set_row_super(W, qmax, group)
     H = H.clone()
@@ -312,7 +312,7 @@ def row_formats(name, rows, recipe, cfg):
 
 
 def group_rows(stem, n, groups, cfg):
-    """Rows of HF tensor `stem` that belong to the engine parent groups (see build_hybrid.py)."""
+    """Rows of HF tensor `stem` that belong to the engine parent groups."""
     m = torch.zeros(n, dtype=torch.bool)
     d, heads = cfg.head_dim, cfg.num_attention_heads
     kg = cfg.linear_num_key_heads * cfg.linear_key_head_dim
@@ -349,7 +349,7 @@ QUANT_SUFFIXES = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.wei
                   "in_proj_z.weight", "out_proj.weight", "gate_proj.weight", "up_proj.weight", "down_proj.weight")
 
 
-# ---- engine KV cache codecs (--kv; see tools/patch_fq_kv.py) ----
+# ---- engine KV cache codecs (--kv) ----
 _HADAMARD = {}
 
 
@@ -436,12 +436,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir"); ap.add_argument("windows"); ap.add_argument("out")
     ap.add_argument("--mode", required=True, choices=["ref", "rtn", "gptq", "codes", "exl3"])
-    ap.add_argument("--codes", help="--mode codes: evaluate the codes store DIR (tools/gptq_recipe.py format)")
+    ap.add_argument("--codes", help="--mode codes: evaluate the codes store DIR (gptq_recipe.py format)")
     ap.add_argument("--exl3", help="--mode exl3: ExLlamaV3 model DIR whose layer projections replace the weights")
     ap.add_argument("--codes-b", help="--mode codes: second store; rows of --groups come from it")
     ap.add_argument("--q4-groups", default="", help="gptq/rtn: also store these parent groups as Q4")
     ap.add_argument("--q4-layers", default="", help="layers where --q4-groups apply (default all)")
-    ap.add_argument("--groups", default="", help="parent groups taken from --codes-b (build_hybrid.py names)")
+    ap.add_argument("--groups", default="", help="parent groups taken from --codes-b (the names in group_rows)")
     ap.add_argument("--codes-c", help="--mode codes: third store; rows of --groups-c come from it")
     ap.add_argument("--groups-c", default="", help="per-group layer ranges taken from --codes-c (gate_up:0-15,...)")
     ap.add_argument("--group-layers", default="", help="layers (e.g. 0-15,40) where --groups apply; default all")
@@ -458,7 +458,7 @@ def main():
     ap.add_argument("--vocab-rows", type=int, default=248077); ap.add_argument("--damp", type=float, default=0.01)
     ap.add_argument("--damp-diag", type=float, default=0.0, help="GPTQ: add d * diag(H) to H before --damp")
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--save-codes", help="write a converter codes store (tools/gptq_recipe.py) to DIR")
+    ap.add_argument("--save-codes", help="write a converter codes store (gptq_recipe.py) to DIR")
     ap.add_argument("--save-hidden", action="store_true", help="also write OUT.hidden.pt (final-layer states)")
     ap.add_argument("--rotate", default="", help="KIND:SEED (haar|had): residual rotation folded into the weights")
     ap.add_argument("--asym", type=float, default=0.0, help="gptq: asymmetric calibration strength (see top)")
@@ -479,7 +479,7 @@ def main():
     ap.add_argument("--q3-groups", default="", help="gptq/rtn: parent groups on the 3-bit grid [-4, 3] with layer "
                     "ranges, e.g. gate_up:0-15,gdn_qk:0-31 (ranges joined by '+'); those rows must be Q4 in the recipe")
     ap.add_argument("--kv", default="bf16", choices=["bf16", "k8v4", "k8v8", "k8vi8", "fp8", "int8"],
-                    help="engine KV cache codec applied to K/V in every attention layer (tools/patch_fq_kv.py)")
+                    help="engine KV cache codec applied to K/V in every attention layer")
     ap.add_argument("--rotate-inputs", default="", help="KIND:SEED: rotate only the normed inputs of the residual "
                     "readers (online in an engine): quantize W R^T, apply Q(W R^T) R; writers and norms untouched")
     ap.add_argument("--mlp-stats", help="--mode ref: write per-layer MLP channel statistics to FILE and stop")

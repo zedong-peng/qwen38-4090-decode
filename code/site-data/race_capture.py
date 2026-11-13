@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Per-round replay capture for the write-up: streams Spec-Bench prompts and records every SSE content chunk with its
-arrival time (one chunk per verify round on Cinference). Same request body as bench_stream.stream_chat.
+arrival time (one chunk per verify round on Cinference). Same request body as ../specbench/specbench.py's stream_chat.
 usage: race_capture.py --base-url URL --label L --out FILE --qids 122,88,413,258 [--max-tokens 256]"""
 import argparse, json, os, time, urllib.request
 

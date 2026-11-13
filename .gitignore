@@ -1,1 +1,4 @@
 reproduce-work/
+__pycache__/
+*.pyc
+CLAUDE.local.md

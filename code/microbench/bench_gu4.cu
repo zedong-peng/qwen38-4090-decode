@@ -1,10 +1,6 @@
 // Q4 gate/up at 4 CTAs/SM (__launch_bounds__(256, 4), <= 64 registers) vs the deployed 3 (72 registers), whole
 // program, bit-exactness checked. Derived from bench_rdc.cu.
-// research41 probe: the same Ada small-T kernels built with -rdc=true (as the engine) or whole program. Out projection
-// (Q4, K = 6144, 5120 rows, residual epilogue) and Q4 gate/up (K = 5120, 34816 rows, paired SwiGLU halves) at T = 16,
-// cold (weights rotate over >= 320 MB) and "warm prefix" (a read kernel pulls the first WARM_MB of the next copy's
-// codes into L2 right before each GEMM, as the engine's L2 fills do).
-// usage: bench_rdc [WARM_MB=8]
+// usage: bench_gu4 [WARM_MB=1]
 #include "ops/linear/ada_small_t_mma.cuh"
 
 #include <cuda_bf16.h>

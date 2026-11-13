@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """DRAM-idle opportunity per verify round from an nsys sqlite: time in DRAM-streaming kernels (weight GEMMs, head
 screens, fold) vs latency-bound kernels vs gaps, and the run lengths of non-streaming stretches between streaming
 kernels. usage: dram_idle.py DB"""
-import sqlite3, sys, collections, statistics
+import os, sqlite3, sys, collections, statistics
+MARKER = os.environ.get("ROUND_MARKER", "recurrent_fold_staged")  # in the name of a kernel that runs once per round
 db = sqlite3.connect(sys.argv[1])
 rows = db.execute("select k.start, k.end, s.value from CUPTI_ACTIVITY_KIND_KERNEL k join StringIds s on s.id = k.shortName "
                   "order by k.start").fetchall()
-fold = [i for i, r in enumerate(rows) if "recurrent_fold_staged" in r[2]]
+fold = [i for i, r in enumerate(rows) if MARKER in r[2]]
 STREAM = ("ada_small_t_mma", "screen_kernel", "recurrent_fold", "q8_ksplit", "context_kv_grouped")
 rounds = []
 for a, b in zip(fold[2:-1], fold[3:]):

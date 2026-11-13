@@ -21,15 +21,14 @@ saw (on its own calibration windows the quantized model is far closer to the ref
 
 Every --eval-every steps the held-out windows (every --holdout-every-th calibration window) are scored; the best held-out
 scales are kept. The output is a codes store (same codes, tuned FP16 scales), readable by fq_eval --mode codes and by the
-converter (tools/gptq_recipe.py: --source gptq/q3/q5 may all point at it).
-usage: e2e_scales.py MODEL_DIR CALIB.windows.bin TEACHER.topk.bin OUT_STORE --codes A [--codes-b B --groups G]
+converter (gptq_recipe.py: --source gptq/q3/q5 may all point at it).
+usage: e2e_scales2.py MODEL_DIR CALIB.windows.bin TEACHER.topk.bin OUT_STORE --codes A [--codes-b B --groups G]
                      [--codes-c C --groups-c G] [--epochs 1] [--wpb 4] [--lr 5e-4] [--param group|row]
                      [--norms --lr-norm 5e-4 --model-out DIR] [--bf16] [--train-ranges 96-383,480-767]"""
 import argparse, json, math, os, shutil, sys, time
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import numpy as np
 import torch
-import torch.nn.functional as F
 from safetensors.torch import save_file
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -161,7 +160,7 @@ def main():
     TOP1[:] = [a.top1, a.top1_gap, a.top1_margin]
     if a.bf16:
         MM_DTYPE[0] = torch.bfloat16
-    if not a.slow_gdr:  # same math as the loop form (tools/fast_gdr.py), one triangular solve per chunk
+    if not a.slow_gdr:  # same math as the loop form (fast_gdr.py), one triangular solve per chunk
         mq.torch_chunk_gated_delta_rule = fast_chunk_gated_delta_rule
     dev = torch.device(a.device)
     torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True

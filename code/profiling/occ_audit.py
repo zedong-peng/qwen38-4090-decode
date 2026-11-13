@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Occupancy audit of an nsys sqlite: per (kernel, grid, block) the registers, shared memory, resident CTAs per SM
 (Ada: 65536 regs, 100 KB smem, 1536 threads, 24 CTAs), waves, and us per round. usage: occ_audit.py DB [TOP=40]"""
-import sqlite3, sys, statistics, collections
+import os, sqlite3, sys, statistics, collections
+MARKER = os.environ.get("ROUND_MARKER", "recurrent_fold_staged")  # in the name of a kernel that runs once per round
 db = sqlite3.connect(sys.argv[1]); top = int(sys.argv[2]) if len(sys.argv) > 2 else 40
 rows = db.execute("select k.start, k.end, s.value, k.gridX*k.gridY*k.gridZ, k.blockX*k.blockY*k.blockZ, "
                   "k.registersPerThread, k.staticSharedMemory + k.dynamicSharedMemory from CUPTI_ACTIVITY_KIND_KERNEL k "
                   "join StringIds s on s.id = k.shortName order by k.start").fetchall()
-fold = [i for i, r in enumerate(rows) if "recurrent_fold_staged" in r[2]]
+fold = [i for i, r in enumerate(rows) if MARKER in r[2]]
 rows = rows[fold[2]:fold[-1]]; rounds = len(fold) - 3
 g = collections.defaultdict(list)
 for st, en, name, grid, block, regs, smem in rows:

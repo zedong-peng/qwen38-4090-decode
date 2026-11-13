@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DFlash2 drafter fine-tuning on target self-distillation data (tools/draft_ft_features.py).
+"""DFlash2 drafter fine-tuning on target self-distillation data (draft_ft_features.py).
 
 Forward semantics follow z-lab/dflash dflash/model.py (DFlash2DraftModel): the block is
 [anchor, mask x (B-1)] embedded with the target's input embeddings; every layer attends

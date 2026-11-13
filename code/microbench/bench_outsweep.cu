@@ -1,10 +1,6 @@
 // research41 out-projection sweep (whole program): pipeline depth and evict-first for the Q4 K = 6144 schedule,
 // both bit-exact against the deployed <2, 8, 2, 8, 2>. Derived from bench_rdc.cu.
-// research41 probe: the same Ada small-T kernels built with -rdc=true (as the engine) or whole program. Out projection
-// (Q4, K = 6144, 5120 rows, residual epilogue) and Q4 gate/up (K = 5120, 34816 rows, paired SwiGLU halves) at T = 16,
-// cold (weights rotate over >= 320 MB) and "warm prefix" (a read kernel pulls the first WARM_MB of the next copy's
-// codes into L2 right before each GEMM, as the engine's L2 fills do).
-// usage: bench_rdc [WARM_MB=8]
+// usage: bench_outsweep [WARM_MB=8]
 #include "ops/linear/ada_small_t_mma.cuh"
 
 #include <cuda_bf16.h>

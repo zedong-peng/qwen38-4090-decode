@@ -7,4 +7,6 @@ distributed under the Apache License, Version 2.0. The patches contain short
 excerpts of that source as match anchors.
 
 fidelity/ref_bf16.py and fidelity/ref_var.py use the Hugging Face transformers
-Qwen3.5 modules (Apache License, Version 2.0) at run time.
+Qwen3.5 modules (Apache License, Version 2.0) at run time, as do the scripts in
+weights/; weights/fast_gdr.py is a rewrite of that library's
+torch_chunk_gated_delta_rule.

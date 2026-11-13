@@ -6,7 +6,7 @@ prefill (continuation) with max_tokens 1, so the prefill dumps one fc column per
 prompt + response, in order. The token ids come from the HF chat template with
 continue_final_message; a record is kept only when its id count equals the dumped column count.
 Writes INDEX.jsonl: id, source, col0, ncols, ids, resp0 (first response position). When the server also
-dumps the target's final-norm hidden states (NINFER_DRAFT_DUMP_ONLY=fc,final; tools/patch_final_dump.py),
+dumps the target's final-norm hidden states (NINFER_DRAFT_DUMP_ONLY=fc,final; engine patch 0011),
 DUMP_DIR/final.bf16 must grow by the same column count and the record gets fcol0 (its first column).
 usage: draft_ft_features.py BASE_URL GENERATED.jsonl DUMP_DIR INDEX.jsonl MODEL_DIR [MAX_TOKENS_TOTAL]"""
 import json, os, sys, time, urllib.request

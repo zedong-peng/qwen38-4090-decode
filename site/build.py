@@ -176,29 +176,20 @@ DATA = {"race": RACE, "board": BOARD, "plane": PLANE, "rounds": ROUNDS, "trees":
 
 # ------------------------------------------------------------------ values used in the prose (all Spec-Bench numbers: one session)
 st, fi = next(t for t in traces if t["key"] == "start"), next(t for t in traces if t["key"] == "final")
-F, RE, RD, ST = BE["final"]["tps"], BE["rel_eng"]["tps"], SB["sb-rel-def"]["overall"]["tps"], BE["stock"]["tps"]
+F, RE, ST = BE["final"]["tps"], BE["rel_eng"]["tps"], BE["stock"]["tps"]
 ratio = lambda a, b, w: BS[a][w] / BS[b][w]
 LONG = ("medium_feature", "long_review")
 V = {
-    "final_tps": f"{F:.1f}", "final_tps0": f"{F:.0f}", "releng_tps": f"{RE:.1f}", "releng_tps0": f"{RE:.0f}",
-    "reldef_tps": f"{RD:.1f}", "stock_tps": f"{ST:.1f}",
-    "speedup": f"{F / ST:.2f}", "engine_x": f"{RE / ST:.2f}", "model_x": f"{F / RE:.2f}",
-    "tree_tau": STEPS["tree_tau"], "kern_ms": STEPS["kern_ms"], "w_ms": STEPS["w_ms"], "w_tau": STEPS["w_tau"],
-    "kl_final": f"{fid['final']['kl']['all']:.4f}", "kl_rel": f"{fid['release']['kl']['all']:.4f}",
-    "ppl_final": f"{fid['final']['ppl']['all']:.2f}", "ppl_rel": f"{fid['release']['ppl']['all']:.2f}",
+    "final_tps0": f"{F:.0f}", "releng_tps0": f"{RE:.0f}", "speedup": f"{F / ST:.2f}",
     "n_pred": f"{fid['n']:,}", "round_ms": f"{BE['final']['ms']:.1f}",
     "start_round_ms": f"{st['span'] / 1000:.1f}", "start_stream_ms": f"{(st['class_us'].get('gemm', 0) + st['class_us'].get('head', 0)) / 1000:.1f}",
     "final_idle_ms": f"{fi['idle_us'] / 1000:.2f}", "final_round_trace_ms": f"{fi['span'] / 1000:.1f}",
     "run_cmd": D.get("run_cmd", ""),
-    "vllm_tps": f"{BE['vllm']['tps']:.1f}", "vllm_tps0": f"{BE['vllm']['tps']:.0f}", "llama_tps": f"{BE['llama']['tps']:.1f}",
-    "llama_tps0": f"{BE['llama']['tps']:.0f}", "llama_n": str(LN),
-    "x_vllm_eng": f"{RE / BE['vllm']['tps']:.2f}", "x_vllm_final": f"{F / BE['vllm']['tps']:.2f}",
-    "x_llama_eng": f"{RE / BE['llama']['tps']:.2f}", "x_llama_final": f"{F / BE['llama']['tps']:.2f}",
+    "vllm_tps0": f"{BE['vllm']['tps']:.0f}", "llama_tps0": f"{BE['llama']['tps']:.0f}", "llama_n": str(LN),
     "vllm_tau": f"{BE['vllm']['tau']:.2f}", "vllm_ms": f"{BE['vllm']['ms']:.1f}", "llama_tau": f"{BE['llama']['tau']:.2f}",
     "llama_ms": f"{BE['llama']['ms']:.1f}", "final_tau": f"{BE['final']['tau']:.2f}",
     "long_x_stock": f"{min(ratio('final', 'stock', w) for w in LONG):.2f}",
     "long_x_vllm": f"{min(ratio('final', 'vllm', w) for w in LONG):.2f}",
-    "best_x_vllm": f"{max(ratio('final', 'vllm', w) for w, *_ in WORKLOADS):.2f}",
     "tree_tau_n": f"{abs(100 * (P1['tau'] / P0['tau'] - 1)):.0f}",
     "session": "in one session",
 }

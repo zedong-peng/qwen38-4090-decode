@@ -14,6 +14,9 @@ import sys
 root = sys.argv[1]
 P = f"{root}/src/models/qwen3_5/program/program_impl.cpp"
 s = open(P).read()
+if "NINFER_SCORE_DUMP" in s:
+    print("already patched")
+    sys.exit(0)
 
 s = s.replace('#include "ninfer/ops/target_logprobs.h"\n', '''#include "ninfer/ops/target_logprobs.h"
 #include <cmath>

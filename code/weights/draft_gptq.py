@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """GPTQ for the DFlash2 drafter's projections from engine-dumped inputs (NINFER_DRAFT_DUMP).
 Writes a codes store (PREFIX.gptq_codes I8 [N,K], PREFIX.gptq_scales F16 [N,K/G]) that the converter
-imports (tools/gptq_recipe.py with --source dcodes=DIR).
+imports (gptq_recipe.py with --source dcodes=DIR).
   --bits B         target grid: B-bit G64 with the canonical FP16 absmax scale (clip search optional)
   --emulate-q8     store the B-bit grid as Q8 G32 codes (code*2^(8-B), scale/2^(8-B)) for the Q8 kernels
   --rtn            no error compensation (same grid; the RTN baseline)

@@ -23,7 +23,7 @@ DFlash2 drafter. It is closer to full precision than the
 weight bytes per decode round.
 
 Write-up with interactive figures:
-[zedongpeng.com/assets/html/qwen38-4090-decode.html](https://zedongpeng.com/assets/html/qwen38-4090-decode.html).
+[zedongpeng.com/blog/2026/qwen38-4090-decode](https://zedongpeng.com/blog/2026/qwen38-4090-decode/).
 Engine patches and measurement tools: [github.com/zedong-peng/qwen38-4090-decode](https://github.com/zedong-peng/qwen38-4090-decode).
 
 ## Speed

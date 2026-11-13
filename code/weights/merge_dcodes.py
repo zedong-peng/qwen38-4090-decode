@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge two drafter codes stores (tools/draft_gptq.py): tensors whose name contains one of ROLES come from B,
+"""Merge two drafter codes stores (draft_gptq.py): tensors whose name contains one of ROLES come from B,
 the rest from A (config.json and draft_gptq.json from A).
 usage: merge_dcodes.py A B OUT ROLE[,ROLE...]   e.g. ROLE list mlp.gate_proj,mlp.up_proj,mlp.down_proj"""
 import os, shutil, sys

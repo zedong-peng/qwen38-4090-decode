@@ -44,7 +44,7 @@ for example GDN state stored in FP16, or a norm folded into a GEMM epilogue.
 
 ## profiling/: nsys round analysis
 
-Each tool takes the sqlite export of an nsys trace. Steady rounds are delimited by a kernel that runs once per decode
+Each tool but `res_cmp.py` takes the sqlite export of an nsys trace. Steady rounds are delimited by a kernel that runs once per decode
 round; set it with `ROUND_MARKER` (default `recurrent_fold_staged_kernel`).
 
 | tool | what it does |
@@ -53,6 +53,9 @@ round; set it with `ROUND_MARKER` (default `recurrent_fold_staged_kernel`).
 | `gap_list.py` | Where the round idles: gaps attributed to the (previous → next) activity pair, plus host runtime calls per round. |
 | `round_kernels.py`, `round_diff.py` | Per-kernel calls and µs per round, for one trace or the difference of two. |
 | `kern_grep.py SQLITE REGEX` | Per-call medians by kernel and grid. This is the A/B that does not depend on run length. |
+| `dram_idle.py` | DRAM-streaming kernels against latency-bound kernels and gaps per round, and how long the non-streaming stretches are. |
+| `occ_audit.py` | Registers, shared memory and resident CTAs per SM for every kernel of a round, and the register count that would fit one more CTA. |
+| `res_cmp.py A.res B.res` | Per-kernel registers of two builds, from `cuobjdump -res-usage` output instead of a trace (the `-rdc` comparison). |
 
 nsys inflates host-side time severalfold, so price host costs from unprofiled request logs instead.
 

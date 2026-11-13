@@ -10,7 +10,7 @@ NINFER_Q3_SHADOW=1 NINFER_Q3_TILED=1 NINFER_DRAFT_CONV_Q4=1 NINFER_KV_VI8=1 NINF
 NINFER_GDN_STATE_F16=1 NINFER_L2_FILL=121 NINFER_L2_FILL_NORM_KB=1536 NINFER_L2_FILL_POST_KB=768
 NINFER_L2_FILL_GATED_KB=768 NINFER_L2_FILL_RECORD_KB=2048 NINFER_L2_FILL_ATTN_KB=4096 NINFER_ATTN_ROWSPLIT=3
 NINFER_SCREEN_TILED=1
-ninfer-serve ... --spec dflash2 --draft-tokens 15 --verify-tree --kv-dtype k8v4 --no-prefix-reuse
+ninfer-serve ... --spec dflash2 --draft-tokens 15 --lm-head-draft --verify-tree --kv-dtype k8v4 --no-prefix-reuse
 ```
 
 Build the engine whole-program (patch 0052): configure a separate build directory with `-DNINFER_RDC=OFF`. It is

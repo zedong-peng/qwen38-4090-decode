@@ -6,7 +6,7 @@ pathlib); math problems are templated with a fixed seed. usage: draft_calib_prom
 import ast, json, os, random, sys, sysconfig
 import pyarrow.parquet as pq
 
-W = os.environ.get("WORK", ".")  # needs W/models/src/Qwen3.8-27B (tokenizer) and W/data/fidelity/wikitext2-train.parquet
+W = os.environ.get("WORK", ".")  # needs W/data/fidelity/wikitext2-train.parquet
 rng = random.Random(20261003)
 out = []
 
@@ -68,8 +68,6 @@ for i in range(16):
         f"A tank holds {a * 100} liters. One pipe fills it in {b} hours and another drains it in {b + c % 7 + 1} hours. How long does it take to fill the empty tank with both open? Explain.",
         f"Find all integer solutions of x^2 - {a}x + {a * b % 97} = 0, or show there are none. Reason carefully.",
         f"The sum of {b} consecutive integers is {a * b + b * (b - 1) // 2}. What are the integers? Explain."])))
-for i, (kind, prompt) in enumerate(out):
-    pass
 with open(sys.argv[1], "w") as f:
     for i, (kind, prompt) in enumerate(out):
         f.write(json.dumps({"id": i, "kind": kind, "prompt": prompt}) + "\n")

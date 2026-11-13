@@ -3,7 +3,7 @@
 """Steady-state round budget from an nsys sqlite: kernels between the first and last recurrent_fold_staged_kernel,
 per round: wall span, busy (union of kernel intervals), idle gaps, and busy time by kernel class.
 usage: round_budget.py SQLITE"""
-import os, re, sqlite3, sys
+import os, sqlite3, sys
 MARKER = os.environ.get("ROUND_MARKER", "recurrent_fold_staged_kernel")  # one call per decode round
 from collections import defaultdict
 db = sqlite3.connect(sys.argv[1])

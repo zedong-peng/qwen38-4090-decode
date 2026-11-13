@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 # Compare per-kernel registers (cuobjdump -res-usage) of two builds: counts of kernels with more / fewer / equal
 # registers, and the named hot kernels side by side.
 # usage: res_cmp.py A.res B.res [REGEX]

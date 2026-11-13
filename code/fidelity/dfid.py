@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Decode-path fidelity from NINFER_HIDDEN_DUMP runs (tools/patch_hidden_dump.py) on forced Spec-Bench text.
+"""Decode-path fidelity from NINFER_HIDDEN_DUMP runs (../engine-patches/patch_hidden_dump.py) on forced Spec-Bench text.
 
 windows DUMP IDS.jsonl OUT [--every K]
     Scoring windows prompt_ids + ids (ids = the run's NINFER_TOKEN_DUMP ids, ids[0] = prefill token) with first
@@ -192,11 +192,11 @@ def score(argv):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "windows":
+    if sys.argv[1:2] == ["windows"]:
         a = sys.argv[2:]
         every = int(a[a.index("--every") + 1]) if "--every" in a else 1
         write_windows(a[0], a[1], a[2], every)
-    elif sys.argv[1] == "score":
+    elif sys.argv[1:2] == ["score"]:
         score(sys.argv[2:])
     else:
         sys.exit(__doc__)

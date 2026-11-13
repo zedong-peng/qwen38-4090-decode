@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""ref_bf16.py for windows of different lengths (decode-path fidelity, tools/dfid.py).
+"""ref_bf16.py for windows of different lengths (decode-path fidelity, dfid.py).
 Same reference: BF16 checkpoint layer-streamed through the transformers qwen3_5 modules (GDN on the FP32 torch
 fallback), FP32 logits from the BF16 normed hidden and the BF16 head. Every window runs alone (batch 1); the hidden
 states of all windows stay on the GPU between layers.
