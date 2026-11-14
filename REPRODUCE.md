@@ -125,41 +125,57 @@ ranks the first row against other engines on the same replay.
 
 | configuration | weights | minutes to finish | output tok/s | tokens/round |
 |---|---|---|---|---|
+| our engine, the engine knobs that keep the dense verify head, `NINFER_ANCHOR_BEFORE_LAST_USER=1` | official NInfer v3 container | 4.18 (4.17, 4.18, 4.20) | 275 | 6.6 |
+| our engine, every research knob off, `NINFER_ANCHOR_BEFORE_LAST_USER=1` | official NInfer v3 container | 4.22 (4.27, 4.22, 4.17) | 270 | 6.4 |
 | our engine, every research knob off | official NInfer v3 container | 15.82 (16.01, 15.82, 15.76) | 266 | 6.4 |
 | our engine, the engine knobs that keep the dense verify head | official NInfer v3 container | 15.85 (15.90, 15.75, 15.85) | 268 | 6.5 |
 | our engine, `serve.sh official` | official NInfer v3 container | not comparable | | |
 | our engine, `serve.sh ours` | our container | does not start | | |
 | llama.cpp b11236, UD-Q4_K_M, DFlash 7 (AA's recipe) | | 9.02 | 90 | |
 
-Minutes are the median of three replays; output speed and tokens per round are from the median replay.
+Minutes are the median of three replays; output speed and tokens per round are from the median replay. All twelve
+replays finished 168 of 168 turns at the recorded lengths, with the 65,536-token context reported and not reduced.
 
-- **Decoding carries over.** Output is 266 tok/s against llama.cpp's 90, and verify trees accept 6.4 tokens per round
-  under sampling (5.18 on Spec-Bench, which is greedy and other text).
-- **The replay is still slower, because decoding is 12% of it.** Of 949 s, prefill takes 821 s: the server recomputed
-  1.29 M of the 2.58 M prompt tokens, at 1,570 tok/s. llama.cpp recomputed 0.19 M.
-- **The misses are all in the three SWE-bench tasks** (108 turns). Each of their prompts ends with a turn-counter user message ("Tool-call
-  turn 4 of 100. Remaining turns: 96.") that the next prompt no longer contains. `ninfer-serve` resumes a conversation
-  only from the checkpoints it kept, and those sit after that message, so every one of these turns is prefilled from the
-  first token: 798 s on the three tasks against llama.cpp's 255 s. On the other five tasks the prefix is reused and the engine
-  takes 151 s to llama.cpp's 287 s.
-- **The engine knobs do not matter here**: the two rows differ by 0.2%.
+- **Decoding carries over.** Output is 266 to 275 tok/s against llama.cpp's 90, and verify trees accept 6.4 tokens per
+  round under sampling (5.18 on Spec-Bench, which is greedy and other text).
+- **As the server ships, the replay is slower than llama.cpp, because decoding is 12% of it.** Of 949 s, prefill takes
+  821 s: the server recomputed 1.29 M of the 2.58 M prompt tokens. The misses are all in the three SWE-bench tasks
+  (108 turns). Each of their prompts ends with a turn-counter user message ("Tool-call turn 4 of 100. Remaining turns:
+  96.") that the next prompt no longer contains. `ninfer-serve` resumes a conversation from the checkpoint it keeps
+  at the end of the prompt, which sits after that message, so every one of these turns is prefilled from the first
+  token: 798 s on the three tasks against llama.cpp's 255 s.
+- **`NINFER_ANCHOR_BEFORE_LAST_USER=1` keeps that checkpoint in front of a trailing user message instead**
+  (`code/reproduce/anchor_patch.py`, 17 lines in the chat template code, off by default). The next request then
+  resumes from the previous turn. With every research knob off the server recomputes 0.21 M prompt tokens (llama.cpp
+  0.19 M), the three SWE-bench tasks take 107 s and the other five 146 s (llama.cpp: 255 s and 287 s), and the replay
+  finishes in 253 s, of which prefill is 124 s and decoding 114 s. The cost: a client that does keep its last user message has that one
+  message prefilled again on the next turn.
+- **The engine knobs do not matter here**: with or without the flag the two knob sets differ by less than 1%, inside
+  the spread of the three replays.
 - **`serve.sh official` is not comparable.** Its two-level head returns argmax tokens and no logits, so the sampled
-  requests are served greedily (one replay: 15.7 min, 296 output tok/s).
+  requests are served greedily (one replay without the flag: 15.7 min, 296 output tok/s).
 - **`serve.sh ours` does not start** at this context: its decode-only weight copies leave room for 57,344 tokens at most.
+- **What did not work first**: asking the engine for a private long anchor at the same boundary. The anchor was stored
+  every turn, but resuming from one keeps its source continuation alive, the server then has to evict a continuation
+  for the running request, and it values each by how many recent requests could have used it, so the newest anchor was
+  the one evicted (60% of prompt tokens from the cache on one task, against 93% with the checkpoint moved).
 
-To run it, add two protocol fields to the server and rebuild (neither touches the engine: `ignore_eos`, and a `length`
-finish reason whenever the output limit ends a turn), install the tool, and start a replay:
+To run it, add two protocol fields to the server (neither touches the engine: `ignore_eos`, and a `length` finish
+reason whenever the output limit ends a turn) and the flag, rebuild, install the tool, and start a replay:
 
 ```bash
 python3 qwen38-4090-decode/code/reproduce/aa_serve_patch.py engine
+python3 qwen38-4090-decode/code/reproduce/anchor_patch.py engine
 cmake --build engine/build --target ninfer-serve
 pip install git+https://github.com/ArtificialAnalysis/aa-agentperf-local@1fe8056      # 0.3.4
-bash qwen38-4090-decode/code/reproduce/aa_agentperf.sh defaults official/qwen3_8_27b.ninfer aa-results
+bash qwen38-4090-decode/code/reproduce/aa_agentperf.sh engine-anchor official/qwen3_8_27b.ninfer aa-results
 ```
 
-The script starts the server as below, runs the tool's six-turn check and then three full replays of about 16 minutes
-each (`agentperf-local run --base-url http://127.0.0.1:8080/v1 --model qwen3.8-27b`). The sampler, thinking and prefix
-reuse stay at the server's defaults, which is what the benchmark expects; `serve.sh` turns all three off for Spec-Bench.
+The script starts the server as below with the mode's environment variables in front, runs the tool's six-turn check
+and then three full replays of about 4 minutes each (`agentperf-local run --base-url http://127.0.0.1:8080/v1 --model
+qwen3.8-27b`). The modes `anchor`, `engine` and `defaults` give the other rows; without the flag a replay takes about
+16 minutes. The sampler, thinking and prefix reuse stay at the server's defaults, which is what the benchmark expects;
+`serve.sh` turns all three off for Spec-Bench.
 
 ```bash
 ninfer-serve official/qwen3_8_27b.ninfer --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b \

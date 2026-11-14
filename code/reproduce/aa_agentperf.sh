@@ -3,12 +3,16 @@
 # AA-AgentPerf-Local's default replay against our engine on one RTX 4090: the tool unmodified, a 65,536-token context,
 # one sequence, exact output lengths, the tool's standard sampling. Starts ninfer-serve, runs the tool's small check
 # (aa-mini-v1) and then REPS full replays; each replay's result directory is OUTDIR/MODE/N.
-# usage: aa_agentperf.sh defaults|engine|official MODEL.ninfer OUTDIR [REPS=3]
-#   env NINFER_SERVE  ninfer-serve built from the patched tree after aa_serve_patch.py
+# usage: aa_agentperf.sh defaults|anchor|engine|engine-anchor|official MODEL.ninfer OUTDIR [REPS=3]
+#   env NINFER_SERVE  ninfer-serve built from the patched tree after aa_serve_patch.py (and anchor_patch.py for the
+#                     two anchor modes)
 #       AGENTPERF     agentperf-local 0.3.4 (default: agentperf-local on PATH)
 #       GPU           card index (default 0); nothing else may run on it
 #   defaults  every research knob off
+#   anchor    defaults plus NINFER_ANCHOR_BEFORE_LAST_USER=1: the turn checkpoint sits before a trailing user message,
+#             so a harness that replaces that message every turn still resumes from the previous turn
 #   engine    the engine knobs that keep the dense verify head: sampled requests take the ordinary route
+#   engine-anchor  engine plus the same flag
 #   official  serve.sh official. Its two-level head returns argmax tokens only, so sampled requests are served greedily:
 #             the replay finishes, but it is not the benchmark's sampling
 # Unlike serve.sh this leaves the sampler, thinking and prefix reuse at the server's defaults, as the benchmark expects.
@@ -22,9 +26,11 @@ ENGINE=(NINFER_PROPOSAL_SCREEN=3 NINFER_TREE_TEMPERATURE=1.25 NINFER_KV_VI8=1 NI
 HEAD=(NINFER_TWO_LEVEL_HEAD=1 NINFER_HEAD_SCREEN=3 NINFER_SCREEN_TILED=1)
 case $MODE in
   defaults) KNOBS=() ;;
+  anchor) KNOBS=(NINFER_ANCHOR_BEFORE_LAST_USER=1) ;;
   engine) KNOBS=("${ENGINE[@]}") ;;
+  engine-anchor) KNOBS=("${ENGINE[@]}" NINFER_ANCHOR_BEFORE_LAST_USER=1) ;;
   official) KNOBS=("${ENGINE[@]}" "${HEAD[@]}") ;;
-  *) echo "usage: aa_agentperf.sh defaults|engine|official MODEL.ninfer OUTDIR [REPS]" >&2; exit 2 ;;
+  *) echo "usage: aa_agentperf.sh defaults|anchor|engine|engine-anchor|official MODEL.ninfer OUTDIR [REPS]" >&2; exit 2 ;;
 esac
 mkdir -p "$OUT/$MODE"
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$G setsid env ${KNOBS[@]+"${KNOBS[@]}"} "$BIN" "$MODEL" \
