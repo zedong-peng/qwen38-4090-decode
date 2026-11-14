@@ -114,3 +114,55 @@ llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -ngl all -fa on -c 65536 -np 1 --fit
 ```
 
 Run Spec-Bench with `--engine llama`. A maximum of 7 drafts was faster than the recipe's 4 (97.8 tok/s).
+
+## The agent workload: AA-AgentPerf-Local
+
+Spec-Bench measures decoding alone. [AA-AgentPerf-Local](https://github.com/ArtificialAnalysis/aa-agentperf-local)
+0.3.4's default replay is an agent workload: 8 tasks, 168 turns, a 65,536-token context, one sequence, every turn
+generated to its recorded length, the tool's standard sampling (temperature 0.7, top_p 0.8, top_k 20). We ran it
+unmodified on the same card on Nov 14, 2026. The [RTX 4090 leaderboard](https://zedongpeng.com/qwen38-4090-inference/)
+ranks the first row against other engines on the same replay.
+
+| configuration | weights | minutes to finish | output tok/s | tokens/round |
+|---|---|---|---|---|
+| our engine, every research knob off | official NInfer v3 container | 15.82 (16.01, 15.82, 15.76) | 266 | 6.4 |
+| our engine, the engine knobs that keep the dense verify head | official NInfer v3 container | 15.85 (15.90, 15.75, 15.85) | 268 | 6.5 |
+| our engine, `serve.sh official` | official NInfer v3 container | not comparable | | |
+| our engine, `serve.sh ours` | our container | does not start | | |
+| llama.cpp b11236, UD-Q4_K_M, DFlash 7 (AA's recipe) | | 9.02 | 90 | |
+
+Minutes are the median of three replays; output speed and tokens per round are from the median replay.
+
+- **Decoding carries over.** Output is 266 tok/s against llama.cpp's 90, and verify trees accept 6.4 tokens per round
+  under sampling (5.18 on Spec-Bench, which is greedy and other text).
+- **The replay is still slower, because decoding is 12% of it.** Of 949 s, prefill takes 821 s: the server recomputed
+  1.29 M of the 2.58 M prompt tokens, at 1,570 tok/s. llama.cpp recomputed 0.19 M.
+- **The misses are all in the three SWE-bench tasks** (108 turns). Each of their prompts ends with a turn-counter user message ("Tool-call
+  turn 4 of 100. Remaining turns: 96.") that the next prompt no longer contains. `ninfer-serve` resumes a conversation
+  only from the checkpoints it kept, and those sit after that message, so every one of these turns is prefilled from the
+  first token: 798 s on the three tasks against llama.cpp's 255 s. On the other five tasks the prefix is reused and the engine
+  takes 151 s to llama.cpp's 287 s.
+- **The engine knobs do not matter here**: the two rows differ by 0.2%.
+- **`serve.sh official` is not comparable.** Its two-level head returns argmax tokens and no logits, so the sampled
+  requests are served greedily (one replay: 15.7 min, 296 output tok/s).
+- **`serve.sh ours` does not start** at this context: its decode-only weight copies leave room for 57,344 tokens at most.
+
+To run it, add two protocol fields to the server and rebuild (neither touches the engine: `ignore_eos`, and a `length`
+finish reason whenever the output limit ends a turn), install the tool, and start a replay:
+
+```bash
+python3 qwen38-4090-decode/code/reproduce/aa_serve_patch.py engine
+cmake --build engine/build --target ninfer-serve
+pip install git+https://github.com/ArtificialAnalysis/aa-agentperf-local@1fe8056      # 0.3.4
+bash qwen38-4090-decode/code/reproduce/aa_agentperf.sh defaults official/qwen3_8_27b.ninfer aa-results
+```
+
+The script starts the server as below, runs the tool's six-turn check and then three full replays of about 16 minutes
+each (`agentperf-local run --base-url http://127.0.0.1:8080/v1 --model qwen3.8-27b`). The sampler, thinking and prefix
+reuse stay at the server's defaults, which is what the benchmark expects; `serve.sh` turns all three off for Spec-Bench.
+
+```bash
+ninfer-serve official/qwen3_8_27b.ninfer --host 127.0.0.1 --port 8080 --model-id qwen3.8-27b \
+  --spec dflash2 --draft-tokens 15 --lm-head-draft --verify-tree --kv-dtype k8v4 \
+  --max-context 65536 --kv-capacity 65536 --max-concurrency 1 --prefill-chunk 1024
+```
