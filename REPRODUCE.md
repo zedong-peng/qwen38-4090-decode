@@ -130,11 +130,13 @@ ranks the first row against other engines on the same replay.
 | our engine, every research knob off | official NInfer v3 container | 15.82 (16.01, 15.82, 15.76) | 266 | 6.4 |
 | our engine, the engine knobs that keep the dense verify head | official NInfer v3 container | 15.85 (15.90, 15.75, 15.85) | 268 | 6.5 |
 | our engine, `serve.sh official` | official NInfer v3 container | not comparable | | |
-| our engine, `serve.sh ours` | our container | does not start | | |
+| our engine, the same knobs and flag plus the four weight knobs of `serve.sh ours` | our container | 4.12 (4.12, 4.14, 4.03) | 294 | 6.1 |
+| our engine, `serve.sh ours` (two-level head) | our container | does not start | | |
 | llama.cpp b11236, UD-Q4_K_M, DFlash 7 (AA's recipe) | | 9.02 | 90 | |
 
-Minutes are the median of three replays; output speed and tokens per round are from the median replay. All twelve
-replays finished 168 of 168 turns at the recorded lengths, with the 65,536-token context reported and not reduced.
+Minutes are the median of three replays; output speed and tokens per round are from the median replay. All fifteen
+replays finished 168 of 168 turns at the recorded lengths, with the 65,536-token context reported and not reduced. The
+row on our container was measured on Nov 19.
 
 - **Decoding carries over.** Output is 266 to 275 tok/s against llama.cpp's 90, and verify trees accept 6.4 tokens per
   round under sampling (5.18 on Spec-Bench, which is greedy and other text).
@@ -154,7 +156,12 @@ replays finished 168 of 168 turns at the recorded lengths, with the 65,536-token
   the spread of the three replays.
 - **`serve.sh official` is not comparable.** Its two-level head returns argmax tokens and no logits, so the sampled
   requests are served greedily (one replay without the flag: 15.7 min, 296 output tok/s).
-- **`serve.sh ours` does not start** at this context: its decode-only weight copies leave room for 57,344 tokens at most.
+- **Our weights change little here.** `serve.sh ours` does not start at this context (with the two-level head its
+  decode-only weight copies leave room for 57,344 tokens at most), but with the dense verify head, which sampling
+  needs anyway, the container fits with 345 MiB to spare. A round then takes 20.5 ms instead of 24.0. Two of the three
+  replays accepted fewer tokens per round than the official weights did (6.0, 6.0 and 6.6 against 6.6 to 6.8), so
+  decoding took 104 s against 110 s and the whole replay is about 1% faster: on Spec-Bench the same weights are 31%
+  faster. Half of this replay is prefill, which reads the 4-bit copies either way.
 - **What did not work first**: asking the engine for a private long anchor at the same boundary. The anchor was stored
   every turn, but resuming from one keeps its source continuation alive, the server then has to evict a continuation
   for the running request, and it values each by how many recent requests could have used it, so the newest anchor was
@@ -173,7 +180,8 @@ bash qwen38-4090-decode/code/reproduce/aa_agentperf.sh engine-anchor official/qw
 
 The script starts the server as below with the mode's environment variables in front, runs the tool's six-turn check
 and then three full replays of about 4 minutes each (`agentperf-local run --base-url http://127.0.0.1:8080/v1 --model
-qwen3.8-27b`). The modes `anchor`, `engine` and `defaults` give the other rows; without the flag a replay takes about
+qwen3.8-27b`). The modes `anchor`, `engine` and `defaults` give the other rows, and `ours-anchor` with
+`ours/qwen3_8_27b.ninfer` the row on our container; without the flag a replay takes about
 16 minutes. The sampler, thinking and prefix reuse stay at the server's defaults, which is what the benchmark expects;
 `serve.sh` turns all three off for Spec-Bench.
 
