@@ -51,6 +51,12 @@ sessions, so treat differences under 1% between days as noise.
 
 ## Where to start next
 
+- **The agent workload first.** On AA-AgentPerf-Local's replay (REPRODUCE.md) nothing this study tuned decides the
+  time. Moving one checkpoint in the serving code took the replay from 15.8 to 4.2 minutes; the engine knobs are worth
+  under 1% there and our weights about 1%. Of the 250 s that remain, prefill is 125 s, decoding 112 s and request
+  preparation 10 s. Prefill costs about 0.14 s per request before the first token is computed, 24 s over the 168
+  requests, and 0.44 ms per token after that (2,300 tok/s). Two thirds of the requests recompute fewer than 1,024
+  tokens, so that fixed cost is the first thing to look at, then the prefill kernels, which nobody tuned for this card.
 - **More 3-bit layers.** MLP gate/up 32–63 and down 16–31 are still Q4. Each block of 16 layers moved to 3 bits bought
   0.8–1.6% once end-to-end tuning recovered the quality, and E2E v5 was still improving at its last step. See
   code/weights/README.md.
