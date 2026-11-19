@@ -150,8 +150,10 @@ row on our container was measured on Nov 19.
   (`code/reproduce/anchor_patch.py`, 17 lines in the chat template code, off by default). The next request then
   resumes from the previous turn. With every research knob off the server recomputes 0.21 M prompt tokens (llama.cpp
   0.19 M), the three SWE-bench tasks take 107 s and the other five 146 s (llama.cpp: 255 s and 287 s), and the replay
-  finishes in 253 s, of which prefill is 124 s and decoding 114 s. The cost: a client that does keep its last user message has that one
-  message prefilled again on the next turn.
+  finishes in 253 s, of which prefill is 124 s and decoding 114 s. The cost: a client that does keep its last user
+  message has that one message prefilled again on the next turn, and a prompt that ends this way renders its chat
+  template once more to find the boundary. On the same 102 SWE-bench prompts with and without the flag that is 17 ms
+  of preparation each (the prompts average 11 k tokens), about 1.8 s of the replay.
 - **The engine knobs do not matter here**: with or without the flag the two knob sets differ by less than 1%, inside
   the spread of the three replays.
 - **`serve.sh official` is not comparable.** Its two-level head returns argmax tokens and no logits, so the sampled
