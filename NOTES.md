@@ -17,6 +17,7 @@ sessions, so treat differences under 1% between days as noise.
 | Oct 4 | 3-bit MLP via load-time planes ("Q3 shadow", no new file format); GPTQ Q4 drafter; end-to-end scale tuning pays back the 3-bit cost; c384 calibration; forced-text A/Bs. | 299 → 309 |
 | Oct 5 | E2E v5 (16 more 3-bit layers); INT8 V; proposal-head screen; L2 fills; FP16 GDN state; decode-path fidelity tool. | 310 → 319 |
 | Oct 6 | Whole-program CUDA build; last fill sizes; converged. Same-session comparison with vLLM and llama.cpp. | 322 |
+| Nov 14–20 | AA-AgentPerf-Local's agent replay: 15.8 min as the server ships, 4.2 with the turn checkpoint moved (first on the RTX 4090 leaderboard); our weights fit its 65,536-token context with the dense head; an nsys timeline of what a resumed turn costs. The project closed here. | – |
 
 ## Lessons
 
@@ -76,7 +77,8 @@ sessions, so treat differences under 1% between days as noise.
 - **More 3-bit layers.** MLP gate/up 32–63 and down 16–31 are still Q4. Each block of 16 layers moved to 3 bits bought
   0.8–1.6% once end-to-end tuning recovered the quality, and E2E v5 was still improving at its last step. See
   code/weights/README.md.
-- **Prefill on the 3-bit planes.** It would drop the duplicate Q4 copy (about 4 GiB) and allow a 65,536-token context.
+- **Prefill on the 3-bit planes.** It would drop the duplicate Q4 copy (about 4 GiB) and allow a 65,536-token context
+  with the two-level head (the dense head already fits it).
 - **Long contexts.** At 11K–32K tokens verify attention reads the whole cache and the advantage over the other engines
   shrinks (Limitations in the write-up). Verify attention at long context is the least-tuned path.
 - **Sampling.** Only greedy decoding is supported: the two-level head returns no dense logits.

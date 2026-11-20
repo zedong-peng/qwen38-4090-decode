@@ -103,9 +103,11 @@ NINFER_L2_FILL_GATED_KB=768 NINFER_L2_FILL_RECORD_KB=2048 NINFER_L2_FILL_ATTN_KB
 ```
 
 Limitations:
-- Batch 1 and greedy decoding. The two-level LM head returns no dense logits.
+- Batch 1. The two-level LM head returns no dense logits, so the command above decodes greedily; without its three
+  `NINFER_*HEAD*`/`SCREEN_TILED` variables the dense head samples.
 - Memory: the 3-bit planes, 8-bit scale planes and LM-head screens are decode-only copies, about 4 GiB next to the Q4
-  weights. The largest KV cache that starts on a 24 GB card is 57,344 tokens (65,536 does not).
+  weights. With the two-level head the largest KV cache that starts on a 24 GB card is 57,344 tokens; with the dense
+  head 65,536 fits, with 345 MiB to spare.
 - Tested on one RTX 4090 (sm_89) only.
 
 ## License and attribution
