@@ -59,8 +59,12 @@ round; set it with `ROUND_MARKER` (default `recurrent_fold_staged_kernel`).
 | `dram_idle.py` | DRAM-streaming kernels against latency-bound kernels and gaps per round, and how long the non-streaming stretches are. |
 | `occ_audit.py` | Registers, shared memory and resident CTAs per SM for every kernel of a round, and the register count that would fit one more CTA. |
 | `res_cmp.py A.res B.res` | Per-kernel registers of two builds, from `cuobjdump -res-usage` output instead of a trace (the `-rdc` comparison). |
+| `nsys_budget.py SQLITE REQUESTS.jsonl` | Serving traces (`ninfer-serve` with its request log): each request from arrival to its first decode round, split into frontend, planning and restore, prefill passes (tiny and longer, the latter into token cost and excess), and the gaps between passes. |
+| `nsys_passkern.py SQLITE LO-HI ...` | Serving traces: GPU time per kernel of the prefill passes in each token-count bin. |
+| `nsys_requests.py SQLITE REQUESTS.jsonl [LO HI [SHOW]]` | Serving traces: prefill chunk cost by size, and a full host/GPU layout of a few requests that recompute LO..HI tokens. |
 
-nsys inflates host-side time severalfold, so price host costs from unprofiled request logs instead.
+nsys inflates host-side time severalfold, so price host costs from unprofiled request logs instead. Prefill is
+GPU-bound: on one SWE-bench task of the agent replay, profiled and unprofiled prefill agreed within 4%.
 
 ## engine-patches/: research hooks for Cinference
 

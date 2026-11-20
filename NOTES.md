@@ -55,8 +55,24 @@ sessions, so treat differences under 1% between days as noise.
   time. Moving one checkpoint in the serving code took the replay from 15.8 to 4.2 minutes; the engine knobs are worth
   under 1% there and our weights about 1%. Of the 250 s that remain, prefill is 125 s, decoding 112 s and request
   preparation 10 s. Prefill costs about 0.14 s per request before the first token is computed, 24 s over the 168
-  requests, and 0.44 ms per token after that (2,300 tok/s). Two thirds of the requests recompute fewer than 1,024
-  tokens, so that fixed cost is the first thing to look at, then the prefill kernels, which this study left as they came.
+  requests, and 0.44 ms per token after that (2,300 tok/s). An nsys timeline (REPRODUCE.md, Nov 20) shows that a
+  resumed SWE-bench turn spends 253 of its 452 ms outside the token work, in four separate places, none of them a
+  one-line fix. In order, with the estimated gain on the 250 s replay:
+  1. *Short prefill passes leave the small-T kernels.* At 16 tokens or fewer a pass costs one read of the weights
+     (18 ms). At 26 tokens the generic GEMMs and the long-prompt attention kernel make it 60 ms, and every pass up to
+     several hundred tokens carries about 50 ms above its token cost. Small-T GEMMs and split-KV attention up to 32
+     tokens would take the 27-token pass that every SWE-bench turn runs from 60 to about 20 ms: about 4 s. Tuning the
+     tiles for 33–500 tokens could save up to 7 s more. This is kernel work in the study's own territory and changes
+     numerics, so it needs a fidelity check that runs short chunks.
+  2. *Passes stopped at execution frontiers.* The engine ends a pass after each assistant header and each think block,
+     so states stay bit-identical across reuse paths. That costs three passes of 2–4 tokens per turn, 57 ms. Splitting
+     only where a state is captured is a few lines and about 5 s, but it gives up that identity and needs its own
+     fidelity check. Do it after 1, because the merged tail pass (29 tokens) lands in the range that 1 fixes.
+  3. *The frontend*: 47 ms per turn, from 10 ms at 2 k prompt tokens to 60–90 ms at 10–13 k (3–4 template renders,
+     then tokenizing the whole prompt). It is 10 s of the replay. A cache keyed on the unchanged message prefix would
+     save about 5–7 s and leave the tokens exactly the same.
+  4. *Checkpoint copies*: 29 ms per turn over PCIe, serialized with the passes. More device state slots did not keep
+     them on the GPU, because the planner decides that, not capacity. At most 3 s.
 - **More 3-bit layers.** MLP gate/up 32–63 and down 16–31 are still Q4. Each block of 16 layers moved to 3 bits bought
   0.8–1.6% once end-to-end tuning recovered the quality, and E2E v5 was still improving at its last step. See
   code/weights/README.md.

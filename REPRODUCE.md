@@ -168,6 +168,31 @@ row on our container was measured on Nov 19.
   every turn, but resuming from one keeps its source continuation alive, the server then has to evict a continuation
   for the running request, and it values each by how many recent requests could have used it, so the newest anchor was
   the one evicted (60% of prompt tokens from the cache on one task, against 93% with the checkpoint moved).
+- **Where a resumed turn's time goes** (an nsys timeline of one SWE-bench task with the first row's settings, Nov 20).
+  Its 27 resumed turns recompute 449 tokens on average and take 452 ms from arrival to the first decode round. At the
+  cost per token of a full 1,024-token pass those tokens would take 199 ms. Every turn runs five prefill passes, for
+  example 3, 4, 94, 27 and 2 tokens: the engine ends a pass after each assistant header and after each (empty) think
+  block, so that a state computed from the first token and one resumed from a checkpoint stay bit-identical, and at
+  the checkpoint kept before the turn counter. Passes of up to 16 tokens use the small-T kernels and take 18 ms, about
+  one read of the weights. Longer ones switch to the generic GEMMs and the long-prompt attention kernel: 60 ms at
+  26 tokens, about 50 ms above their token cost up to several hundred tokens.
+
+  | part of a resumed turn | ms |
+  |---|---|
+  | chat template and tokenizer | 47 |
+  | planning, and the checkpoint copied back from host memory | 23 (copy 15) |
+  | the three passes of 2–4 tokens | 57 |
+  | the two longer passes, above their token cost | 114 |
+  | between passes: the new checkpoint copied to host memory | 16 (copy 14) |
+  | the longer passes' 440 tokens at a full pass's cost | 195 |
+  | arrival to the first decode round | 452 |
+
+  On these turns profiled and unprofiled prefill agree within 4% (367 against 355 ms). In a test on Nov 14, with the
+  first version of the checkpoint change, four extra device state slots (`--device-state-slots 4`) cut copy time on the
+  same task by a third but left prefill time unchanged. To take the timeline: start the server under
+  `nsys launch --trace=cuda,nvtx,osrt --cuda-graph-trace=node`, then `nsys start --sample=none --cpuctxsw=none`,
+  replay one task, `nsys stop`, export to sqlite, and run `code/profiling/nsys_budget.py` and `nsys_passkern.py` on the
+  export and the server's request log.
 
 To run it, add two protocol fields to the server (neither touches the engine: `ignore_eos`, and a `length` finish
 reason whenever the output limit ends a turn) and the flag, rebuild, install the tool, and start a replay:
