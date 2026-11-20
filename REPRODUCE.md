@@ -120,8 +120,8 @@ Run Spec-Bench with `--engine llama`. A maximum of 7 drafts was faster than the 
 Spec-Bench measures decoding alone. [AA-AgentPerf-Local](https://github.com/ArtificialAnalysis/aa-agentperf-local)
 0.3.4's default replay is an agent workload: 8 tasks, 168 turns, a 65,536-token context, one sequence, every turn
 generated to its recorded length, the tool's standard sampling (temperature 0.7, top_p 0.8, top_k 20). We ran it
-unmodified on the same card on Nov 14, 2026. The [RTX 4090 leaderboard](https://zedongpeng.com/qwen38-4090-inference/)
-ranks the first row against other engines on the same replay.
+unmodified on the same card on Nov 14, 2026. The [post](https://zedongpeng.com/blog/2026/qwen38-4090-decode/#an-agent-workload)
+ranks the first row against the other engines on the same replay, next to Artificial Analysis's own systems.
 
 | configuration | weights | minutes to finish | output tok/s | tokens/round |
 |---|---|---|---|---|
